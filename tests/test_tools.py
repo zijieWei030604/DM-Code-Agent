@@ -1,3 +1,4 @@
+import ast
 import json
 
 import pytest
@@ -16,6 +17,7 @@ from dm_agent.tools.file_tools import (
     read_file,
     search_in_file,
 )
+from dm_agent.tools.structured_edit_tools import edit_python_symbol, inspect_python_symbol
 
 
 def test_file_tools_create_read_edit_and_search(tmp_path):
@@ -258,6 +260,108 @@ def test_code_analysis_tools_return_structured_json(tmp_path):
     metrics = json.loads(get_code_metrics({"path": str(module)}))
     assert metrics["num_functions"] == 2
     assert metrics["num_classes"] == 1
+
+
+def test_inspect_python_symbol_finds_function_class_and_method(tmp_path):
+    module = tmp_path / "service.py"
+    module.write_text(
+        "def helper(value: int) -> int:\n"
+        "    return value + 1\n\n"
+        "class UserService:\n"
+        "    async def login(self, username: str) -> bool:\n"
+        "        return bool(username)\n",
+        encoding="utf-8",
+    )
+
+    function = json.loads(inspect_python_symbol({"path": str(module), "qualified_name": "helper"}))
+    class_info = json.loads(
+        inspect_python_symbol({"path": str(module), "qualified_name": "UserService"})
+    )
+    method = json.loads(
+        inspect_python_symbol({"path": str(module), "qualified_name": "UserService.login"})
+    )
+
+    assert function["symbol_type"] == "function"
+    assert function["signature"] == "def helper(value: int)"
+    assert class_info["symbol_type"] == "class"
+    assert method["symbol_type"] == "method"
+    assert method["signature"] == "async def login(self, username: str)"
+    assert len(method["source_hash"]) == 64
+
+
+def test_edit_python_symbol_replaces_body_with_matching_hash(tmp_path):
+    module = tmp_path / "service.py"
+    module.write_text(
+        "class UserService:\n"
+        "    def login(self, username: str) -> bool:\n"
+        "        return bool(username)\n\n"
+        "def untouched():\n"
+        "    return 1\n",
+        encoding="utf-8",
+    )
+    inspected = json.loads(
+        inspect_python_symbol({"path": str(module), "qualified_name": "UserService.login"})
+    )
+
+    result = json.loads(
+        edit_python_symbol(
+            {
+                "path": str(module),
+                "qualified_name": "UserService.login",
+                "expected_hash": inspected["source_hash"],
+                "operation": "replace_body",
+                "content": "if not username:\n    return False\nreturn True",
+            }
+        )
+    )
+
+    updated = module.read_text(encoding="utf-8")
+    assert "        if not username:" in updated
+    assert "        return True" in updated
+    assert "def untouched():\n    return 1" in updated
+    assert result["source_hash"] != inspected["source_hash"]
+    ast.parse(updated)
+
+
+def test_edit_python_symbol_rejects_stale_hash_without_writing(tmp_path):
+    module = tmp_path / "module.py"
+    module.write_text("def value():\n    return 1\n", encoding="utf-8")
+    inspected = json.loads(inspect_python_symbol({"path": str(module), "qualified_name": "value"}))
+    module.write_text("def value():\n    return 2\n", encoding="utf-8")
+    current = module.read_text(encoding="utf-8")
+
+    with pytest.raises(ValueError, match="重新调用 inspect_python_symbol"):
+        edit_python_symbol(
+            {
+                "path": str(module),
+                "qualified_name": "value",
+                "expected_hash": inspected["source_hash"],
+                "operation": "replace_body",
+                "content": "return 3",
+            }
+        )
+
+    assert module.read_text(encoding="utf-8") == current
+
+
+def test_edit_python_symbol_rejects_invalid_python_without_writing(tmp_path):
+    module = tmp_path / "module.py"
+    original = "def value():\n    return 1\n"
+    module.write_text(original, encoding="utf-8")
+    inspected = json.loads(inspect_python_symbol({"path": str(module), "qualified_name": "value"}))
+
+    with pytest.raises(ValueError, match="文件未写入"):
+        edit_python_symbol(
+            {
+                "path": str(module),
+                "qualified_name": "value",
+                "expected_hash": inspected["source_hash"],
+                "operation": "replace_body",
+                "content": "return (",
+            }
+        )
+
+    assert module.read_text(encoding="utf-8") == original
 
 
 def test_code_index_tools_find_symbols_and_dependencies(tmp_path):

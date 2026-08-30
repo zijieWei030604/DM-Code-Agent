@@ -96,6 +96,24 @@ CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
         "label": "Adaptive Replanning",
         "help": "扩展的重规划决策策略与限制。基础重规划本来就一直开着。",
     },
+    {
+        "flag": "--enable-repo-map",
+        "key": "enable_repo_map",
+        "kind": "bool",
+        "default": False,
+        "category": "behavior",
+        "label": "Repository Map",
+        "help": "按任务筛选 Python 类、函数、方法与导入关系，并注入模型上下文。",
+    },
+    {
+        "flag": "--enable-verified-edits",
+        "key": "enable_verified_edits",
+        "kind": "bool",
+        "default": False,
+        "category": "safety",
+        "label": "Verified Edit Transaction",
+        "help": "完成前校验语法和受影响测试；校验未通过时恢复修改前快照。",
+    },
 )
 
 

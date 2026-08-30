@@ -144,6 +144,18 @@ dm-agent-web                 # 完整工作台：对话式交任务 + SSE 实时
 | 原子写 + 自动备份、LLM 统一重试 | |
 | `--checkpoint` / `--resume` run 级断点续跑 | |
 
+两个面向真实代码库的能力保持默认关闭，可分别启用：
+
+```bash
+dm-agent --enable-repo-map "定位并修复订单金额计算问题"
+dm-agent --enable-repo-map --enable-verified-edits "修复订单金额计算并补回归测试"
+```
+
+`--enable-repo-map` 会在 `.dm_agent/index/workspace.db` 中维护内容哈希、符号、引用和
+FTS5 全文索引；文件修改后只重建受影响记录，并在下一次 LLM 请求前刷新 Repo Map。
+`--enable-verified-edits` 把本轮所有写操作纳入同一事务，完成前校验 Python 语法和由
+引用关系推导出的测试；校验未通过时恢复修改前字节快照并否决本次完成。
+
 新用户拿到的是一个**安全的**默认配置；研究者按需 `--enable-xxx` 打开单个变量做 ablation。
 
 v2.1 做了一次减法：把 6 个**毕业标准依赖已冻结评测**的默认关模块删掉了
@@ -245,7 +257,7 @@ flowchart TD
     EXT["<b>extensions</b> — ExtensionAPI · 注册表 · 五级发现 · 项目信任模型"]
     CORE["<b>core</b> — agent.py 只做装配 + ReAct 主循环<br/>context_window · response_parser · tool_invoker · completion<br/>replan · persistence · run_state · observation · prompting"]
     TRACING["<b>tracing</b> — 会话条目树 · append-only 写入 · 隐私分档 · fork"]
-    TOOLS["<b>tools</b> — 17 个内置工具 + MCP 动态工具"]
+    TOOLS["<b>tools</b> — 19 个内置工具 + MCP 动态工具"]
     CLIENTS["<b>clients</b> — deepseek / openai / claude / gemini + 可注册自定义"]
 
     WEB -. "spawn 子进程，不把 CLI 当库用" .-> CLI
@@ -269,6 +281,8 @@ flowchart TD
 | 本地优先（无沙箱依赖） | ✅ | ✅ | docker | docker | ✅ |
 | 会话日志 + Replay | ✅ JSONL 条目树 + dry/tool replay + diff + fork | git diff | server log | trajectory | 弱 |
 | 非破坏式上下文折叠 | ✅ 原文不删，可离线重算 | repo-map | partial | trajectory | weak |
+| 任务相关 Repo Map | ✅ SQLite FTS5 持久索引、引用影响分析、动态刷新、字符预算 | ✅ | partial | partial | ❌ |
+| Verified Edit Transaction | ✅ 写前快照、语法/受影响测试校验、失败回滚 | partial | partial | partial | ❌ |
 | 扩展系统（不改内核加能力） | ✅ entry_points + 目录 + 显式文件 | ❌ | plugins | ❌ | ❌ |
 | 可拦截生命周期钩子 | ✅ 6 个事件 | ❌ | partial | ❌ | ❌ |
 | 可视化审计控制台 | ✅ 只读展厅免 key、可静态托管 | 聊天 GUI | ✅ 完整 Web UI | trajectory inspector | ❌ |

@@ -142,18 +142,28 @@ def test_cli_advanced_features_default_off(monkeypatch):
     args = parse_args(["do maintenance"])
 
     assert args.enable_adaptive_replanning is False
+    assert args.enable_repo_map is False
     assert args.max_replans == -1
     assert validate_feature_args(args) == ""
 
 
 def test_cli_advanced_features_wire_into_agent(monkeypatch):
     monkeypatch.setattr("dm_agent.cli.args.load_config_from_file", lambda: {})
-    args = parse_args(["do maintenance", "--enable-adaptive-replanning", "--max-replans", "2"])
+    args = parse_args(
+        [
+            "do maintenance",
+            "--enable-adaptive-replanning",
+            "--enable-repo-map",
+            "--max-replans",
+            "2",
+        ]
+    )
     assert validate_feature_args(args) == ""
 
     config = Config(
         api_key="test-key",
         enable_adaptive_replanning=args.enable_adaptive_replanning,
+        enable_repo_map=args.enable_repo_map,
         max_replans=args.max_replans,
     )
 
@@ -167,6 +177,7 @@ def test_cli_advanced_features_wire_into_agent(monkeypatch):
     )
 
     assert agent.enable_adaptive_replanning is True
+    assert agent.enable_repo_map is True
     assert agent.max_replans == 2
 
 

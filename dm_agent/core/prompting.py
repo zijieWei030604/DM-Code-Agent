@@ -28,7 +28,12 @@ class SkillActivation:
     tools: list[Tool] = field(default_factory=list)
 
 
-def build_user_prompt(task: str, plan: Sequence[PlanStep] | None = None) -> str:
+def build_user_prompt(
+    task: str,
+    plan: Sequence[PlanStep] | None = None,
+    *,
+    repository_map: str = "",
+) -> str:
     """构建用户提示词。
 
     Args:
@@ -39,6 +44,10 @@ def build_user_prompt(task: str, plan: Sequence[PlanStep] | None = None) -> str:
         构建好的用户提示词字符串
     """
     lines: list[str] = [f"任务：{task.strip()}"]
+
+    if repository_map.strip():
+        lines.append("\n代码库地图：")
+        lines.append(repository_map.strip())
 
     # 如果有计划，添加到提示中
     if plan:

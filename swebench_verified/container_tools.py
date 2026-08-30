@@ -38,8 +38,10 @@ class ContainerExecutionBackend:
         self.container_name = container_name
         self.stats = ContainerExecutionStats()
 
-    def _run(self, command: str) -> str:
-        result = subprocess.run(
+    def _execute(
+        self, command: str, *, timeout: int | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
             [
                 "docker",
                 "exec",
@@ -52,10 +54,11 @@ class ContainerExecutionBackend:
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=timeout,
         )
-        self.stats.calls += 1
-        if result.returncode != 0:
-            self.stats.failures += 1
+
+    @staticmethod
+    def _format_result(result: subprocess.CompletedProcess[str]) -> str:
         segments: list[str] = []
         if result.stdout:
             segments.append(result.stdout.strip())
@@ -63,6 +66,27 @@ class ContainerExecutionBackend:
             segments.append(f"stderr:\n{result.stderr.strip()}")
         segments.append(f"returncode: {result.returncode}")
         return "\n".join(segment for segment in segments if segment).strip()
+
+    def _run(self, command: str) -> str:
+        result = self._execute(command)
+        self.stats.calls += 1
+        if result.returncode != 0:
+            self.stats.failures += 1
+        return self._format_result(result)
+
+    def run_validation(self, arguments: list[str], timeout: int) -> tuple[int, str]:
+        """Run a verifier with the task image's Python and dependencies."""
+        command = " ".join(shlex.quote(part) for part in ["python", *arguments])
+        try:
+            result = self._execute(command, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            self.stats.calls += 1
+            self.stats.failures += 1
+            return 124, f"validation timed out after {timeout} seconds"
+        self.stats.calls += 1
+        if result.returncode != 0:
+            self.stats.failures += 1
+        return result.returncode, self._format_result(result)
 
     def run_shell(self, arguments: dict[str, Any]) -> str:
         return self._run(_require_str(arguments, "command"))

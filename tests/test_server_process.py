@@ -139,6 +139,11 @@ def test_boolean_flags_only_appear_when_true() -> None:
     on = build_argv(spec(options={"enable_adaptive_replanning": True}), trace_path=Path("t.jsonl"))
     assert "--enable-adaptive-replanning" in on
 
+    repo_map_off = build_argv(spec(options={"enable_repo_map": False}), trace_path=Path("t.jsonl"))
+    assert "--enable-repo-map" not in repo_map_off
+    repo_map_on = build_argv(spec(options={"enable_repo_map": True}), trace_path=Path("t.jsonl"))
+    assert "--enable-repo-map" in repo_map_on
+
 
 def test_edit_guard_is_a_reverse_flag() -> None:
     """守卫默认开，只有显式关掉才加 --disable-edit-guard。"""
@@ -158,6 +163,7 @@ def test_model_omitted_when_empty() -> None:
 
 ALL_OPTIONS: dict[str, object] = {
     "enable_adaptive_replanning": True,
+    "enable_repo_map": True,
     "enable_edit_guard": False,
     "max_steps": 10,
     "temperature": 0.5,
@@ -197,6 +203,7 @@ def test_generated_argv_is_accepted_by_the_real_cli_parser() -> None:
     # --disable-edit-guard 的 dest 是 enable_edit_guard + store_false，
     # 所以「传了这个开关」在解析结果里表现为 enable_edit_guard=False。
     assert parsed.enable_edit_guard is False
+    assert parsed.enable_repo_map is True
 
 
 def test_default_argv_is_also_accepted(tmp_path: Path) -> None:

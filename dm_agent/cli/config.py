@@ -41,6 +41,8 @@ class Config:
     max_observation_chars: int = 8000
     context_token_budget: int = 24000
     enable_edit_guard: bool = True
+    enable_repo_map: bool = False
+    enable_verified_edits: bool = False
     llm_max_retries: int = 2
     enable_adaptive_replanning: bool = False
     max_replans: int = -1
@@ -82,6 +84,8 @@ def save_config_to_file(config: Config) -> None:
             "max_observation_chars": config.max_observation_chars,
             "context_token_budget": config.context_token_budget,
             "enable_edit_guard": config.enable_edit_guard,
+            "enable_repo_map": config.enable_repo_map,
+            "enable_verified_edits": config.enable_verified_edits,
             "llm_max_retries": config.llm_max_retries,
             "enable_adaptive_replanning": config.enable_adaptive_replanning,
             "max_replans": config.max_replans,
@@ -130,6 +134,7 @@ def resolve_advanced_features(config: Config) -> dict[str, bool]:
     """Return effective advanced feature switches for one agent run."""
     return {
         "adaptive_replanning": config.enable_adaptive_replanning,
+        "verified_edits": config.enable_verified_edits,
     }
 
 
@@ -140,6 +145,7 @@ def format_advanced_feature_status(config: Config) -> str:
         label
         for key, label in [
             ("adaptive_replanning", "adaptive-replan"),
+            ("verified_edits", "verified-edits"),
         ]
         if advanced[key]
     ]

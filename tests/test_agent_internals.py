@@ -280,6 +280,17 @@ def test_build_user_prompt_renders_task_and_plan():
     assert "之前的步骤：" not in prompt
 
 
+def test_build_user_prompt_includes_repository_map_when_present():
+    prompt = build_user_prompt(
+        "修改登录逻辑",
+        repository_map="<repository_map>\nauth.py\n  def login(user)\n</repository_map>",
+    )
+
+    assert "代码库地图：" in prompt
+    assert "auth.py" in prompt
+    assert "def login(user)" in prompt
+
+
 def test_get_conversation_history_returns_a_copy():
     agent = _agent([_action("finish", {"answer": "done"})])
     agent.run("build some history", max_steps=2)

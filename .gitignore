@@ -101,3 +101,9 @@ swebench_work/
 swebench_verified/logs/
 dm-agent-*.json
 logs/run_evaluation/
+
+# Local pytest/benchmark temporary workspaces
+.pytest-tmp-*/
+.test-tmp-*/
+.pytest-*/
+.verified-edits-subprocess-temp/

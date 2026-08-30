@@ -36,6 +36,7 @@ COMPARED_CONFIG_KEYS = (
     "enable_planning",
     "enable_compression",
     "enable_edit_guard",
+    "enable_repo_map",
     "max_observation_chars",
     "context_token_budget",
 )
@@ -190,6 +191,7 @@ def agent_config_snapshot(
     enable_planning: bool,
     enable_compression: bool,
     enable_edit_guard: bool,
+    enable_repo_map: bool,
     max_observation_chars: int,
     context_token_budget: int,
     max_steps: int | None = None,
@@ -205,6 +207,7 @@ def agent_config_snapshot(
         "enable_planning": enable_planning,
         "enable_compression": enable_compression,
         "enable_edit_guard": enable_edit_guard,
+        "enable_repo_map": enable_repo_map,
         "max_observation_chars": max_observation_chars,
         "context_token_budget": context_token_budget,
     }

@@ -20,6 +20,7 @@ from dm_agent.core.events import (
     EventBus,
     RunStartEvent,
 )
+from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
 from dm_agent.tools.base import Tool
 from dm_agent.tools.file_tools import create_file, edit_file, read_file
 from dm_agent.tracing import TraceWriter, load_trace_events
@@ -95,6 +96,27 @@ def test_container_execution_backend_replaces_only_execution_tools(monkeypatch):
     assert "conda activate testbed" in calls[0][-1]
     assert backend.stats.calls == 1
     assert backend.stats.failures == 0
+
+
+def test_container_execution_backend_runs_validation_in_task_container(monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+    calls: list[tuple[list[str], int | None]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs.get("timeout")))
+        return subprocess.CompletedProcess(command, 0, stdout="1 passed\n", stderr="")
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
+
+    returncode, output = backend.run_validation(["-m", "pytest", "-q", "tests/test_service.py"], 45)
+
+    assert returncode == 0
+    assert "1 passed" in output
+    assert calls[0][0][:4] == ["docker", "exec", "task-container", "bash"]
+    assert "python -m pytest -q tests/test_service.py" in calls[0][0][-1]
+    assert calls[0][1] == 45
 
 
 def test_start_runtime_container_mounts_workspace_without_removing_image(monkeypatch, tmp_path):
@@ -388,6 +410,34 @@ def test_predict_one_marks_diagnostics_unmeasured_after_agent_exception(monkeypa
     assert "dm_parse_errors" not in record
     assert "dm_repeat_search_blocks" not in record
     assert "dm_edit_cycle_blocks" not in record
+
+
+def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypatch, tmp_path):
+    workspace_root = _prepare_predict(monkeypatch, tmp_path, {"metadata": {}, "steps": []})
+
+    predict.predict_one(
+        _instance(),
+        workspace_root=workspace_root,
+        provider="deepseek",
+        model=None,
+        max_steps=60,
+        temperature=0.0,
+        timeout=30,
+        trace_dir=None,
+        keep_workspace=True,
+        enable_repo_map=True,
+        enable_verified_edits=True,
+    )
+
+    capabilities = _FakeAgent.last_kwargs["capabilities"]
+    assert isinstance(capabilities[0], SWEProgressLoopGuard)
+    assert any(isinstance(capability, SemanticWorkspaceCapability) for capability in capabilities)
+    verified = next(
+        capability for capability in capabilities if isinstance(capability, VerifiedEditCapability)
+    )
+    assert verified.command_runner is not None
+    assert verified.command_runner.__self__.container_name == "test-container"
+    assert _FakeAgent.last_kwargs["enable_repo_map"] is True
 
 
 def _event_bus_with_progress_guard(trace_writer=None):

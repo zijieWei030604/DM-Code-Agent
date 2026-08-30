@@ -29,9 +29,11 @@ from typing import Any
 from dm_agent.clients.llm_factory import PROVIDER_DEFAULTS, create_llm_client
 from dm_agent.core import ReactAgent
 from dm_agent.evals.real_runner import PROVIDER_API_KEY_ENV, UsageTrackingClient
+from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
 from dm_agent.paths import load_env_files
 from dm_agent.tools import default_tools
 from dm_agent.tracing import TraceWriter
+from dm_agent.workspace import SemanticWorkspaceEngine
 
 from .container_tools import ContainerExecutionBackend
 from .dataset import image_name
@@ -419,6 +421,8 @@ def predict_one(
     timeout: int,
     trace_dir: Path | None,
     keep_workspace: bool,
+    enable_repo_map: bool = False,
+    enable_verified_edits: bool = False,
 ) -> dict[str, Any]:
     """跑完一道题，返回一条预测记录（含足够的诊断字段）。"""
     instance_id = instance["instance_id"]
@@ -450,13 +454,28 @@ def predict_one(
 
         client = build_client(provider, model, timeout)
         tools = execution_backend.replace_execution_tools(default_tools(include_mcp=False))
+        capabilities: list[Any] = [SWEProgressLoopGuard()]
+        workspace_engine = None
+        if enable_repo_map or enable_verified_edits:
+            workspace_engine = SemanticWorkspaceEngine(workspace)
+        if enable_repo_map and workspace_engine is not None:
+            capabilities.append(SemanticWorkspaceCapability(workspace_engine))
+        if enable_verified_edits:
+            capabilities.append(
+                VerifiedEditCapability(
+                    workspace,
+                    engine=workspace_engine,
+                    command_runner=execution_backend.run_validation,
+                )
+            )
         agent = ReactAgent(
             client,
             tools,
             max_steps=max_steps,
             temperature=temperature,
             trace_writer=trace_writer,
-            capabilities=[SWEProgressLoopGuard()],
+            enable_repo_map=enable_repo_map,
+            capabilities=capabilities,
         )
         prompt = PROMPT_TEMPLATE.format(
             repo=instance["repo"],

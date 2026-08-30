@@ -15,10 +15,13 @@ from dm_agent import (
     create_llm_client,
     default_tools,
 )
+from dm_agent.core.capabilities import AgentCapability
 from dm_agent.core.checkpoint import RunCheckpoint
+from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
 from dm_agent.mcp import MCPManager, load_mcp_config
 from dm_agent.skills import SkillManager
 from dm_agent.tracing import SessionWriter, TraceWriter
+from dm_agent.workspace import SemanticWorkspaceEngine
 
 if TYPE_CHECKING:
     from dm_agent.extensions import ExtensionRegistry
@@ -96,6 +99,14 @@ def create_agent(
 ) -> ReactAgent:
     """Create a ReactAgent with the CLI's default-off advanced switches."""
     advanced = resolve_advanced_features(config)
+    capabilities: list[AgentCapability] = []
+    workspace_engine = None
+    if config.enable_repo_map or config.enable_verified_edits:
+        workspace_engine = SemanticWorkspaceEngine(Path.cwd())
+    if config.enable_repo_map and workspace_engine is not None:
+        capabilities.append(SemanticWorkspaceCapability(workspace_engine))
+    if config.enable_verified_edits:
+        capabilities.append(VerifiedEditCapability(Path.cwd(), engine=workspace_engine))
     return ReactAgent(
         client,
         tools,
@@ -107,6 +118,8 @@ def create_agent(
         max_observation_chars=config.max_observation_chars,
         context_token_budget=config.context_token_budget,
         enable_edit_guard=config.enable_edit_guard,
+        enable_repo_map=config.enable_repo_map,
+        capabilities=capabilities,
         enable_adaptive_replanning=advanced["adaptive_replanning"],
         max_replans=config.max_replans,
         event_bus=(
@@ -186,6 +199,7 @@ def _assemble_agent(
                 "skill_count": skill_count,
                 "trace_llm_io": trace_llm_io,
                 "adaptive_replanning_enabled": advanced["adaptive_replanning"],
+                "verified_edits_enabled": advanced["verified_edits"],
                 "max_replans": config.max_replans,
             },
         )

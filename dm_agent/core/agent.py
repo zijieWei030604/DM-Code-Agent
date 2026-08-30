@@ -11,6 +11,7 @@ from typing import Any, cast
 
 from dm_agent.clients.base_client import BaseLLMClient
 from dm_agent.memory.context_compressor import ContextCompressor
+from dm_agent.memory.repo_map import RepoMapResult, RepositoryMap
 from dm_agent.prompts import build_code_agent_prompt
 from dm_agent.tools.base import Tool
 from dm_agent.tracing.session import parse_failed_response_placeholder
@@ -89,6 +90,7 @@ class ReactAgent:
         max_observation_chars: int = 8000,
         context_token_budget: int = 24000,
         enable_edit_guard: bool = True,
+        enable_repo_map: bool = False,
         event_bus: EventBus | None = None,
     ) -> None:
         """初始化 ReactAgent。
@@ -171,6 +173,8 @@ class ReactAgent:
         self._edit_guard = ReadBeforeEditGuard(
             enabled=enable_edit_guard, trace_writer=self.trace_writer
         )
+        self.enable_repo_map = enable_repo_map
+        self._repo_map = RepositoryMap() if enable_repo_map else None
         # 技能管理器
         self.skill_manager = skill_manager
         self._base_system_prompt = self.system_prompt
@@ -365,6 +369,17 @@ class ReactAgent:
             adaptive_replanning_enabled=self.enable_adaptive_replanning,
             max_replans=self.max_replans,
         )
+        metadata.update(
+            {
+                "repo_map_enabled": self.enable_repo_map,
+                "repo_map_files": 0,
+                "repo_map_chars": 0,
+                "repo_map_cache_hits": 0,
+                "repo_map_parse_errors": 0,
+                "repo_map_truncated": False,
+                "repo_map_error": "",
+            }
+        )
         self._run_context.begin(run_id=run_token, metadata=metadata)
         start_event = RunStartEvent(
             task=task,
@@ -391,6 +406,7 @@ class ReactAgent:
                     "max_observation_chars": self.max_observation_chars,
                     "context_token_budget": self.context_token_budget,
                     "edit_guard_enabled": self.enable_edit_guard,
+                    "repo_map_enabled": self.enable_repo_map,
                     "skills_enabled": bool(self.skill_manager),
                     "adaptive_replanning_enabled": self.enable_adaptive_replanning,
                     "max_replans": self.max_replans,
@@ -421,6 +437,33 @@ class ReactAgent:
         if prompt_suffix:
             self.system_prompt += "\n\n" + prompt_suffix
 
+        repo_map_result = RepoMapResult("", 0, 0, 0, 0, False, "")
+        if resume_state is None and self._repo_map is not None:
+            try:
+                repo_map_result = self._repo_map.build(task, Path.cwd())
+            except (OSError, ValueError) as exc:
+                metadata["repo_map_error"] = str(exc)
+                print(f"[warn] Repo Map 生成失败：{exc}")
+            else:
+                metadata["repo_map_files"] = repo_map_result.included_files
+                metadata["repo_map_chars"] = len(repo_map_result.content)
+                metadata["repo_map_cache_hits"] = repo_map_result.cache_hits
+                metadata["repo_map_parse_errors"] = repo_map_result.parse_errors
+                metadata["repo_map_truncated"] = repo_map_result.truncated
+                if self.trace_writer:
+                    self.trace_writer.record(
+                        "repo_map",
+                        {
+                            "scanned_files": repo_map_result.scanned_files,
+                            "included_files": repo_map_result.included_files,
+                            "chars": len(repo_map_result.content),
+                            "cache_hits": repo_map_result.cache_hits,
+                            "parse_errors": repo_map_result.parse_errors,
+                            "truncated": repo_map_result.truncated,
+                            "fingerprint": repo_map_result.fingerprint,
+                        },
+                    )
+
         # 第一步：生成计划（如果启用）；resume 时改为恢复既有状态
         if resume_state is not None:
             self._adopt_existing_history(kind="resumed")
@@ -434,7 +477,10 @@ class ReactAgent:
             self._adopt_existing_history(kind="carried")
             if self.enable_planning and self.planner:
                 try:
-                    plan = self.planner.plan(task)
+                    planning_task = task
+                    if repo_map_result.content:
+                        planning_task += "\n\n" + repo_map_result.content
+                    plan = self.planner.plan(planning_task)
                     metadata["initial_plan_steps"] = len(plan)
                     if self.trace_writer:
                         self.trace_writer.record_plan(plan)
@@ -447,7 +493,11 @@ class ReactAgent:
                     print(f"[warn] 计划生成失败：{e}，将使用常规模式执行")
 
             # 添加新任务到对话历史
-            task_prompt: str = build_user_prompt(task, plan)
+            task_prompt: str = build_user_prompt(
+                task,
+                plan,
+                repository_map=repo_map_result.content,
+            )
             self._append_history("user", task_prompt, kind="task")
 
         for step_num in range(resume_from + 1, limit + 1):
@@ -769,6 +819,7 @@ class ReactAgent:
             enable_planning=self.enable_planning,
             enable_compression=self.enable_compression,
             enable_edit_guard=self.enable_edit_guard,
+            enable_repo_map=self.enable_repo_map,
             max_observation_chars=self.max_observation_chars,
             context_token_budget=self.context_token_budget,
             max_steps=max_steps,
@@ -864,6 +915,7 @@ class ReactAgent:
             "conversation_messages": len(self.conversation_history),
             "compression_enabled": self.enable_compression,
             "memory_items": self.compressor.memory_count if self.compressor else 0,
+            "repo_map_enabled": self.enable_repo_map,
         }
 
     def get_conversation_history(self) -> list[dict[str, str]]:

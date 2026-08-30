@@ -122,6 +122,18 @@ def parse_args(argv: Any) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-repo-map",
+        action="store_true",
+        default=saved_config.get("enable_repo_map", False),
+        help="启用任务相关的 Python 代码库地图，并自动注入 Planner 与 Agent 上下文。",
+    )
+    parser.add_argument(
+        "--enable-verified-edits",
+        action="store_true",
+        default=saved_config.get("enable_verified_edits", False),
+        help="启用编辑事务：完成前校验语法和受影响测试，失败时自动回滚。",
+    )
+    parser.add_argument(
         "--llm-max-retries",
         type=int,
         default=saved_config.get("llm_max_retries", 2),

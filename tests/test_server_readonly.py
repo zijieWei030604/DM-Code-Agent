@@ -34,8 +34,8 @@ def test_health_and_meta_shape(client: TestClient) -> None:
         "claude",
         "gemini",
     }
-    # 17 个内置工具，与 README 声明一致。
-    assert len(meta["tools"]) == 17
+    # 19 个内置工具，与工具注册表保持一致。
+    assert len(meta["tools"]) == 19
     # 开关目录必须同时覆盖两类，前端才能渲染出「护栏默认开 / 行为默认关」的分组。
     categories = {item["category"] for item in meta["capabilities"]}
     assert {"guardrail", "behavior"} <= categories

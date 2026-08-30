@@ -90,6 +90,8 @@ _STRUCTURED_OUTPUT_TOOLS = frozenset(
         "build_code_index",
         "search_symbol",
         "dependency_graph",
+        "inspect_python_symbol",
+        "edit_python_symbol",
         "task_complete",
     }
 )

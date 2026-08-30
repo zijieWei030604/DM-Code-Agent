@@ -8,8 +8,8 @@ from dm_agent.memory.context_budget import FileLedger
 
 from .events import AfterToolResultEvent, BeforeToolCallEvent
 
-READ_ACTIONS = frozenset({"read_file", "search_in_file"})
-WRITE_ACTIONS = frozenset({"edit_file", "create_file"})
+READ_ACTIONS = frozenset({"read_file", "search_in_file", "inspect_python_symbol"})
+WRITE_ACTIONS = frozenset({"edit_file", "create_file", "edit_python_symbol"})
 
 
 class ReadBeforeEditGuard:
@@ -26,7 +26,7 @@ class ReadBeforeEditGuard:
 
     def before_tool_call(self, event: BeforeToolCallEvent) -> dict[str, Any] | None:
         """检查 edit_file，并以标准 block 结果拦截未读或已过期的编辑。"""
-        if not self.enabled or event.tool_name != "edit_file":
+        if not self.enabled or event.tool_name not in {"edit_file", "edit_python_symbol"}:
             return None
         path = event.arguments.get("path")
         if not isinstance(path, str) or not path:
@@ -104,12 +104,12 @@ def _block_message(path: str, reason: str) -> str:
     if reason == "stale_read":
         return (
             f"Edit blocked: {path} changed after your last read in this run. "
-            "Re-read the target range with read_file (line_start/line_end) to get "
-            "current line numbers, then edit."
+            "Re-read the target with read_file, or re-inspect it with "
+            "inspect_python_symbol, then edit."
         )
     return (
         f"Edit blocked: {path} has not been read in this run yet. "
-        "Read the target range with read_file (line_start/line_end) first, then edit."
+        "Read the target with read_file, or inspect it with inspect_python_symbol first, then edit."
     )
 
 

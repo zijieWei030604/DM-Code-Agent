@@ -9,6 +9,7 @@ from dm_agent.core.agent import ReactAgent
 from dm_agent.core.events import EventBus
 from dm_agent.tools.base import Tool
 from dm_agent.tools.file_tools import create_file, edit_file, read_file
+from dm_agent.tools.structured_edit_tools import edit_python_symbol, inspect_python_symbol
 from dm_agent.tracing import TraceWriter, load_trace_events
 
 
@@ -29,6 +30,14 @@ def _file_tools():
         Tool("read_file", "Read a file", read_file),
         Tool("create_file", "Create a file", create_file),
         Tool("edit_file", "Edit a file", edit_file),
+        Tool("task_complete", "Finish", lambda arguments: "finished"),
+    ]
+
+
+def _structured_file_tools():
+    return [
+        Tool("inspect_python_symbol", "Inspect a Python symbol", inspect_python_symbol),
+        Tool("edit_python_symbol", "Edit a Python symbol", edit_python_symbol),
         Tool("task_complete", "Finish", lambda arguments: "finished"),
     ]
 
@@ -84,6 +93,44 @@ def test_edit_guard_blocks_unread_file_then_allows_after_read(tmp_path, monkeypa
     assert Path("app.py").read_text(encoding="utf-8") == "edited line\n"
     # Guard text must not read as a failure (no replan / failure bookkeeping).
     assert not ReactAgent._is_failure_observation(blocked)
+
+
+def test_structured_edit_requires_inspection_then_writes_with_backup(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = Path("app.py")
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    inspected = json.loads(inspect_python_symbol({"path": "app.py", "qualified_name": "value"}))
+    edit_arguments = {
+        "path": "app.py",
+        "qualified_name": "value",
+        "expected_hash": inspected["source_hash"],
+        "operation": "replace_body",
+        "content": "return 2",
+    }
+    client = FakeRespondClient(
+        [
+            _action("edit_python_symbol", edit_arguments),
+            _action(
+                "inspect_python_symbol",
+                {"path": "app.py", "qualified_name": "value"},
+            ),
+            _action("edit_python_symbol", edit_arguments),
+            _action("finish", "updated value"),
+        ]
+    )
+    agent = ReactAgent(
+        client,
+        _structured_file_tools(),
+        enable_planning=False,
+        enable_compression=False,
+    )
+
+    result = agent.run("update value", max_steps=6)
+
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["edit_guard_block_count"] == 1
+    assert result["metadata"]["backup_count"] == 1
+    assert target.read_text(encoding="utf-8") == "def value():\n    return 2\n"
 
 
 def test_edit_guard_requires_reread_after_write(tmp_path, monkeypatch):

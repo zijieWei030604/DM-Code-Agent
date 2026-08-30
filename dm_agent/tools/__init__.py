@@ -20,6 +20,7 @@ from .file_tools import (
     read_file,
     search_in_file,
 )
+from .structured_edit_tools import edit_python_symbol, inspect_python_symbol
 
 if TYPE_CHECKING:
     from dm_agent.extensions import ExtensionAPI, ExtensionRegistry
@@ -191,6 +192,25 @@ def _builtin_tools() -> list[Tool]:
                 '"max_files": optional int, "include_external": optional bool}.'
             ),
             runner=dependency_graph,
+        ),
+        Tool(
+            name="inspect_python_symbol",
+            description=(
+                "Inspect one top-level Python function/class or direct class method without knowing line numbers. "
+                'Arguments: {"path": string, "qualified_name": string such as "UserService.login"}. '
+                "Returns source, location, signature, and source_hash for a guarded follow-up edit."
+            ),
+            runner=inspect_python_symbol,
+        ),
+        Tool(
+            name="edit_python_symbol",
+            description=(
+                "Safely edit a previously inspected Python function, class, or direct method. "
+                'Arguments: {"path": string, "qualified_name": string, "expected_hash": string from '
+                'inspect_python_symbol, "operation": "replace_body"|"replace_symbol", "content": string}. '
+                "The edit is rejected if the symbol changed, and invalid Python is never written."
+            ),
+            runner=edit_python_symbol,
         ),
         Tool(
             name="task_complete",
