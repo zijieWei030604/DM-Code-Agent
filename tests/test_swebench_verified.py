@@ -59,11 +59,85 @@ def _prepare_predict(monkeypatch, tmp_path: Path, result: dict[str, Any] | Excep
 
     _FakeAgent.result = result
     monkeypatch.setattr(predict, "materialize_workspace", materialize)
+    monkeypatch.setattr(
+        predict,
+        "start_runtime_container",
+        lambda _instance_id, _workspace: ("test-container", "test-image"),
+    )
+    monkeypatch.setattr(predict, "stop_runtime_container", lambda _container: None)
     monkeypatch.setattr(predict, "build_client", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(predict, "ReactAgent", _FakeAgent)
     monkeypatch.setattr(predict, "default_tools", lambda **_kwargs: [])
     monkeypatch.setattr(predict, "extract_patch", lambda _workspace: "diff --git a/a b/a\n")
     return workspace_root
+
+
+def test_container_execution_backend_replaces_only_execution_tools(monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+    original = [
+        Tool("read_file", "read", lambda _args: "host"),
+        Tool("run_shell", "shell", lambda _args: "host"),
+    ]
+    tools = backend.replace_execution_tools(original)
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="inside\n", stderr="")
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
+
+    assert tools[0] is original[0]
+    assert tools[1].execute({"command": "python -V"}) == "inside\nreturncode: 0"
+    assert calls[0][:4] == ["docker", "exec", "task-container", "bash"]
+    assert "conda activate testbed" in calls[0][-1]
+    assert backend.stats.calls == 1
+    assert backend.stats.failures == 0
+
+
+def test_start_runtime_container_mounts_workspace_without_removing_image(monkeypatch, tmp_path):
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(predict, "ensure_image", lambda _instance_id: "task-image:latest")
+    monkeypatch.setattr(predict, "_run", fake_run)
+
+    container, image = predict.start_runtime_container("owner__repo-1", tmp_path)
+
+    assert container == "dmagent-run-owner-repo-1"
+    assert image == "task-image:latest"
+    create = commands[1]
+    assert create[:4] == ["docker", "create", "--name", container]
+    assert "--mount" in create
+    assert f"type=bind,source={tmp_path.resolve()},target=/testbed" in create
+    assert create[-4:] == ["--entrypoint", "sleep", "task-image:latest", "infinity"]
+    assert commands[2] == ["docker", "start", container]
+    assert not any(command[:3] == ["docker", "image", "rm"] for command in commands)
+
+
+def test_predict_one_always_stops_runtime_container(monkeypatch, tmp_path):
+    stopped: list[str] = []
+    workspace_root = _prepare_predict(monkeypatch, tmp_path, RuntimeError("boom"))
+    monkeypatch.setattr(predict, "stop_runtime_container", stopped.append)
+
+    predict.predict_one(
+        _instance(),
+        workspace_root=workspace_root,
+        provider="deepseek",
+        model=None,
+        max_steps=60,
+        temperature=0.0,
+        timeout=30,
+        trace_dir=None,
+        keep_workspace=True,
+    )
+
+    assert stopped == ["test-container"]
 
 
 def test_extract_workspace_archive_materializes_symlinks_as_git_link_text(tmp_path):

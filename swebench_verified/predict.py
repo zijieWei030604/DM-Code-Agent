@@ -33,6 +33,7 @@ from dm_agent.paths import load_env_files
 from dm_agent.tools import default_tools
 from dm_agent.tracing import TraceWriter
 
+from .container_tools import ContainerExecutionBackend
 from .dataset import image_name
 from .progress_guard import SWEProgressLoopGuard
 
@@ -284,6 +285,42 @@ def materialize_workspace(instance_id: str, destination: Path) -> Path:
     return destination
 
 
+def start_runtime_container(instance_id: str, workspace: Path) -> tuple[str, str]:
+    """Start a live task container with the host workspace mounted at ``/testbed``."""
+    image = ensure_image(instance_id)
+    container = f"dmagent-run-{instance_id.replace('__', '-')}"
+    _run(["docker", "rm", "-f", container])
+    mount = f"type=bind,source={workspace.resolve()},target=/testbed"
+    created = _run(
+        [
+            "docker",
+            "create",
+            "--name",
+            container,
+            "--mount",
+            mount,
+            "--workdir",
+            "/testbed",
+            "--entrypoint",
+            "sleep",
+            image,
+            "infinity",
+        ]
+    )
+    if created.returncode != 0:
+        raise RuntimeError(f"创建运行容器失败 {instance_id}: {created.stderr.strip()[:300]}")
+    started = _run(["docker", "start", container])
+    if started.returncode != 0:
+        _run(["docker", "rm", "-f", container])
+        raise RuntimeError(f"启动运行容器失败 {instance_id}: {started.stderr.strip()[:300]}")
+    return container, image
+
+
+def stop_runtime_container(container: str) -> None:
+    """Best-effort cleanup for a per-task runtime container; images are never removed."""
+    _run(["docker", "rm", "-f", container])
+
+
 def _assert_git_root(workspace: Path, instance_id: str) -> None:
     """确认工作区自己就是 git 仓库根。
 
@@ -389,91 +426,103 @@ def predict_one(
     started = time.perf_counter()
 
     materialize_workspace(instance_id, workspace)
+    container_name, container_image = start_runtime_container(instance_id, workspace)
+    execution_backend = ContainerExecutionBackend(container_name)
 
-    trace_writer = None
-    if trace_dir is not None:
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        trace_writer = TraceWriter(trace_dir / f"{instance_id}.jsonl")
-        trace_writer.record(
-            "runtime",
-            {
-                "mode": "swebench_verified",
-                "instance_id": instance_id,
-                "repo": instance["repo"],
-                "base_commit": instance["base_commit"],
-                "provider": provider,
-                "model": model or PROVIDER_DEFAULTS.get(provider, {}).get("model"),
-            },
+    try:
+        trace_writer = None
+        if trace_dir is not None:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            trace_writer = TraceWriter(trace_dir / f"{instance_id}.jsonl")
+            trace_writer.record(
+                "runtime",
+                {
+                    "mode": "swebench_verified",
+                    "instance_id": instance_id,
+                    "repo": instance["repo"],
+                    "base_commit": instance["base_commit"],
+                    "provider": provider,
+                    "model": model or PROVIDER_DEFAULTS.get(provider, {}).get("model"),
+                    "exec_backend": "docker",
+                    "container_image": container_image,
+                },
+            )
+
+        client = build_client(provider, model, timeout)
+        tools = execution_backend.replace_execution_tools(default_tools(include_mcp=False))
+        agent = ReactAgent(
+            client,
+            tools,
+            max_steps=max_steps,
+            temperature=temperature,
+            trace_writer=trace_writer,
+            capabilities=[SWEProgressLoopGuard()],
+        )
+        prompt = PROMPT_TEMPLATE.format(
+            repo=instance["repo"],
+            base_commit=instance["base_commit"],
+            problem_statement=instance["problem_statement"],
         )
 
-    client = build_client(provider, model, timeout)
-    agent = ReactAgent(
-        client,
-        default_tools(include_mcp=False),
-        max_steps=max_steps,
-        temperature=temperature,
-        trace_writer=trace_writer,
-        capabilities=[SWEProgressLoopGuard()],
-    )
-    prompt = PROMPT_TEMPLATE.format(
-        repo=instance["repo"],
-        base_commit=instance["base_commit"],
-        problem_statement=instance["problem_statement"],
-    )
+        status = "ok"
+        failure = ""
+        metadata: dict[str, Any] = {}
+        step_count = 0
+        diagnostics_measured = False
+        with chdir(workspace):
+            try:
+                with redirect_stdout(StringIO()):
+                    result = agent.run(prompt)
+                diagnostics_measured = True
+                metadata = dict(result.get("metadata", {}))
+                status = str(metadata.get("status", "unknown"))
+                step_count = len(result.get("steps", []))
+            except Exception as exc:  # 单题崩溃不该让整批预测终止
+                status = "agent_exception"
+                failure = f"{type(exc).__name__}: {exc}"
 
-    status = "ok"
-    failure = ""
-    metadata: dict[str, Any] = {}
-    step_count = 0
-    diagnostics_measured = False
-    with chdir(workspace):
-        try:
-            with redirect_stdout(StringIO()):
-                result = agent.run(prompt)
-            diagnostics_measured = True
-            metadata = dict(result.get("metadata", {}))
-            status = str(metadata.get("status", "unknown"))
-            step_count = len(result.get("steps", []))
-        except Exception as exc:  # 单题崩溃不该让整批预测终止
-            status = "agent_exception"
-            failure = f"{type(exc).__name__}: {exc}"
+        patch = extract_patch(workspace)
+        record: dict[str, Any] = {
+            "instance_id": instance_id,
+            "model_name_or_path": f"dm-agent-{provider}",
+            "model_patch": patch,
+            "dm_status": status,
+            "dm_failure": failure,
+            "dm_patch_chars": len(patch),
+            "dm_duration_seconds": round(time.perf_counter() - started, 2),
+            "dm_difficulty": instance.get("difficulty", ""),
+            "dm_exec_backend": "docker",
+            "dm_container_image": container_image,
+            "dm_container_exec_count": execution_backend.stats.calls,
+            "dm_container_exec_failures": execution_backend.stats.failures,
+        }
+        if diagnostics_measured:
+            # 下面是诊断字段，官方 harness 会忽略，但我们自己要看。Agent 异常时
+            # metadata 只存在于部分 trace，不能把“未测量”伪装成真实 0。
+            record.update(
+                {
+                    "dm_diagnostics_version": 1,
+                    "dm_steps": step_count,
+                    "dm_replans": metadata.get("replan_count", 0),
+                    "dm_parse_errors": metadata.get("parse_error_count", 0),
+                    "dm_parse_repairs": metadata.get("parse_repair_count", 0),
+                    "dm_parse_error_context_omitted_count": metadata.get(
+                        "parse_error_context_omitted_count", 0
+                    ),
+                    "dm_parse_error_context_omitted_chars": metadata.get(
+                        "parse_error_context_omitted_chars", 0
+                    ),
+                    "dm_truncations": metadata.get("truncation_count", 0),
+                    "dm_edit_guard_blocks": metadata.get("edit_guard_block_count", 0),
+                    "dm_edit_noops": metadata.get("edit_noop_count", 0),
+                    "dm_repeat_search_blocks": metadata.get("repeat_search_block_count", 0),
+                    "dm_edit_state_revisits": metadata.get("edit_state_revisit_count", 0),
+                    "dm_edit_cycle_blocks": metadata.get("edit_cycle_block_count", 0),
+                }
+            )
 
-    patch = extract_patch(workspace)
-    record: dict[str, Any] = {
-        "instance_id": instance_id,
-        "model_name_or_path": f"dm-agent-{provider}",
-        "model_patch": patch,
-        "dm_status": status,
-        "dm_failure": failure,
-        "dm_patch_chars": len(patch),
-        "dm_duration_seconds": round(time.perf_counter() - started, 2),
-        "dm_difficulty": instance.get("difficulty", ""),
-    }
-    if diagnostics_measured:
-        # 下面是诊断字段，官方 harness 会忽略，但我们自己要看。Agent 异常时
-        # metadata 只存在于部分 trace，不能把“未测量”伪装成真实 0。
-        record.update(
-            {
-                "dm_diagnostics_version": 1,
-                "dm_steps": step_count,
-                "dm_replans": metadata.get("replan_count", 0),
-                "dm_parse_errors": metadata.get("parse_error_count", 0),
-                "dm_parse_repairs": metadata.get("parse_repair_count", 0),
-                "dm_parse_error_context_omitted_count": metadata.get(
-                    "parse_error_context_omitted_count", 0
-                ),
-                "dm_parse_error_context_omitted_chars": metadata.get(
-                    "parse_error_context_omitted_chars", 0
-                ),
-                "dm_truncations": metadata.get("truncation_count", 0),
-                "dm_edit_guard_blocks": metadata.get("edit_guard_block_count", 0),
-                "dm_edit_noops": metadata.get("edit_noop_count", 0),
-                "dm_repeat_search_blocks": metadata.get("repeat_search_block_count", 0),
-                "dm_edit_state_revisits": metadata.get("edit_state_revisit_count", 0),
-                "dm_edit_cycle_blocks": metadata.get("edit_cycle_block_count", 0),
-            }
-        )
-
-    if not keep_workspace:
-        shutil.rmtree(workspace, ignore_errors=True)
-    return record
+        if not keep_workspace:
+            shutil.rmtree(workspace, ignore_errors=True)
+        return record
+    finally:
+        stop_runtime_container(container_name)
