@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from dm_agent.core.capabilities import CapabilityContext
 from dm_agent.core.events import (
     AfterToolResultEvent,
@@ -10,6 +12,7 @@ from dm_agent.core.events import (
     RunStartEvent,
 )
 from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
+from dm_agent.tools.structured_edit_tools import edit_python_symbol, inspect_python_symbol
 from dm_agent.workspace import SemanticWorkspaceEngine
 
 
@@ -149,6 +152,96 @@ def test_verified_edit_commits_valid_python(tmp_path):
     assert block is None
     assert "return 2" in target.read_text(encoding="utf-8")
     assert metadata["edit_transaction_status"] == "committed"
+
+
+def test_structured_edit_commits_after_verified_validation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "module.py"
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    inspected = json.loads(
+        inspect_python_symbol({"path": "module.py", "qualified_name": "value"})
+    )
+    arguments = {
+        "path": "module.py",
+        "qualified_name": "value",
+        "expected_hash": inspected["source_hash"],
+        "operation": "replace_body",
+        "content": "return 2",
+    }
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path, run_affected_tests=False, run_lint=False, run_type_check=False
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("edit symbol", 1, "run", metadata=metadata))
+
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("edit_python_symbol", arguments, 1, "run", metadata)
+    )
+    observation = edit_python_symbol(arguments)
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_python_symbol", arguments, observation, 1, "run", True, metadata
+        )
+    )
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("edit symbol", "finish", "done", [], 2, "run", metadata)
+    )
+
+    assert block is None
+    assert target.read_text(encoding="utf-8") == "def value():\n    return 2\n"
+    assert metadata["edit_transaction_status"] == "committed"
+
+
+def test_structured_edit_rolls_back_when_verified_validation_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "module.py"
+    original = "def value():\n    return 1\n"
+    target.write_text(original, encoding="utf-8")
+    inspected = json.loads(
+        inspect_python_symbol({"path": "module.py", "qualified_name": "value"})
+    )
+    arguments = {
+        "path": "module.py",
+        "qualified_name": "value",
+        "expected_hash": inspected["source_hash"],
+        "operation": "replace_body",
+        "content": "return 2",
+    }
+
+    def reject_validation(command: list[str], timeout: int) -> tuple[int, str]:
+        return 1, f"rejected: {' '.join(command)} ({timeout}s)"
+
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path,
+        command_runner=reject_validation,
+        run_affected_tests=False,
+        run_lint=False,
+        run_type_check=False,
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("edit symbol", 1, "run", metadata=metadata))
+
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("edit_python_symbol", arguments, 1, "run", metadata)
+    )
+    observation = edit_python_symbol(arguments)
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_python_symbol", arguments, observation, 1, "run", True, metadata
+        )
+    )
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("edit symbol", "finish", "done", [], 2, "run", metadata)
+    )
+
+    assert block is not None
+    assert "runtime_python_syntax" in block["reason"]
+    assert target.read_text(encoding="utf-8") == original
+    assert metadata["edit_transaction_status"] == "rolled_back"
 
 
 def test_verified_edit_uses_injected_validation_runner(tmp_path):
