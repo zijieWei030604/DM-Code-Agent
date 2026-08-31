@@ -22,7 +22,7 @@ class OpenAIClient(BaseLLMClient):
         api_key: str,
         *,
         model: str = "gpt-5",
-        base_url: str = "",  # OpenAI SDK 不需要 base_url
+        base_url: str = "",
         timeout: int = 600,
         respond_retries: int = 2,
     ) -> None:
@@ -37,12 +37,15 @@ class OpenAIClient(BaseLLMClient):
             respond_retries=respond_retries,
         )
 
-        # 创建 OpenAI 客户端实例
-        # 官方 SDK 不需要手动设置 base_url
-        self.client = OpenAI(
-            api_key=self.api_key,
-            timeout=self.timeout,
-        )
+        # Keep the official default when no endpoint override is configured,
+        # while allowing OpenAI-compatible providers to supply their endpoint.
+        client_options: dict[str, Any] = {
+            "api_key": self.api_key,
+            "timeout": self.timeout,
+        }
+        if self.base_url:
+            client_options["base_url"] = self.base_url
+        self.client = OpenAI(**client_options)
 
     def complete(
         self,

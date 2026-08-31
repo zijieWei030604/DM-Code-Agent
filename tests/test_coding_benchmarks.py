@@ -50,6 +50,14 @@ def test_coding_benchmark_cli_lists_without_api_key():
     assert bench_main(["--list"]) == 0
 
 
+def test_coding_benchmark_cli_loads_env_files(monkeypatch):
+    loaded = []
+    monkeypatch.setattr("dm_agent.benchmarks.cli.load_env_files", lambda: loaded.append(True))
+
+    assert bench_main(["--list"]) == 0
+    assert loaded == [True]
+
+
 def test_benchmark_feature_flags_parse_without_api_key():
     assert (
         bench_main(

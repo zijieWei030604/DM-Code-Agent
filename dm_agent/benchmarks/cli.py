@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from dm_agent.paths import load_env_files
+
 from .models import BenchmarkRunConfig
 from .runner import (
     BENCH_VARIANTS,
@@ -104,6 +106,9 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
 
 
 def main(argv: Any = None) -> int:
+    # Match dm-agent and dm-agent-web: project .env first, then user .env.
+    # Existing process environment variables retain precedence.
+    load_env_files()
     args = parse_args(argv)
     if args.max_replans < -1:
         print("--max-replans must be -1 or greater.", file=sys.stderr)

@@ -9,11 +9,13 @@ from dm_agent.core.events import (
     BeforeLLMRequestEvent,
     BeforeToolCallEvent,
     EventBus,
+    RunEndEvent,
     RunStartEvent,
 )
 from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
 from dm_agent.tools.structured_edit_tools import edit_python_symbol, inspect_python_symbol
-from dm_agent.workspace import SemanticWorkspaceEngine
+from dm_agent.verification import VerificationPolicy
+from dm_agent.workspace import ImpactReport, SemanticWorkspaceEngine
 
 
 def test_semantic_workspace_persists_symbols_references_and_affected_tests(tmp_path):
@@ -176,13 +178,103 @@ def test_verified_edit_commits_valid_python(tmp_path):
     assert metadata["edit_transaction_status"] == "committed"
 
 
+def test_verified_edit_drops_transaction_when_file_returns_to_baseline(tmp_path):
+    target = tmp_path / "module.py"
+    original = "def value():\n    return 1\n"
+    target.write_text(original, encoding="utf-8")
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path, run_affected_tests=False, run_lint=False, run_type_check=False
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("edit module", 1, "run", metadata=metadata))
+    arguments = {"path": "module.py"}
+
+    bus.emit_before_tool_call(BeforeToolCallEvent("edit_file", arguments, 1, "run", metadata))
+    target.write_text("def value():\n    return 2\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent("edit_file", arguments, "written", 1, "run", True, metadata)
+    )
+    target.write_text(original, encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent("edit_file", arguments, "restored", 2, "run", True, metadata)
+    )
+
+    assert metadata["edit_transaction_status"] == "idle"
+    assert (
+        bus.emit_before_finish(
+            BeforeFinishEvent("edit module", "finish", "done", [], 3, "run", metadata)
+        )
+        is None
+    )
+    assert metadata["edit_validation_count"] == 0
+
+
+def test_verified_edit_salvages_valid_patch_at_run_end(tmp_path):
+    target = tmp_path / "module.py"
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path,
+        policy=VerificationPolicy(
+            check_lint=False,
+            check_types=False,
+            run_affected_tests=False,
+            finalize_on_run_end=True,
+        ),
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {"status": "max_steps_exceeded"}
+    bus.emit_run_start(RunStartEvent("edit module", 1, "run", metadata=metadata))
+    arguments = {"path": "module.py"}
+    bus.emit_before_tool_call(BeforeToolCallEvent("edit_file", arguments, 1, "run", metadata))
+    target.write_text("def value():\n    return 2\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent("edit_file", arguments, "written", 1, "run", True, metadata)
+    )
+
+    bus.emit_run_end(RunEndEvent("edit module", 1, "run", {"metadata": metadata}, metadata))
+
+    assert target.read_text(encoding="utf-8").endswith("return 2\n")
+    assert metadata["edit_transaction_status"] == "committed_on_run_end"
+    assert metadata["edit_run_end_salvaged"] is True
+    assert metadata["status"] == "max_steps_exceeded"
+
+
+def test_verified_edit_rolls_back_invalid_patch_at_run_end(tmp_path):
+    target = tmp_path / "module.py"
+    original = "def value():\n    return 1\n"
+    target.write_text(original, encoding="utf-8")
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path,
+        run_affected_tests=False,
+        run_lint=False,
+        run_type_check=False,
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {"status": "max_steps_exceeded"}
+    bus.emit_run_start(RunStartEvent("edit module", 1, "run", metadata=metadata))
+    arguments = {"path": "module.py"}
+    bus.emit_before_tool_call(BeforeToolCallEvent("edit_file", arguments, 1, "run", metadata))
+    target.write_text("def value(:\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent("edit_file", arguments, "written", 1, "run", True, metadata)
+    )
+
+    bus.emit_run_end(RunEndEvent("edit module", 1, "run", {"metadata": metadata}, metadata))
+
+    assert target.read_text(encoding="utf-8") == original
+    assert metadata["edit_transaction_status"] == "rolled_back"
+    assert metadata["edit_run_end_salvaged"] is False
+
+
 def test_structured_edit_commits_after_verified_validation(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "module.py"
     target.write_text("def value():\n    return 1\n", encoding="utf-8")
-    inspected = json.loads(
-        inspect_python_symbol({"path": "module.py", "qualified_name": "value"})
-    )
+    inspected = json.loads(inspect_python_symbol({"path": "module.py", "qualified_name": "value"}))
     arguments = {
         "path": "module.py",
         "qualified_name": "value",
@@ -203,9 +295,7 @@ def test_structured_edit_commits_after_verified_validation(tmp_path, monkeypatch
     )
     observation = edit_python_symbol(arguments)
     bus.emit_after_tool_result(
-        AfterToolResultEvent(
-            "edit_python_symbol", arguments, observation, 1, "run", True, metadata
-        )
+        AfterToolResultEvent("edit_python_symbol", arguments, observation, 1, "run", True, metadata)
     )
     block = bus.emit_before_finish(
         BeforeFinishEvent("edit symbol", "finish", "done", [], 2, "run", metadata)
@@ -221,9 +311,7 @@ def test_structured_edit_rolls_back_when_verified_validation_fails(tmp_path, mon
     target = tmp_path / "module.py"
     original = "def value():\n    return 1\n"
     target.write_text(original, encoding="utf-8")
-    inspected = json.loads(
-        inspect_python_symbol({"path": "module.py", "qualified_name": "value"})
-    )
+    inspected = json.loads(inspect_python_symbol({"path": "module.py", "qualified_name": "value"}))
     arguments = {
         "path": "module.py",
         "qualified_name": "value",
@@ -239,6 +327,7 @@ def test_structured_edit_rolls_back_when_verified_validation_fails(tmp_path, mon
     capability = VerifiedEditCapability(
         tmp_path,
         command_runner=reject_validation,
+        policy=VerificationPolicy(check_runtime_syntax=True),
         run_affected_tests=False,
         run_lint=False,
         run_type_check=False,
@@ -252,9 +341,7 @@ def test_structured_edit_rolls_back_when_verified_validation_fails(tmp_path, mon
     )
     observation = edit_python_symbol(arguments)
     bus.emit_after_tool_result(
-        AfterToolResultEvent(
-            "edit_python_symbol", arguments, observation, 1, "run", True, metadata
-        )
+        AfterToolResultEvent("edit_python_symbol", arguments, observation, 1, "run", True, metadata)
     )
     block = bus.emit_before_finish(
         BeforeFinishEvent("edit symbol", "finish", "done", [], 2, "run", metadata)
@@ -280,10 +367,132 @@ def test_verified_edit_uses_injected_validation_runner(tmp_path):
         run_type_check=False,
     )
 
-    result = capability._run_tests(["tests/test_service.py"])
+    result = capability.runner.run_tests(["tests/test_service.py"])
 
     assert result.passed is True
     assert calls == [(["-m", "pytest", "-q", "tests/test_service.py"], 120)]
+
+
+def test_verified_edit_limits_affected_tests(tmp_path):
+    capability = VerifiedEditCapability(
+        tmp_path,
+        max_affected_tests=2,
+        run_affected_tests=True,
+        run_lint=False,
+        run_type_check=False,
+    )
+    impact = ImpactReport(
+        changed_files=("service.py",),
+        changed_symbols=(),
+        affected_symbols=(),
+        affected_files=(),
+        related_tests=("tests/test_a.py", "tests/test_b.py", "tests/test_c.py"),
+        risk_score=0.5,
+        risk_level="medium",
+        reasons=(),
+    )
+
+    assert capability._selected_tests(impact) == ["tests/test_a.py", "tests/test_b.py"]
+
+
+def test_verified_edit_reuses_validation_for_identical_patch(tmp_path):
+    target = tmp_path / "module.py"
+    original = "value = 1\n"
+    changed = "value = 2\n"
+    target.write_text(original, encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def runner(arguments: list[str], timeout: int) -> tuple[int, str]:
+        calls.append(arguments)
+        return (1, "rejected") if arguments[:2] == ["-m", "py_compile"] else (0, "ok")
+
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path,
+        command_runner=runner,
+        policy=VerificationPolicy(check_runtime_syntax=True),
+        run_affected_tests=False,
+        run_lint=False,
+        run_type_check=False,
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("edit", 1, "run", metadata=metadata))
+    arguments = {"path": "module.py"}
+
+    for step in (1, 3):
+        bus.emit_before_tool_call(
+            BeforeToolCallEvent("edit_file", arguments, step, "run", metadata)
+        )
+        target.write_text(changed, encoding="utf-8")
+        bus.emit_after_tool_result(
+            AfterToolResultEvent("edit_file", arguments, "written", step, "run", True, metadata)
+        )
+        block = bus.emit_before_finish(
+            BeforeFinishEvent("edit", "finish", "done", [], step + 1, "run", metadata)
+        )
+        assert block is not None
+        assert target.read_text(encoding="utf-8") == original
+
+    assert calls == [["-m", "py_compile", "module.py"]]
+    assert metadata["edit_validation_cache_hit_count"] == 1
+
+
+def test_verified_edit_mypy_allows_preexisting_error_after_line_shift(tmp_path):
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    mypy_calls = 0
+
+    def runner(arguments: list[str], timeout: int) -> tuple[int, str]:
+        nonlocal mypy_calls
+        if arguments[0] == "-c":
+            return 0, ""
+        mypy_calls += 1
+        line = 926 if mypy_calls == 1 else 932
+        return 1, f'module.py:{line}: error: "Legacy" not callable  [misc]'
+
+    capability = VerifiedEditCapability(
+        tmp_path,
+        command_runner=runner,
+        policy=VerificationPolicy(check_types=True, baseline_aware_types=True),
+    )
+    capability.runner.capture_type_baseline(target)
+    target.write_text("\nvalue = 2\n", encoding="utf-8")
+
+    result = capability.runner.validate_mypy_delta(["module.py"])
+
+    assert result.passed is True
+    assert "1 pre-existing diagnostic" in result.detail
+
+
+def test_verified_edit_mypy_rejects_new_error(tmp_path):
+    target = tmp_path / "module.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    mypy_calls = 0
+
+    def runner(arguments: list[str], timeout: int) -> tuple[int, str]:
+        nonlocal mypy_calls
+        if arguments[0] == "-c":
+            return 0, ""
+        mypy_calls += 1
+        old = 'module.py:926: error: "Legacy" not callable  [misc]'
+        if mypy_calls == 1:
+            return 1, old
+        return 1, f"{old}\nmodule.py:10: error: Incompatible return value  [return-value]"
+
+    capability = VerifiedEditCapability(
+        tmp_path,
+        command_runner=runner,
+        policy=VerificationPolicy(check_types=True, baseline_aware_types=True),
+    )
+    capability.runner.capture_type_baseline(target)
+    target.write_text("value = 'wrong'\n", encoding="utf-8")
+
+    result = capability.runner.validate_mypy_delta(["module.py"])
+
+    assert result.passed is False
+    assert "Incompatible return value" in result.detail
+    assert "Legacy" not in result.detail
 
 
 def test_verified_edit_uses_posix_paths_for_container_validation(tmp_path):
@@ -299,19 +508,20 @@ def test_verified_edit_uses_posix_paths_for_container_validation(tmp_path):
     capability = VerifiedEditCapability(
         tmp_path,
         command_runner=runner,
+        policy=VerificationPolicy(check_runtime_syntax=True),
         run_affected_tests=False,
         run_lint=False,
         run_type_check=False,
     )
     capability._changed.add(target)
 
-    results = capability._validate()
+    results = list(capability.runner.verify(capability._changed).results)
 
     assert all(result.passed for result in results)
     assert ["-m", "py_compile", "package/module.py"] in calls
 
 
-def test_semantic_capability_injects_bounded_impact_context_after_write(tmp_path):
+def test_semantic_capability_records_impact_without_rewriting_context(tmp_path):
     (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     (tmp_path / "consumer.py").write_text(
         "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
@@ -332,9 +542,7 @@ def test_semantic_capability_injects_bounded_impact_context_after_write(tmp_path
     messages = [{"role": "user", "content": "continue\n\n<repository_map></repository_map>"}]
     bus.emit_before_llm_request(BeforeLLMRequestEvent(messages, 2, "run", "agent", metadata))
 
-    assert "<change_impact>" in messages[0]["content"]
-    assert "consumer.py:consume" in messages[0]["content"]
-    assert "[affected]" in messages[0]["content"]
+    assert messages[0]["content"] == "continue\n\n<repository_map></repository_map>"
     assert metadata["semantic_impact_files"] == 1
     engine.close()
 
@@ -361,6 +569,7 @@ def test_verified_edit_selects_graph_related_tests(tmp_path):
         tmp_path,
         engine=engine,
         command_runner=runner,
+        run_affected_tests=True,
         run_lint=False,
         run_type_check=False,
     )
@@ -402,7 +611,7 @@ def test_impact_graph_keeps_callers_visible_when_symbol_is_deleted(tmp_path):
     engine.close()
 
 
-def test_semantic_capability_supplies_map_and_impact_to_replanner(tmp_path):
+def test_semantic_capability_keeps_replanner_context_model_driven(tmp_path):
     (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     (tmp_path / "consumer.py").write_text(
         "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
@@ -422,8 +631,6 @@ def test_semantic_capability_supplies_map_and_impact_to_replanner(tmp_path):
 
     bus.emit_before_llm_request(BeforeLLMRequestEvent(messages, 2, "run", "planner", metadata))
 
-    assert "<repository_map" in messages[0]["content"]
-    assert "<change_impact>" in messages[0]["content"]
-    assert "consumer.py:consume" in messages[0]["content"]
+    assert messages[0]["content"] == "Replan after failed test"
     assert metadata["semantic_impact_enabled"] is True
     engine.close()

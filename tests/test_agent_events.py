@@ -63,6 +63,38 @@ def test_before_tool_call_block_prevents_execution_and_returns_reason():
     assert result["metadata"]["status"] == "success"
 
 
+def test_blocked_tool_does_not_complete_run_on_behalf_of_model():
+    calls = []
+    bus = EventBus()
+    finish_events = []
+
+    def block_tool(_event):
+        return {
+            "block": True,
+            "reason": "no new evidence",
+        }
+
+    def observe_finish(event):
+        finish_events.append((event.action, event.completion_text))
+
+    bus.on("before_tool_call", block_tool, name="block_tool")
+    bus.on("before_finish", observe_finish, name="observe_finish")
+    client = FakeRespondClient([_action("echo", {})])
+    agent = ReactAgent(
+        client,
+        [Tool("echo", "Echo", lambda arguments: calls.append(arguments) or "ran")],
+        enable_planning=False,
+        enable_compression=False,
+        event_bus=bus,
+    )
+
+    result = agent.run("finish through capability", max_steps=1)
+
+    assert calls == []
+    assert finish_events == []
+    assert result["metadata"]["status"] == "max_steps_exceeded"
+
+
 def test_after_tool_result_handlers_chain_in_registration_order():
     second_seen = []
     bus = EventBus()

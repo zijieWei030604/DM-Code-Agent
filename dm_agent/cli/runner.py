@@ -18,10 +18,11 @@ from dm_agent import (
 from dm_agent.core.capabilities import AgentCapability
 from dm_agent.core.checkpoint import RunCheckpoint
 from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
-from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.mcp import MCPManager, load_mcp_config
+from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.skills import SkillManager
 from dm_agent.tracing import SessionWriter, TraceWriter
+from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
 
 if TYPE_CHECKING:
@@ -107,7 +108,9 @@ def create_agent(
     if config.enable_repo_map and workspace_engine is not None:
         capabilities.append(SemanticWorkspaceCapability(workspace_engine))
     if config.enable_verified_edits:
-        capabilities.append(VerifiedEditCapability(Path.cwd(), engine=workspace_engine))
+        capabilities.append(
+            VerifiedEditCapability(Path.cwd(), engine=workspace_engine, policy=VerificationPolicy())
+        )
     return ReactAgent(
         client,
         tools,

@@ -2,13 +2,13 @@
 
 它只在独立预测子系统中装配，处理两种已有真实轨迹证据的机械固定点：
 
-- 同一文件内容版本上的完全相同 ``search_in_file``；
+- 连续重复、参数/工作区状态/输出均不变的只读或执行工具调用；
 - 内容锚定编辑撤销后，再次试图进入刚刚访问过的文件内容状态。
 
-这不是内核通用熔断器，也不按失败次数禁用工具。搜索缓存以目标文件内容指纹为准；
+这不是内核通用熔断器，也不按失败次数禁用工具。重复工具允许一次真实复查，只有
+第三次仍得到相同结果才复用缓存并拦截；文件工具以目标文件内容指纹为准；
 内容锚定编辑允许一次撤销，只有随后再次进入旧状态时才在执行前拦截。行号编辑与
-覆盖既有文件的 ``create_file`` 只在执行后记录回访，不承诺预拦；``run_shell`` /
-``run_python`` 造成的文件变化不作为本守卫的写入事件计数。
+覆盖既有文件的 ``create_file`` 只在执行后记录回访，不承诺预拦。
 """
 
 from __future__ import annotations
@@ -25,14 +25,33 @@ from dm_agent.core.events import AfterToolResultEvent, BeforeToolCallEvent, RunS
 from dm_agent.core.guards import WRITE_ACTIONS
 from dm_agent.core.observation import is_failure_observation
 
+_READ_ACTION = "read_file"
 _SEARCH_ACTION = "search_in_file"
+_REPEATABLE_TOOLS = frozenset(
+    {
+        _READ_ACTION,
+        _SEARCH_ACTION,
+        "run_python",
+        "run_shell",
+        "run_tests",
+        "run_linter",
+    }
+)
+_EXECUTION_TOOLS = _REPEATABLE_TOOLS - {_READ_ACTION, _SEARCH_ACTION}
+_IGNORED_STATE_DIRS = frozenset(
+    {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+)
 
 
 @dataclass(frozen=True)
-class _SearchRecord:
+class _ToolRecord:
+    action: str
+    signature: str
+    state_fingerprint: str
     first_success_step: int
-    file_fingerprint: str
     observation: str
+    observation_fingerprint: str
+    stable_repeats: int = 0
 
 
 @dataclass(frozen=True)
@@ -47,8 +66,8 @@ class SWEProgressLoopGuard:
     """切断 SWE-bench 预测里的搜索固定点与内容锚定编辑状态二周期。"""
 
     def __init__(self) -> None:
-        self._search_records: dict[str, _SearchRecord] = {}
-        self._search_repeat_counts: dict[str, int] = {}
+        self._last_tool: _ToolRecord | None = None
+        self._pending_tool_states: dict[tuple[str, int], str] = {}
         self._file_states: dict[str, dict[str, str]] = {}
         self._state_revisit_counts: dict[str, int] = {}
         self._pending_writes: dict[tuple[str, int], _PendingWrite] = {}
@@ -74,19 +93,22 @@ class SWEProgressLoopGuard:
         )
 
     def _on_run_start(self, event: RunStartEvent) -> None:
-        self._search_records.clear()
-        self._search_repeat_counts.clear()
+        self._reset_repeatable_sequence()
+        self._pending_tool_states.clear()
         self._file_states.clear()
         self._state_revisit_counts.clear()
         self._pending_writes.clear()
         event.metadata["progress_loop_guard_enabled"] = True
+        event.metadata["repeat_tool_block_count"] = 0
         event.metadata["repeat_search_block_count"] = 0
+        event.metadata["repeat_read_block_count"] = 0
         event.metadata["edit_state_revisit_count"] = 0
         event.metadata["edit_cycle_block_count"] = 0
 
     def _before_tool_call(self, event: BeforeToolCallEvent) -> dict[str, Any] | None:
-        if event.tool_name == _SEARCH_ACTION:
-            return self._before_search(event)
+        if event.tool_name in _REPEATABLE_TOOLS:
+            return self._before_repeatable_tool(event)
+        self._reset_repeatable_sequence()
         if event.tool_name not in WRITE_ACTIONS:
             return None
 
@@ -134,44 +156,60 @@ class SWEProgressLoopGuard:
         event.metadata["edit_cycle_block_count"] = block_count
         return {"block": True, "reason": reason}
 
-    def _before_search(self, event: BeforeToolCallEvent) -> dict[str, Any] | None:
-        signature = _search_signature(event.arguments)
-        record = self._search_records.get(signature)
-        if record is None:
+    def _before_repeatable_tool(self, event: BeforeToolCallEvent) -> dict[str, Any] | None:
+        signature = _arguments_signature(event.arguments)
+        state_fingerprint = _tool_state_fingerprint(event.tool_name, event.arguments)
+        self._pending_tool_states[(event.run_id, event.step_number)] = state_fingerprint
+        record = self._last_tool
+        if (
+            record is None
+            or record.action != event.tool_name
+            or record.signature != signature
+            or record.state_fingerprint != state_fingerprint
+        ):
+            self._reset_repeatable_sequence()
+            return None
+        if record.stable_repeats < 1:
             return None
 
-        state = _read_path_state(event.arguments)
-        if state is None or state[3] != record.file_fingerprint:
-            self._search_records.pop(signature, None)
-            self._search_repeat_counts.pop(signature, None)
-            return None
-
-        repeat_count = self._search_repeat_counts.get(signature, 0) + 1
+        block_count = int(event.metadata.get("repeat_tool_block_count", 0)) + 1
+        noun = (
+            "read"
+            if event.tool_name == _READ_ACTION
+            else ("search" if event.tool_name == _SEARCH_ACTION else "tool call")
+        )
         reason = (
-            f"Skipped exact duplicate search #{repeat_count}: the target file still has the "
-            f"same content as at step {record.first_success_step}. Reuse the cached result below, "
-            "then edit the target, read a different range, or materially change the search "
-            f"arguments.\nCached result:\n{_quote_observation(record.observation)}"
+            f"Skipped exact duplicate {noun} #{block_count}: the same call was executed twice "
+            f"with unchanged state and output, first at step {record.first_success_step}. "
+            "Reuse the cached result, then change the arguments, inspect different evidence, "
+            "edit the workspace, or finish the task.\n"
+            f"Cached result:\n{_quote_observation(record.observation)}"
         )
-        self._record_trace(
-            "swebench_repeat_search_block",
-            {
-                "step_number": event.step_number,
-                "tool_name": event.tool_name,
-                "arguments": dict(event.arguments),
-                "first_success_step": record.first_success_step,
-                "repeat_count": repeat_count,
-            },
-        )
-        self._search_repeat_counts[signature] = repeat_count
-        event.metadata["repeat_search_block_count"] = (
-            int(event.metadata.get("repeat_search_block_count", 0)) + 1
-        )
+        payload = {
+            "step_number": event.step_number,
+            "tool_name": event.tool_name,
+            "arguments": dict(event.arguments),
+            "first_success_step": record.first_success_step,
+            "block_count": block_count,
+        }
+        self._record_trace("swebench_repeat_tool_block", payload)
+        legacy_key = None
+        legacy_event = None
+        if event.tool_name == _READ_ACTION:
+            legacy_key = "repeat_read_block_count"
+            legacy_event = "swebench_repeat_read_block"
+        elif event.tool_name == _SEARCH_ACTION:
+            legacy_key = "repeat_search_block_count"
+            legacy_event = "swebench_repeat_search_block"
+        if legacy_key and legacy_event:
+            event.metadata[legacy_key] = int(event.metadata.get(legacy_key, 0)) + 1
+            self._record_trace(legacy_event, payload)
+        event.metadata["repeat_tool_block_count"] = block_count
         return {"block": True, "reason": reason}
 
     def _after_tool_result(self, event: AfterToolResultEvent) -> str | None:
-        if event.tool_name == _SEARCH_ACTION:
-            self._remember_search(event)
+        if event.tool_name in _REPEATABLE_TOOLS:
+            self._remember_repeatable_tool(event)
             return None
         if event.tool_name not in WRITE_ACTIONS:
             return None
@@ -226,21 +264,51 @@ class SWEProgressLoopGuard:
             f"already seen {previous_label}. {guidance}"
         )
 
-    def _remember_search(self, event: AfterToolResultEvent) -> None:
+    def _remember_repeatable_tool(self, event: AfterToolResultEvent) -> None:
+        before_state = self._pending_tool_states.pop(
+            (event.run_id, event.step_number),
+            _tool_state_fingerprint(event.tool_name, event.arguments),
+        )
         if not event.tool_succeeded or is_failure_observation(
             event.observation, action=event.tool_name
         ):
+            self._reset_repeatable_sequence()
             return
-        state = _read_path_state(event.arguments)
-        if state is None:
+        signature = _arguments_signature(event.arguments)
+        state_fingerprint = _tool_state_fingerprint(event.tool_name, event.arguments)
+        if event.tool_name in _EXECUTION_TOOLS and state_fingerprint != before_state:
+            self._reset_repeatable_sequence()
             return
-        signature = _search_signature(event.arguments)
-        self._search_records[signature] = _SearchRecord(
+        observation_fingerprint = _text_fingerprint(event.observation)
+        record = self._last_tool
+        if (
+            record is not None
+            and record.action == event.tool_name
+            and record.signature == signature
+            and record.state_fingerprint == state_fingerprint
+            and record.observation_fingerprint == observation_fingerprint
+        ):
+            self._last_tool = _ToolRecord(
+                action=record.action,
+                signature=record.signature,
+                state_fingerprint=record.state_fingerprint,
+                first_success_step=record.first_success_step,
+                observation=event.observation,
+                observation_fingerprint=observation_fingerprint,
+                stable_repeats=record.stable_repeats + 1,
+            )
+            return
+        self._last_tool = _ToolRecord(
+            action=event.tool_name,
+            signature=signature,
+            state_fingerprint=state_fingerprint,
             first_success_step=event.step_number,
-            file_fingerprint=state[3],
             observation=event.observation,
+            observation_fingerprint=observation_fingerprint,
         )
-        self._search_repeat_counts.pop(signature, None)
+
+    def _reset_repeatable_sequence(self) -> None:
+        self._last_tool = None
 
     def _record_trace(self, event: str, payload: dict[str, Any]) -> None:
         if not self._trace_writer:
@@ -252,9 +320,38 @@ class SWEProgressLoopGuard:
             return
 
 
-def _search_signature(arguments: dict[str, Any]) -> str:
-    """参数顺序无关、跨进程稳定的搜索签名。"""
+def _arguments_signature(arguments: dict[str, Any]) -> str:
+    """参数顺序无关、跨进程稳定的工具调用签名。"""
     return json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _tool_state_fingerprint(action: str, arguments: dict[str, Any]) -> str:
+    """返回与调用相关的最小状态；文件内容变化会立即打断重复序列。"""
+    if action in {_READ_ACTION, _SEARCH_ACTION}:
+        state = _read_path_state(arguments)
+        return state[3] if state is not None else "missing-or-unreadable"
+    return _workspace_state_fingerprint(Path.cwd())
+
+
+def _workspace_state_fingerprint(root: Path) -> str:
+    """用路径、大小和修改时间检测执行工具是否改变了工作区。"""
+    digest = hashlib.sha256()
+    try:
+        for current_root, directories, files in os.walk(root):
+            directories[:] = sorted(name for name in directories if name not in _IGNORED_STATE_DIRS)
+            current = Path(current_root)
+            for name in sorted(files):
+                path = current / name
+                try:
+                    stat = path.stat()
+                    relative = path.relative_to(root).as_posix()
+                except (OSError, ValueError):
+                    continue
+                digest.update(relative.encode("utf-8", errors="surrogatepass"))
+                digest.update(f"\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode())
+    except OSError:
+        return "workspace-unreadable"
+    return digest.hexdigest()
 
 
 def _read_path_state(arguments: dict[str, Any]) -> tuple[str, str, str, str] | None:

@@ -24,6 +24,7 @@ from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, Verifi
 from dm_agent.tools.base import Tool
 from dm_agent.tools.file_tools import create_file, edit_file, read_file
 from dm_agent.tracing import TraceWriter, load_trace_events
+from dm_agent.verification import VerificationPolicy
 from swebench_verified import evaluate, predict
 from swebench_verified.progress_guard import SWEProgressLoopGuard
 
@@ -349,9 +350,13 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
         "truncation_count": 7,
         "edit_guard_block_count": 8,
         "edit_noop_count": 9,
+        "repeat_tool_block_count": 14,
         "repeat_search_block_count": 10,
+        "repeat_read_block_count": 13,
         "edit_state_revisit_count": 11,
         "edit_cycle_block_count": 12,
+        "edit_run_end_finalization_count": 2,
+        "edit_run_end_salvaged": True,
     }
     workspace_root = _prepare_predict(
         monkeypatch,
@@ -381,12 +386,15 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
     assert record["dm_truncations"] == 7
     assert record["dm_edit_guard_blocks"] == 8
     assert record["dm_edit_noops"] == 9
+    assert record["dm_repeat_tool_blocks"] == 14
     assert record["dm_repeat_search_blocks"] == 10
+    assert record["dm_repeat_read_blocks"] == 13
     assert record["dm_edit_state_revisits"] == 11
     assert record["dm_edit_cycle_blocks"] == 12
+    assert record["dm_edit_run_end_finalizations"] == 2
+    assert record["dm_edit_run_end_salvaged"] is True
     capabilities = _FakeAgent.last_kwargs["capabilities"]
-    assert len(capabilities) == 1
-    assert isinstance(capabilities[0], SWEProgressLoopGuard)
+    assert capabilities == []
 
 
 def test_predict_one_marks_diagnostics_unmeasured_after_agent_exception(monkeypatch, tmp_path):
@@ -430,13 +438,16 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
     )
 
     capabilities = _FakeAgent.last_kwargs["capabilities"]
-    assert isinstance(capabilities[0], SWEProgressLoopGuard)
     assert any(isinstance(capability, SemanticWorkspaceCapability) for capability in capabilities)
     verified = next(
         capability for capability in capabilities if isinstance(capability, VerifiedEditCapability)
     )
     assert verified.command_runner is not None
     assert verified.command_runner.__self__.container_name == "test-container"
+    assert verified.run_affected_tests is False
+    assert verified.policy.check_lint is False
+    assert verified.policy.check_types is False
+    assert verified.policy.finalize_on_run_end is True
     assert _FakeAgent.last_kwargs["enable_repo_map"] is True
     repository_map = _FakeAgent.last_kwargs["repository_map"]
     assert repository_map.engine is verified.engine
@@ -444,9 +455,7 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
     assert not verified.engine.database_path.is_relative_to(
         workspace_root / _instance()["instance_id"]
     )
-    assert not (
-        workspace_root / ".dm_agent_indexes" / _instance()["instance_id"]
-    ).exists()
+    assert not (workspace_root / ".dm_agent_indexes" / _instance()["instance_id"]).exists()
 
 
 def _event_bus_with_progress_guard(trace_writer=None):
@@ -551,7 +560,21 @@ def test_repeat_search_guard_replays_cache_and_invalidates_on_file_change(tmp_pa
     )
 
     repeated = BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 2, "run", metadata)
-    block = bus.emit_before_tool_call(repeated)
+    assert bus.emit_before_tool_call(repeated) is None
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            tool_name=_SEARCH_ACTION,
+            arguments=dict(arguments),
+            observation="found at line 10",
+            step_number=2,
+            run_id="run",
+            tool_succeeded=True,
+            metadata=metadata,
+        )
+    )
+    block = bus.emit_before_tool_call(
+        BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 3, "run", metadata)
+    )
 
     assert suffix == "existing suffix"
     assert block is not None and block["block"] is True
@@ -559,12 +582,13 @@ def test_repeat_search_guard_replays_cache_and_invalidates_on_file_change(tmp_pa
     assert "> found at line 10" in block["reason"]
     assert metadata["progress_loop_guard_enabled"] is True
     assert metadata["repeat_search_block_count"] == 1
+    assert metadata["repeat_tool_block_count"] == 1
 
     # 无论改写来自哪个工具，只要目标文件内容变化，同一搜索就重新放行。
     target.write_text("def target():\n    return 2\n", encoding="utf-8")
     assert (
         bus.emit_before_tool_call(
-            BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 3, "run", metadata)
+            BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 4, "run", metadata)
         )
         is None
     )
@@ -595,9 +619,22 @@ def test_repeat_search_guard_replays_full_bounded_observation(tmp_path, monkeypa
             metadata=metadata,
         )
     )
+    second = BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 2, "run", metadata)
+    assert bus.emit_before_tool_call(second) is None
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            tool_name=_SEARCH_ACTION,
+            arguments=dict(arguments),
+            observation=observation,
+            step_number=2,
+            run_id="run",
+            tool_succeeded=True,
+            metadata=metadata,
+        )
+    )
 
     block = bus.emit_before_tool_call(
-        BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 2, "run", metadata)
+        BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 3, "run", metadata)
     )
 
     assert block is not None
@@ -653,9 +690,22 @@ def test_repeat_search_trace_failure_does_not_change_block_decision(tmp_path, mo
             metadata=metadata,
         )
     )
+    second = BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 2, "run", metadata)
+    assert bus.emit_before_tool_call(second) is None
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            tool_name=_SEARCH_ACTION,
+            arguments=dict(arguments),
+            observation="found",
+            step_number=2,
+            run_id="run",
+            tool_succeeded=True,
+            metadata=metadata,
+        )
+    )
 
     block = bus.emit_before_tool_call(
-        BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 2, "run", metadata)
+        BeforeToolCallEvent(_SEARCH_ACTION, dict(arguments), 3, "run", metadata)
     )
 
     assert block is not None and block["block"] is True
@@ -835,6 +885,69 @@ def _action(action: str, action_input: Any) -> str:
 _SEARCH_ACTION = "search_in_file"
 
 
+def test_progress_loop_guard_allows_one_identical_reread_then_blocks(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "pkg" / "mod.py"
+    target.parent.mkdir()
+    target.write_text("value = 1\n", encoding="utf-8")
+    calls: list[dict[str, Any]] = []
+    arguments = {"path": "pkg/mod.py", "line_start": 1, "line_end": 1}
+    client = _ScriptedClient(
+        [
+            _action("read_file", arguments),
+            _action("read_file", arguments),
+            _action("read_file", arguments),
+            _action("finish", "done"),
+        ]
+    )
+    agent = ReactAgent(
+        client,
+        [
+            Tool(
+                "read_file",
+                "read",
+                lambda received: calls.append(dict(received)) or "value = 1",
+            )
+        ],
+        enable_planning=False,
+        enable_compression=False,
+        capabilities=[SWEProgressLoopGuard()],
+    )
+
+    result = agent.run("fix", max_steps=4)
+
+    assert len(calls) == 2
+    assert result["metadata"]["repeat_read_block_count"] == 1
+    assert result["steps"][2]["observation"].startswith("Skipped exact duplicate read #1")
+
+
+def test_progress_loop_guard_resets_read_sequence_for_different_range(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("module.py").write_text("one\ntwo\n", encoding="utf-8")
+    bus = _event_bus_with_progress_guard()
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent(task="fix", attempt=1, run_id="run", metadata=metadata))
+
+    for step_number, arguments in enumerate(
+        [
+            {"path": "module.py", "line_start": 1, "line_end": 1},
+            {"path": "module.py", "line_start": 1, "line_end": 1},
+            {"path": "module.py", "line_start": 2, "line_end": 2},
+            {"path": "module.py", "line_start": 1, "line_end": 1},
+        ],
+        start=1,
+    ):
+        event = BeforeToolCallEvent("read_file", arguments, step_number, "run", metadata)
+        assert bus.emit_before_tool_call(event) is None
+        bus.emit_after_tool_result(
+            AfterToolResultEvent(
+                "read_file", arguments, "content", step_number, "run", True, metadata
+            )
+        )
+
+    assert metadata["repeat_read_block_count"] == 0
+
+
 def test_progress_loop_guard_breaks_scripted_search_fixed_point(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "pkg" / "mod.py"
@@ -843,6 +956,7 @@ def test_progress_loop_guard_breaks_scripted_search_fixed_point(tmp_path, monkey
     calls: list[dict[str, Any]] = []
     client = _ScriptedClient(
         [
+            _action(_SEARCH_ACTION, {"path": "pkg/mod.py", "pattern": "target"}),
             _action(_SEARCH_ACTION, {"path": "pkg/mod.py", "pattern": "target"}),
             _action(_SEARCH_ACTION, {"path": "pkg/mod.py", "pattern": "target"}),
             _action("finish", "done"),
@@ -862,11 +976,172 @@ def test_progress_loop_guard_breaks_scripted_search_fixed_point(tmp_path, monkey
         capabilities=[SWEProgressLoopGuard()],
     )
 
-    result = agent.run("fix", max_steps=3)
+    result = agent.run("fix", max_steps=4)
 
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert result["metadata"]["repeat_search_block_count"] == 1
-    assert result["steps"][1]["observation"].startswith("Skipped exact duplicate search #1")
+    assert result["metadata"]["repeat_tool_block_count"] == 1
+    assert result["steps"][2]["observation"].startswith("Skipped exact duplicate search #1")
+
+
+def test_progress_loop_guard_breaks_scripted_run_python_fixed_point(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    calls: list[dict[str, Any]] = []
+    arguments = {"code": "print('unchanged')"}
+    client = _ScriptedClient(
+        [
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("finish", "done"),
+        ]
+    )
+    agent = ReactAgent(
+        client,
+        [
+            Tool(
+                "run_python",
+                "execute Python",
+                lambda received: calls.append(dict(received)) or "unchanged\nreturncode: 0",
+            )
+        ],
+        enable_planning=False,
+        enable_compression=False,
+        capabilities=[SWEProgressLoopGuard()],
+    )
+
+    result = agent.run("fix", max_steps=4)
+
+    assert len(calls) == 2
+    assert result["metadata"]["repeat_tool_block_count"] == 1
+    assert result["steps"][2]["observation"].startswith("Skipped exact duplicate tool call #1")
+
+
+def test_progress_loop_guard_blocks_repeats_without_requesting_completion(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    calls: list[dict[str, Any]] = []
+    arguments = {"code": "print('unchanged')"}
+    client = _ScriptedClient(
+        [
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("finish", "done"),
+        ]
+    )
+    guard = SWEProgressLoopGuard()
+    bus = EventBus()
+    guard.install(CapabilityContext(bus, lambda _phase: client))
+
+    def declare_pending_verified_edit(event):
+        event.metadata["verified_edits_enabled"] = True
+        event.metadata["edit_transaction_status"] = "active"
+
+    bus.on("on_run_start", declare_pending_verified_edit, name="test.pending_edit")
+    agent = ReactAgent(
+        client,
+        [
+            Tool(
+                "run_python",
+                "execute Python",
+                lambda received: calls.append(dict(received)) or "unchanged\nreturncode: 0",
+            )
+        ],
+        enable_planning=False,
+        enable_compression=False,
+        event_bus=bus,
+    )
+
+    result = agent.run("fix", max_steps=10)
+
+    assert len(calls) == 2
+    assert len(result["steps"]) == 5
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["repeat_tool_block_count"] == 2
+    assert "progress_guard_completion_request_count" not in result["metadata"]
+    assert "capability_completion_count" not in result["metadata"]
+
+
+def test_progress_guard_repeat_block_keeps_verified_edit_finish_model_driven(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    Path("module.py").write_text("value = 1\n", encoding="utf-8")
+    check_arguments = {"code": "print('stable')"}
+    client = _ScriptedClient(
+        [
+            _action("read_file", {"path": "module.py"}),
+            _action(
+                "edit_file",
+                {"path": "module.py", "old_string": "value = 1", "new_string": "value = 2"},
+            ),
+            _action("run_python", check_arguments),
+            _action("run_python", check_arguments),
+            _action("run_python", check_arguments),
+            _action("run_python", check_arguments),
+            _action("finish", "done"),
+        ]
+    )
+    capability = VerifiedEditCapability(
+        tmp_path,
+        policy=VerificationPolicy(
+            check_lint=False,
+            check_types=False,
+            run_affected_tests=False,
+        ),
+    )
+    agent = ReactAgent(
+        client,
+        [
+            Tool("read_file", "read", read_file),
+            Tool("edit_file", "edit", edit_file),
+            Tool("run_python", "execute Python", lambda _arguments: "stable\nreturncode: 0"),
+        ],
+        enable_planning=False,
+        enable_compression=False,
+        capabilities=[SWEProgressLoopGuard(), capability],
+    )
+
+    result = agent.run("change the value", max_steps=10)
+
+    assert Path("module.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["edit_transaction_status"] == "committed"
+    assert result["metadata"]["edit_validation_count"] > 0
+    assert result["metadata"]["repeat_tool_block_count"] == 2
+    assert "capability_completion_count" not in result["metadata"]
+
+
+def test_progress_loop_guard_allows_execution_that_changes_workspace(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    calls = 0
+    arguments = {"code": "mutate workspace"}
+    client = _ScriptedClient(
+        [
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("run_python", arguments),
+            _action("finish", "done"),
+        ]
+    )
+
+    def mutate(_arguments):
+        nonlocal calls
+        calls += 1
+        Path("counter.txt").write_text(str(calls), encoding="utf-8")
+        return "same output\nreturncode: 0"
+
+    agent = ReactAgent(
+        client,
+        [Tool("run_python", "execute Python", mutate)],
+        enable_planning=False,
+        enable_compression=False,
+        capabilities=[SWEProgressLoopGuard()],
+    )
+
+    result = agent.run("fix", max_steps=4)
+
+    assert calls == 3
+    assert result["metadata"]["repeat_tool_block_count"] == 0
 
 
 def test_progress_loop_guard_allows_one_undo_then_blocks_edit_cycle(tmp_path, monkeypatch):

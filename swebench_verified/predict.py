@@ -34,11 +34,11 @@ from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.paths import load_env_files
 from dm_agent.tools import default_tools
 from dm_agent.tracing import TraceWriter
+from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
 
 from .container_tools import ContainerExecutionBackend
 from .dataset import image_name
-from .progress_guard import SWEProgressLoopGuard
 
 IMAGE_PULL_TIMEOUT_SECONDS = 3600
 _WINDOWS_RESERVED_NAMES = {
@@ -453,21 +453,17 @@ def predict_one(
                     "model": model or PROVIDER_DEFAULTS.get(provider, {}).get("model"),
                     "exec_backend": "docker",
                     "container_image": container_image,
-                    "semantic_workspace_enabled": enable_repo_map
-                    or enable_verified_edits,
-                    "semantic_impact_enabled": enable_repo_map
-                    or enable_verified_edits,
+                    "semantic_workspace_enabled": enable_repo_map or enable_verified_edits,
+                    "semantic_impact_enabled": enable_repo_map or enable_verified_edits,
                     "verified_edits_enabled": enable_verified_edits,
                 },
             )
 
         client = build_client(provider, model, timeout)
         tools = execution_backend.replace_execution_tools(default_tools(include_mcp=False))
-        capabilities: list[Any] = [SWEProgressLoopGuard()]
+        capabilities: list[Any] = []
         if enable_repo_map or enable_verified_edits:
-            workspace_engine = SemanticWorkspaceEngine(
-                workspace, database_path=semantic_database
-            )
+            workspace_engine = SemanticWorkspaceEngine(workspace, database_path=semantic_database)
         if enable_repo_map and workspace_engine is not None:
             capabilities.append(SemanticWorkspaceCapability(workspace_engine))
         if enable_verified_edits:
@@ -475,6 +471,7 @@ def predict_one(
                 VerifiedEditCapability(
                     workspace,
                     engine=workspace_engine,
+                    policy=VerificationPolicy(),
                     command_runner=execution_backend.run_validation,
                 )
             )
@@ -555,9 +552,15 @@ def predict_one(
                     "dm_truncations": metadata.get("truncation_count", 0),
                     "dm_edit_guard_blocks": metadata.get("edit_guard_block_count", 0),
                     "dm_edit_noops": metadata.get("edit_noop_count", 0),
+                    "dm_repeat_tool_blocks": metadata.get("repeat_tool_block_count", 0),
                     "dm_repeat_search_blocks": metadata.get("repeat_search_block_count", 0),
+                    "dm_repeat_read_blocks": metadata.get("repeat_read_block_count", 0),
                     "dm_edit_state_revisits": metadata.get("edit_state_revisit_count", 0),
                     "dm_edit_cycle_blocks": metadata.get("edit_cycle_block_count", 0),
+                    "dm_edit_run_end_finalizations": metadata.get(
+                        "edit_run_end_finalization_count", 0
+                    ),
+                    "dm_edit_run_end_salvaged": bool(metadata.get("edit_run_end_salvaged", False)),
                 }
             )
 
