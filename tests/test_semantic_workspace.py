@@ -3,8 +3,8 @@ from __future__ import annotations
 from dm_agent.core.capabilities import CapabilityContext
 from dm_agent.core.events import (
     AfterToolResultEvent,
-    BeforeLLMRequestEvent,
     BeforeFinishEvent,
+    BeforeLLMRequestEvent,
     BeforeToolCallEvent,
     EventBus,
     RunStartEvent,
@@ -56,8 +56,7 @@ def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "test_api.py").write_text(
-        "from api import checkout\n\n"
-        "def test_checkout():\n    assert checkout([1]) == 1\n",
+        "from api import checkout\n\n" "def test_checkout():\n    assert checkout([1]) == 1\n",
         encoding="utf-8",
     )
     engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
@@ -69,7 +68,9 @@ def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
     assert "tests/test_api.py" in report.affected_files
     assert report.related_tests == ("tests/test_api.py",)
     assert any(item.symbol == "checkout" and item.distance == 1 for item in report.affected_symbols)
-    assert any(item.symbol == "test_checkout" and item.distance == 2 for item in report.affected_symbols)
+    assert any(
+        item.symbol == "test_checkout" and item.distance == 2 for item in report.affected_symbols
+    )
     assert report.risk_level in {"medium", "high"}
     assert "api.py:checkout" in report.render()
     engine.close()
@@ -189,9 +190,7 @@ def test_semantic_capability_injects_bounded_impact_context_after_write(tmp_path
         )
     )
     messages = [{"role": "user", "content": "continue\n\n<repository_map></repository_map>"}]
-    bus.emit_before_llm_request(
-        BeforeLLMRequestEvent(messages, 2, "run", "agent", metadata)
-    )
+    bus.emit_before_llm_request(BeforeLLMRequestEvent(messages, 2, "run", "agent", metadata))
 
     assert "<change_impact>" in messages[0]["content"]
     assert "consumer.py:consume" in messages[0]["content"]
@@ -231,7 +230,6 @@ def test_verified_edit_selects_graph_related_tests(tmp_path):
     arguments = {"path": "service.py"}
     bus.emit_before_tool_call(BeforeToolCallEvent("edit_file", arguments, 1, "run", metadata))
     target.write_text("def value():\n    return 2\n", encoding="utf-8")
-    engine.update([target])
     bus.emit_after_tool_result(
         AfterToolResultEvent("edit_file", arguments, "written", 1, "run", True, metadata)
     )
@@ -243,6 +241,24 @@ def test_verified_edit_selects_graph_related_tests(tmp_path):
     assert block is None
     assert ["-m", "pytest", "-q", "tests/test_consumer.py"] in calls
     assert metadata["edit_impact_tests"] == 1
+    engine.close()
+
+
+def test_impact_graph_keeps_callers_visible_when_symbol_is_deleted(tmp_path):
+    target = tmp_path / "service.py"
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    engine.update([target])
+    impact = engine.analyze_impact([target])
+
+    assert "consumer.py" in impact.affected_files
+    assert any("consumer.py:consume" in reason for reason in impact.reasons)
     engine.close()
 
 
@@ -264,9 +280,7 @@ def test_semantic_capability_supplies_map_and_impact_to_replanner(tmp_path):
     )
     messages = [{"role": "user", "content": "Replan after failed test"}]
 
-    bus.emit_before_llm_request(
-        BeforeLLMRequestEvent(messages, 2, "run", "planner", metadata)
-    )
+    bus.emit_before_llm_request(BeforeLLMRequestEvent(messages, 2, "run", "planner", metadata))
 
     assert "<repository_map" in messages[0]["content"]
     assert "<change_impact>" in messages[0]["content"]

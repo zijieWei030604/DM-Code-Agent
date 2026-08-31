@@ -302,6 +302,13 @@ class SemanticWorkspaceEngine:
         included = 0
         for path in selected[:max_files]:
             block = self._render_file(path)
+            if impact is not None:
+                if path in impact.changed_files:
+                    block = f"# [changed] {path}\n{block}"
+                elif path in impact.related_tests:
+                    block = f"# [related-test] {path}\n{block}"
+                elif path in impact.affected_files:
+                    block = f"# [affected] {path}\n{block}"
             candidate = "\n".join([*lines, block, "</repository_map>"])
             if max_chars > 0 and len(candidate) > max_chars:
                 break

@@ -132,7 +132,13 @@ class VerifiedEditCapability:
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
         if not self._changed or self._verified:
             return None
-        impact = self.engine.analyze_impact(self._changed) if self.engine else None
+        if self.engine:
+            # Verified edits can run without the semantic-context capability. Keep
+            # the shared graph current before selecting impacted tests in that mode.
+            self.engine.update(self._changed)
+            impact = self.engine.analyze_impact(self._changed)
+        else:
+            impact = None
         if impact is not None:
             event.metadata.update(
                 {

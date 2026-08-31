@@ -88,9 +88,7 @@ class SemanticWorkspaceCapability:
         )
         event.metadata.update(
             {
-                "semantic_impact_analyses": int(
-                    event.metadata.get("semantic_impact_analyses", 0)
-                )
+                "semantic_impact_analyses": int(event.metadata.get("semantic_impact_analyses", 0))
                 + 1,
                 "semantic_impact_risk": self._impact.risk_level,
                 "semantic_impact_score": self._impact.risk_score,

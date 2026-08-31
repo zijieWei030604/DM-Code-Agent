@@ -115,7 +115,11 @@ class ImpactGraph:
                 "SELECT content_hash, parser_version FROM impact_files WHERE path = ?",
                 (relative,),
             ).fetchone()
-            if row and row["content_hash"] == digest and row["parser_version"] == self.PARSER_VERSION:
+            if (
+                row
+                and row["content_hash"] == digest
+                and row["parser_version"] == self.PARSER_VERSION
+            ):
                 continue
             try:
                 symbols, references = _parse_python(relative, source)
@@ -125,8 +129,7 @@ class ImpactGraph:
             changed = True
         if remove_missing:
             stored = {
-                str(row["path"])
-                for row in self.connection.execute("SELECT path FROM impact_files")
+                str(row["path"]) for row in self.connection.execute("SELECT path FROM impact_files")
             }
             for stale in stored - live:
                 self._delete_file(stale)
@@ -150,9 +153,7 @@ class ImpactGraph:
                     "SELECT path, name, kind FROM impact_symbols WHERE path = ?", (path,)
                 ).fetchall()
             )
-        changed_symbols = tuple(
-            sorted(f"{row['path']}:{row['name']}" for row in symbol_rows)
-        )
+        changed_symbols = tuple(sorted(f"{row['path']}:{row['name']}" for row in symbol_rows))
         seeds = {(str(row["path"]), str(row["name"])) for row in symbol_rows}
         seeds.update((path, "<module>") for path in changed_files)
         queue = deque((path, symbol, 0) for path, symbol in sorted(seeds))
@@ -163,13 +164,22 @@ class ImpactGraph:
             target_path, target_symbol, distance = queue.popleft()
             if distance >= max(0, max_depth):
                 continue
-            rows = self.connection.execute(
-                """SELECT source_path, source_symbol, relation, confidence
-                   FROM impact_edges
-                   WHERE target_path = ? AND target_symbol IN (?, '<module>')
-                   ORDER BY confidence DESC, source_path, source_symbol""",
-                (target_path, target_symbol),
-            ).fetchall()
+            if target_symbol == "<module>":
+                rows = self.connection.execute(
+                    """SELECT source_path, source_symbol, relation, confidence
+                       FROM impact_edges
+                       WHERE target_path = ?
+                       ORDER BY confidence DESC, source_path, source_symbol""",
+                    (target_path,),
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    """SELECT source_path, source_symbol, relation, confidence
+                       FROM impact_edges
+                       WHERE target_path = ? AND target_symbol IN (?, '<module>')
+                       ORDER BY confidence DESC, source_path, source_symbol""",
+                    (target_path, target_symbol),
+                ).fetchall()
             for row in rows:
                 source = (str(row["source_path"]), str(row["source_symbol"]))
                 if source in visited:
@@ -188,8 +198,7 @@ class ImpactGraph:
                 queue.append((source[0], source[1], distance + 1))
                 if len(reasons) < 8:
                     reasons.append(
-                        f"{source[0]}:{source[1]} {item.relation} "
-                        f"{target_path}:{target_symbol}"
+                        f"{source[0]}:{source[1]} {item.relation} " f"{target_path}:{target_symbol}"
                     )
         affected_files = tuple(
             sorted({item.path for item in affected if item.path not in changed_files})
@@ -214,8 +223,7 @@ class ImpactGraph:
         )
 
     def _create_schema(self) -> None:
-        self.connection.executescript(
-            """CREATE TABLE IF NOT EXISTS impact_files(
+        self.connection.executescript("""CREATE TABLE IF NOT EXISTS impact_files(
                  path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, parser_version TEXT NOT NULL);
                CREATE TABLE IF NOT EXISTS impact_symbols(
                  path TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
@@ -229,8 +237,7 @@ class ImpactGraph:
                  target_path TEXT NOT NULL, target_symbol TEXT NOT NULL,
                  relation TEXT NOT NULL, line INTEGER NOT NULL, confidence REAL NOT NULL);
                CREATE INDEX IF NOT EXISTS impact_edges_target_idx
-                 ON impact_edges(target_path, target_symbol);"""
-        )
+                 ON impact_edges(target_path, target_symbol);""")
 
     def _replace_file(
         self,
@@ -273,6 +280,9 @@ class ImpactGraph:
             path, name = str(row["path"]), str(row["name"])
             by_leaf.setdefault(name.rsplit(".", 1)[-1], []).append((path, name))
             modules[_module_name(Path(path))] = path
+        for row in self.connection.execute("SELECT path FROM impact_files"):
+            path = str(row["path"])
+            modules[_module_name(Path(path))] = path
         edges = set()
         for row in self.connection.execute("SELECT * FROM impact_refs"):
             targets = _resolve_targets(
@@ -302,9 +312,10 @@ class ImpactGraph:
         )
 
     def _tracked(self, path: str) -> bool:
-        return self.connection.execute(
-            "SELECT 1 FROM impact_files WHERE path = ?", (path,)
-        ).fetchone() is not None
+        return (
+            self.connection.execute("SELECT 1 FROM impact_files WHERE path = ?", (path,)).fetchone()
+            is not None
+        )
 
     def _test_companions(self, changed: Iterable[str]) -> set[str]:
         tests = [
