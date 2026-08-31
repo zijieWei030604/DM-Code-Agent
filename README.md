@@ -151,10 +151,12 @@ dm-agent --enable-repo-map "定位并修复订单金额计算问题"
 dm-agent --enable-repo-map --enable-verified-edits "修复订单金额计算并补回归测试"
 ```
 
-`--enable-repo-map` 会在 `.dm_agent/index/workspace.db` 中维护内容哈希、符号、引用和
-FTS5 全文索引；文件修改后只重建受影响记录，并在下一次 LLM 请求前刷新 Repo Map。
-`--enable-verified-edits` 把本轮所有写操作纳入同一事务，完成前校验 Python 语法和由
-引用关系推导出的测试；校验未通过时恢复修改前字节快照并否决本次完成。
+`--enable-repo-map` 会在 `.dm_agent/index/workspace.db` 中维护内容哈希、FTS5、作用域
+符号以及调用/导入/继承关系；文件修改后只重建变化记录，并反向传播得到受影响符号、
+文件、测试与风险分数。动态 Repo Map、Agent 上下文和 Planner/Replanner 共用这份有界证据。
+`--enable-verified-edits` 把本轮所有写操作纳入同一事务，完成前校验 Python 语法，并按
+同一影响报告选择相关测试；校验未通过时恢复修改前字节快照并否决本次完成。影响计算、
+测试选择及原因同时写入 trace，关闭两个开关时不安装这些 capability，保持原有执行路径。
 
 新用户拿到的是一个**安全的**默认配置；研究者按需 `--enable-xxx` 打开单个变量做 ablation。
 

@@ -60,6 +60,7 @@ class SemanticWorkspaceCapability:
         event.metadata.update(
             {
                 "semantic_workspace_enabled": True,
+                "semantic_impact_enabled": True,
                 "semantic_index_files": stats.scanned_files,
                 "semantic_index_cache_hits": stats.cache_hits,
                 "semantic_index_parse_errors": stats.parse_errors,
@@ -106,7 +107,7 @@ class SemanticWorkspaceCapability:
         )
 
     def _before_llm_request(self, event: BeforeLLMRequestEvent) -> None:
-        if event.phase != "agent":
+        if event.phase not in {"agent", "planner"}:
             return
         if self._dirty:
             self._map, included, truncated = self.engine.build_repo_map(
@@ -121,10 +122,17 @@ class SemanticWorkspaceCapability:
                 int(event.metadata.get("dynamic_repo_map_refresh_count", 0)) + 1
             )
             self._dirty = False
+        map_was_present = False
         for message in event.messages:
             content = message.get("content", "")
             if "<repository_map" in content:
                 message["content"] = _MAP_RE.sub(lambda _: self._map, content)
+                map_was_present = True
+        if event.phase == "planner" and not map_was_present:
+            for message in reversed(event.messages):
+                if message.get("role") == "user":
+                    message["content"] = f"{message.get('content', '')}\n\n{self._map}"
+                    break
         if self._impact is not None:
             impact_text = self._impact.render()
             for message in reversed(event.messages):

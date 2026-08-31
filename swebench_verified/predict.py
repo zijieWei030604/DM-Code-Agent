@@ -449,6 +449,11 @@ def predict_one(
                     "model": model or PROVIDER_DEFAULTS.get(provider, {}).get("model"),
                     "exec_backend": "docker",
                     "container_image": container_image,
+                    "semantic_workspace_enabled": enable_repo_map
+                    or enable_verified_edits,
+                    "semantic_impact_enabled": enable_repo_map
+                    or enable_verified_edits,
+                    "verified_edits_enabled": enable_verified_edits,
                 },
             )
 

@@ -244,3 +244,32 @@ def test_verified_edit_selects_graph_related_tests(tmp_path):
     assert ["-m", "pytest", "-q", "tests/test_consumer.py"] in calls
     assert metadata["edit_impact_tests"] == 1
     engine.close()
+
+
+def test_semantic_capability_supplies_map_and_impact_to_replanner(tmp_path):
+    (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    bus = EventBus()
+    SemanticWorkspaceCapability(engine).install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("change value", 1, "run", metadata=metadata))
+    (tmp_path / "service.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file", {"path": "service.py"}, "written", 1, "run", True, metadata
+        )
+    )
+    messages = [{"role": "user", "content": "Replan after failed test"}]
+
+    bus.emit_before_llm_request(
+        BeforeLLMRequestEvent(messages, 2, "run", "planner", metadata)
+    )
+
+    assert "<repository_map" in messages[0]["content"]
+    assert "<change_impact>" in messages[0]["content"]
+    assert "consumer.py:consume" in messages[0]["content"]
+    assert metadata["semantic_impact_enabled"] is True
+    engine.close()
