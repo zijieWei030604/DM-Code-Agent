@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .impact import ImpactGraph, ImpactReport
+
 DEFAULT_EXCLUDES = frozenset(
     {
         ".git",
@@ -152,6 +154,7 @@ class SemanticWorkspaceEngine:
             self._connection = self._connect_database(explicit_database_path=False)
             self._connection.row_factory = sqlite3.Row
             self._fts_enabled = self._create_schema()
+        self._impact_graph = ImpactGraph(self.root, self._connection)
 
     def _fallback_database_path(self) -> Path:
         # Read-only workspaces still get a persistent process-independent cache.
@@ -204,6 +207,7 @@ class SemanticWorkspaceEngine:
             }
             for stale in stored - live:
                 self._delete_file(stale)
+        self._impact_graph.update(candidates, remove_missing=paths is None)
         self._connection.commit()
         return IndexStats(len(candidates), indexed, cache_hits, parse_errors)
 
@@ -242,28 +246,36 @@ class SemanticWorkspaceEngine:
         return ImpactResult(qualified_name, refs, tests)
 
     def affected_tests(self, changed_paths: Iterable[str | Path]) -> list[str]:
-        tests: set[str] = set()
-        test_paths = [
-            str(row["path"])
-            for row in self._connection.execute(
-                "SELECT DISTINCT path FROM symbols WHERE path LIKE 'tests/%' OR path LIKE '%/test_%'"
-            )
-        ]
-        for changed in changed_paths:
-            relative = _relative_path(self.root, changed)
-            stem = Path(relative).stem.removeprefix("test_")
-            tests.update(path for path in test_paths if stem and stem in Path(path).stem)
-            for row in self._connection.execute(
-                "SELECT qualified_name FROM symbols WHERE path = ?", (relative,)
-            ):
-                tests.update(self.find_references(str(row["qualified_name"])).tests)
-        return sorted(tests)
+        return list(self.analyze_impact(changed_paths).related_tests)
+
+    def analyze_impact(
+        self,
+        changed_paths: Iterable[str | Path],
+        *,
+        max_depth: int = 2,
+        max_nodes: int = 100,
+    ) -> ImpactReport:
+        """Return reverse dependencies, related tests, and an explainable risk score."""
+        return self._impact_graph.analyze(
+            changed_paths,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+        )
 
     def build_repo_map(
-        self, task: str, *, max_files: int = 30, max_chars: int = 6000
+        self,
+        task: str,
+        *,
+        max_files: int = 30,
+        max_chars: int = 6000,
+        impact: ImpactReport | None = None,
     ) -> tuple[str, int, bool]:
         hits = self.search_symbols(task, limit=max_files * 3)
         selected: list[str] = []
+        if impact is not None:
+            for path in [*impact.changed_files, *impact.affected_files, *impact.related_tests]:
+                if path not in selected:
+                    selected.append(path)
         for hit in hits:
             if hit.path not in selected:
                 selected.append(hit.path)
@@ -280,6 +292,13 @@ class SemanticWorkspaceEngine:
             f'<repository_map root="{self.root}">',
             "# Persistent semantic index; signatures only, source bodies omitted.",
         ]
+        if impact is not None:
+            lines.extend(
+                [
+                    f"# change risk: {impact.risk_level} ({impact.risk_score:.2f})",
+                    f"# related tests: {', '.join(impact.related_tests[:8]) or 'none'}",
+                ]
+            )
         included = 0
         for path in selected[:max_files]:
             block = self._render_file(path)

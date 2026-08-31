@@ -43,6 +43,55 @@ def test_semantic_workspace_persists_symbols_references_and_affected_tests(tmp_p
     reopened.close()
 
 
+def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
+    (tmp_path / "service.py").write_text(
+        "def calculate_total(items):\n    return sum(items)\n", encoding="utf-8"
+    )
+    (tmp_path / "api.py").write_text(
+        "from service import calculate_total\n\n"
+        "def checkout(items):\n    return calculate_total(items)\n",
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_api.py").write_text(
+        "from api import checkout\n\n"
+        "def test_checkout():\n    assert checkout([1]) == 1\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+
+    engine.update()
+    report = engine.analyze_impact(["service.py"], max_depth=2)
+
+    assert "api.py" in report.affected_files
+    assert "tests/test_api.py" in report.affected_files
+    assert report.related_tests == ("tests/test_api.py",)
+    assert any(item.symbol == "checkout" and item.distance == 1 for item in report.affected_symbols)
+    assert any(item.symbol == "test_checkout" and item.distance == 2 for item in report.affected_symbols)
+    assert report.risk_level in {"medium", "high"}
+    assert "api.py:checkout" in report.render()
+    engine.close()
+
+
+def test_semantic_workspace_incrementally_removes_stale_impact_edges(tmp_path):
+    service = tmp_path / "service.py"
+    caller = tmp_path / "caller.py"
+    service.write_text("def value():\n    return 1\n", encoding="utf-8")
+    caller.write_text(
+        "from service import value\n\ndef use_value():\n    return value()\n", encoding="utf-8"
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+    assert "caller.py" in engine.analyze_impact(["service.py"]).affected_files
+
+    caller.write_text("def use_value():\n    return 2\n", encoding="utf-8")
+    engine.update([caller])
+
+    assert "caller.py" not in engine.analyze_impact(["service.py"]).affected_files
+    engine.close()
+
+
 def test_verified_edit_rolls_back_invalid_python_at_finish(tmp_path):
     target = tmp_path / "module.py"
     original = "def value():\n    return 1\n"
