@@ -30,6 +30,7 @@ from dm_agent.clients.llm_factory import PROVIDER_DEFAULTS, create_llm_client
 from dm_agent.core import ReactAgent
 from dm_agent.evals.real_runner import PROVIDER_API_KEY_ENV, UsageTrackingClient
 from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
+from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.paths import load_env_files
 from dm_agent.tools import default_tools
 from dm_agent.tracing import TraceWriter
@@ -429,9 +430,12 @@ def predict_one(
     workspace = workspace_root / instance_id
     started = time.perf_counter()
 
+    semantic_index_dir = workspace_root / ".dm_agent_indexes" / instance_id
+    semantic_database = semantic_index_dir / "workspace.db"
     materialize_workspace(instance_id, workspace)
     container_name, container_image = start_runtime_container(instance_id, workspace)
     execution_backend = ContainerExecutionBackend(container_name)
+    workspace_engine: SemanticWorkspaceEngine | None = None
 
     try:
         trace_writer = None
@@ -460,9 +464,10 @@ def predict_one(
         client = build_client(provider, model, timeout)
         tools = execution_backend.replace_execution_tools(default_tools(include_mcp=False))
         capabilities: list[Any] = [SWEProgressLoopGuard()]
-        workspace_engine = None
         if enable_repo_map or enable_verified_edits:
-            workspace_engine = SemanticWorkspaceEngine(workspace)
+            workspace_engine = SemanticWorkspaceEngine(
+                workspace, database_path=semantic_database
+            )
         if enable_repo_map and workspace_engine is not None:
             capabilities.append(SemanticWorkspaceCapability(workspace_engine))
         if enable_verified_edits:
@@ -480,6 +485,11 @@ def predict_one(
             temperature=temperature,
             trace_writer=trace_writer,
             enable_repo_map=enable_repo_map,
+            repository_map=(
+                RepositoryMap(engine=workspace_engine)
+                if enable_repo_map and workspace_engine is not None
+                else None
+            ),
             capabilities=capabilities,
         )
         prompt = PROMPT_TEMPLATE.format(
@@ -505,6 +515,12 @@ def predict_one(
                 status = "agent_exception"
                 failure = f"{type(exc).__name__}: {exc}"
 
+        # Close and remove the external index before Git stages the task workspace.
+        # This keeps SQLite WAL/SHM files out of model patches for third-party repos.
+        if workspace_engine is not None:
+            workspace_engine.close()
+        workspace_engine = None
+        shutil.rmtree(semantic_index_dir, ignore_errors=True)
         patch = extract_patch(workspace)
         record: dict[str, Any] = {
             "instance_id": instance_id,
@@ -549,4 +565,7 @@ def predict_one(
             shutil.rmtree(workspace, ignore_errors=True)
         return record
     finally:
+        if workspace_engine is not None:
+            workspace_engine.close()
+        shutil.rmtree(semantic_index_dir, ignore_errors=True)
         stop_runtime_container(container_name)

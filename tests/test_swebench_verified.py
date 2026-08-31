@@ -438,6 +438,15 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
     assert verified.command_runner is not None
     assert verified.command_runner.__self__.container_name == "test-container"
     assert _FakeAgent.last_kwargs["enable_repo_map"] is True
+    repository_map = _FakeAgent.last_kwargs["repository_map"]
+    assert repository_map.engine is verified.engine
+    assert verified.engine is not None
+    assert not verified.engine.database_path.is_relative_to(
+        workspace_root / _instance()["instance_id"]
+    )
+    assert not (
+        workspace_root / ".dm_agent_indexes" / _instance()["instance_id"]
+    ).exists()
 
 
 def _event_bus_with_progress_guard(trace_writer=None):

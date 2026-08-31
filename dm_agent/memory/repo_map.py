@@ -89,6 +89,7 @@ class RepositoryMap:
     max_scan_files: int = 300
     max_map_files: int = 30
     max_chars: int = 6000
+    engine: SemanticWorkspaceEngine | None = field(default=None, repr=False)
     _cache: dict[Path, _CacheEntry] = field(default_factory=dict, init=False, repr=False)
     _engines: dict[Path, SemanticWorkspaceEngine] = field(
         default_factory=dict, init=False, repr=False
@@ -99,13 +100,21 @@ class RepositoryMap:
         if not repository_root.is_dir():
             raise ValueError(f"Repo Map 根目录不是有效目录：{repository_root}")
 
-        engine = self._engines.get(repository_root)
-        if engine is None:
-            engine = SemanticWorkspaceEngine(
-                repository_root,
-                max_scan_files=self.max_scan_files,
-            )
-            self._engines[repository_root] = engine
+        engine = self.engine
+        if engine is not None:
+            if engine.root != repository_root:
+                raise ValueError(
+                    "Repo Map 根目录与共享 Semantic Workspace 根目录不一致："
+                    f"{repository_root} != {engine.root}"
+                )
+        else:
+            engine = self._engines.get(repository_root)
+            if engine is None:
+                engine = SemanticWorkspaceEngine(
+                    repository_root,
+                    max_scan_files=self.max_scan_files,
+                )
+                self._engines[repository_root] = engine
         stats = engine.update()
         content, included_files, truncated = engine.build_repo_map(
             task,

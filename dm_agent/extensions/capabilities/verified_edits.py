@@ -193,7 +193,7 @@ class VerifiedEditCapability:
     def _validate(self, impact: ImpactReport | None = None) -> list[ValidationResult]:
         results = [self._validate_python_syntax()]
         changed_python = [
-            str(path.relative_to(self.root))
+            path.relative_to(self.root).as_posix()
             for path in sorted(self._changed)
             if path.suffix == ".py" and path.is_file()
         ]

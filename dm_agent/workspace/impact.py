@@ -416,7 +416,14 @@ class _Visitor(ast.NodeVisitor):
 def _parse_python(path: str, source: str) -> tuple[list[_Symbol], list[_Reference]]:
     visitor = _Visitor(path, _module_name(Path(path)))
     visitor.visit(ast.parse(source, filename=path))
-    return visitor.symbols, visitor.references
+    # A logical symbol may have multiple AST definitions in real projects, for
+    # example a property getter/setter pair or overload declarations.  The graph
+    # schema identifies symbols by (path, name), so retain the first definition
+    # in source order while keeping every reference for impact propagation.
+    symbols_by_name: dict[str, _Symbol] = {}
+    for symbol in visitor.symbols:
+        symbols_by_name.setdefault(symbol.name, symbol)
+    return list(symbols_by_name.values()), visitor.references
 
 
 def _resolve_targets(

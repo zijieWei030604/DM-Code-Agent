@@ -18,6 +18,7 @@ from dm_agent import (
 from dm_agent.core.capabilities import AgentCapability
 from dm_agent.core.checkpoint import RunCheckpoint
 from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
+from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.mcp import MCPManager, load_mcp_config
 from dm_agent.skills import SkillManager
 from dm_agent.tracing import SessionWriter, TraceWriter
@@ -119,6 +120,11 @@ def create_agent(
         context_token_budget=config.context_token_budget,
         enable_edit_guard=config.enable_edit_guard,
         enable_repo_map=config.enable_repo_map,
+        repository_map=(
+            RepositoryMap(engine=workspace_engine)
+            if config.enable_repo_map and workspace_engine is not None
+            else None
+        ),
         capabilities=capabilities,
         enable_adaptive_replanning=advanced["adaptive_replanning"],
         max_replans=config.max_replans,

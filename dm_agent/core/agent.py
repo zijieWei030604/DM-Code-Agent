@@ -91,6 +91,7 @@ class ReactAgent:
         context_token_budget: int = 24000,
         enable_edit_guard: bool = True,
         enable_repo_map: bool = False,
+        repository_map: RepositoryMap | None = None,
         event_bus: EventBus | None = None,
     ) -> None:
         """初始化 ReactAgent。
@@ -174,7 +175,7 @@ class ReactAgent:
             enabled=enable_edit_guard, trace_writer=self.trace_writer
         )
         self.enable_repo_map = enable_repo_map
-        self._repo_map = RepositoryMap() if enable_repo_map else None
+        self._repo_map = (repository_map or RepositoryMap()) if enable_repo_map else None
         # 技能管理器
         self.skill_manager = skill_manager
         self._base_system_prompt = self.system_prompt

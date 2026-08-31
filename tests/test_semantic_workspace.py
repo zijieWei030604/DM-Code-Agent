@@ -97,6 +97,28 @@ def test_semantic_workspace_incrementally_removes_stale_impact_edges(tmp_path):
     engine.close()
 
 
+def test_semantic_workspace_deduplicates_property_getter_and_setter(tmp_path):
+    module = tmp_path / "module.py"
+    module.write_text(
+        "class Example:\n"
+        "    @property\n"
+        "    def value(self):\n"
+        "        return self._value\n\n"
+        "    @value.setter\n"
+        "    def value(self, new_value):\n"
+        "        self._value = new_value\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+
+    stats = engine.update()
+    report = engine.analyze_impact([module])
+
+    assert stats.parse_errors == 0
+    assert report.changed_symbols.count("module.py:Example.value") == 1
+    engine.close()
+
+
 def test_verified_edit_rolls_back_invalid_python_at_finish(tmp_path):
     target = tmp_path / "module.py"
     original = "def value():\n    return 1\n"
@@ -262,6 +284,31 @@ def test_verified_edit_uses_injected_validation_runner(tmp_path):
 
     assert result.passed is True
     assert calls == [(["-m", "pytest", "-q", "tests/test_service.py"], 120)]
+
+
+def test_verified_edit_uses_posix_paths_for_container_validation(tmp_path):
+    target = tmp_path / "package" / "module.py"
+    target.parent.mkdir()
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def runner(arguments: list[str], timeout: int) -> tuple[int, str]:
+        calls.append(arguments)
+        return 0, f"completed in {timeout}s"
+
+    capability = VerifiedEditCapability(
+        tmp_path,
+        command_runner=runner,
+        run_affected_tests=False,
+        run_lint=False,
+        run_type_check=False,
+    )
+    capability._changed.add(target)
+
+    results = capability._validate()
+
+    assert all(result.passed for result in results)
+    assert ["-m", "py_compile", "package/module.py"] in calls
 
 
 def test_semantic_capability_injects_bounded_impact_context_after_write(tmp_path):
