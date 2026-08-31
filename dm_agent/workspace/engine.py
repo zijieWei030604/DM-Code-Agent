@@ -316,9 +316,23 @@ class SemanticWorkspaceEngine:
             included += 1
         truncated = included < total
         if truncated:
-            lines.append(f"... {total - included} additional Python files omitted")
+            omission_line = f"... {total - included} additional Python files omitted"
+            candidate = "\n".join([*lines, omission_line, "</repository_map>"])
+            while max_chars > 0 and len(candidate) > max_chars and included > 0:
+                lines.pop()
+                included -= 1
+                omission_line = f"... {total - included} additional Python files omitted"
+                candidate = "\n".join([*lines, omission_line, "</repository_map>"])
+            if max_chars <= 0 or len(candidate) <= max_chars:
+                lines.append(omission_line)
+            else:
+                lines = [lines[0], "... repository map omitted by character budget"]
+                included = 0
         lines.append("</repository_map>")
-        return "\n".join(lines), included, truncated
+        content = "\n".join(lines)
+        if max_chars > 0 and len(content) > max_chars:
+            content = content[:max_chars]
+        return content, included, truncated
 
     def _create_schema(self) -> bool:
         self._connection.executescript("""PRAGMA journal_mode=WAL;

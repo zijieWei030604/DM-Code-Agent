@@ -201,8 +201,7 @@ def _assemble_agent(
                 "adaptive_replanning_enabled": advanced["adaptive_replanning"],
                 "semantic_workspace_enabled": config.enable_repo_map
                 or config.enable_verified_edits,
-                "semantic_impact_enabled": config.enable_repo_map
-                or config.enable_verified_edits,
+                "semantic_impact_enabled": config.enable_repo_map or config.enable_verified_edits,
                 "verified_edits_enabled": advanced["verified_edits"],
                 "max_replans": config.max_replans,
             },

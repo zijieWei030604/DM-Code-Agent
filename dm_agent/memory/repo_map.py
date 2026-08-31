@@ -302,9 +302,15 @@ class RepositoryMap:
         lines.extend(footer)
         content = "\n".join(lines)
         if self.max_chars > 0 and len(content) > self.max_chars:
-            content = "\n".join(
-                [*header, "... repository map omitted by character budget", *footer]
-            )
+            omitted_line = "... repository map omitted by character budget"
+            fallback_lines = [*header, omitted_line, *footer]
+            content = "\n".join(fallback_lines)
+            if len(content) > self.max_chars:
+                compact_header = f'<repository_map root="{root}">'
+                compact_lines = [compact_header, omitted_line, *footer]
+                content = "\n".join(compact_lines)
+            if len(content) > self.max_chars:
+                content = content[: self.max_chars]
             included = 0
             truncated = bool(total_summaries)
         return content, included, truncated

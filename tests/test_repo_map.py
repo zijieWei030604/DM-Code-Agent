@@ -12,7 +12,7 @@ class _FinishClient:
     total_respond_retries = 0
 
     def __init__(self) -> None:
-        self.requests = []
+        self.requests: list[tuple[list[dict[str, str]], dict[str, object]]] = []
 
     def respond(self, messages, **extra):
         self.requests.append((messages, extra))
