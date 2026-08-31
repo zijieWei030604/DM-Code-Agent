@@ -22,7 +22,7 @@ from dm_agent.core.events import (
     RunStartEvent,
 )
 from dm_agent.core.guards import WRITE_ACTIONS
-from dm_agent.workspace import SemanticWorkspaceEngine
+from dm_agent.workspace import ImpactReport, SemanticWorkspaceEngine
 
 
 @dataclass
@@ -132,7 +132,18 @@ class VerifiedEditCapability:
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
         if not self._changed or self._verified:
             return None
-        results = self._validate()
+        impact = self.engine.analyze_impact(self._changed) if self.engine else None
+        if impact is not None:
+            event.metadata.update(
+                {
+                    "edit_impact_risk": impact.risk_level,
+                    "edit_impact_score": impact.risk_score,
+                    "edit_impact_files": len(impact.affected_files),
+                    "edit_impact_tests": len(impact.related_tests),
+                }
+            )
+            self._record("edit_transaction_impact", impact.to_dict())
+        results = self._validate(impact)
         event.metadata["edit_validation_count"] = int(
             event.metadata.get("edit_validation_count", 0)
         ) + len(results)
@@ -173,7 +184,7 @@ class VerifiedEditCapability:
                 {"reason": "run_not_successful", "restored": restored, "conflicts": conflicts},
             )
 
-    def _validate(self) -> list[ValidationResult]:
+    def _validate(self, impact: ImpactReport | None = None) -> list[ValidationResult]:
         results = [self._validate_python_syntax()]
         changed_python = [
             str(path.relative_to(self.root))
@@ -188,8 +199,18 @@ class VerifiedEditCapability:
             results.append(self._run_optional_module("ruff", ["check", *changed_python]))
         if self.run_type_check and changed_python:
             results.append(self._run_optional_module("mypy", changed_python))
-        tests = self.engine.affected_tests(self._changed) if self.engine else []
+        tests = list(impact.related_tests) if impact is not None else []
+        if not tests and self.engine:
+            tests = self.engine.affected_tests(self._changed)
         if self.run_affected_tests and tests:
+            self._record(
+                "affected_tests_selected",
+                {
+                    "tests": tests,
+                    "risk": impact.risk_level if impact else "unknown",
+                    "reasons": list(impact.reasons) if impact else [],
+                },
+            )
             results.append(self._run_tests(tests))
         return results
 

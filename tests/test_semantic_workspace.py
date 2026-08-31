@@ -3,12 +3,13 @@ from __future__ import annotations
 from dm_agent.core.capabilities import CapabilityContext
 from dm_agent.core.events import (
     AfterToolResultEvent,
+    BeforeLLMRequestEvent,
     BeforeFinishEvent,
     BeforeToolCallEvent,
     EventBus,
     RunStartEvent,
 )
-from dm_agent.extensions.capabilities import VerifiedEditCapability
+from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
 from dm_agent.workspace import SemanticWorkspaceEngine
 
 
@@ -167,3 +168,79 @@ def test_verified_edit_uses_injected_validation_runner(tmp_path):
 
     assert result.passed is True
     assert calls == [(["-m", "pytest", "-q", "tests/test_service.py"], 120)]
+
+
+def test_semantic_capability_injects_bounded_impact_context_after_write(tmp_path):
+    (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    bus = EventBus()
+    capability = SemanticWorkspaceCapability(engine)
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("change value", 1, "run", metadata=metadata))
+
+    (tmp_path / "service.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file", {"path": "service.py"}, "written", 1, "run", True, metadata
+        )
+    )
+    messages = [{"role": "user", "content": "continue\n\n<repository_map></repository_map>"}]
+    bus.emit_before_llm_request(
+        BeforeLLMRequestEvent(messages, 2, "run", "agent", metadata)
+    )
+
+    assert "<change_impact>" in messages[0]["content"]
+    assert "consumer.py:consume" in messages[0]["content"]
+    assert "[affected]" in messages[0]["content"]
+    assert metadata["semantic_impact_files"] == 1
+    engine.close()
+
+
+def test_verified_edit_selects_graph_related_tests(tmp_path):
+    target = tmp_path / "service.py"
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_consumer.py").write_text(
+        "from service import value\n\ndef test_value():\n    assert value() == 1\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+    calls: list[list[str]] = []
+
+    def runner(arguments: list[str], timeout: int) -> tuple[int, str]:
+        calls.append(arguments)
+        return 0, "passed"
+
+    bus = EventBus()
+    capability = VerifiedEditCapability(
+        tmp_path,
+        engine=engine,
+        command_runner=runner,
+        run_lint=False,
+        run_type_check=False,
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("edit service", 1, "run", metadata=metadata))
+    arguments = {"path": "service.py"}
+    bus.emit_before_tool_call(BeforeToolCallEvent("edit_file", arguments, 1, "run", metadata))
+    target.write_text("def value():\n    return 2\n", encoding="utf-8")
+    engine.update([target])
+    bus.emit_after_tool_result(
+        AfterToolResultEvent("edit_file", arguments, "written", 1, "run", True, metadata)
+    )
+
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("edit service", "finish", "done", [], 2, "run", metadata)
+    )
+
+    assert block is None
+    assert ["-m", "pytest", "-q", "tests/test_consumer.py"] in calls
+    assert metadata["edit_impact_tests"] == 1
+    engine.close()
