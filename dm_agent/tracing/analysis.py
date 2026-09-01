@@ -7,6 +7,7 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from .evidence import analyze_evidence_events
 from .summary import _first, _last, summarize_events
 from .writer import load_trace_events
 
@@ -80,6 +81,7 @@ def analyze_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     )
     recovered = bool(failures and summary.get("status") == "success")
     verification = _verification_analysis(summary)
+    evidence = analyze_evidence_events(events)
     signals = _analysis_signals(
         primary_stage=primary_stage,
         final_stage=final_stage,
@@ -113,6 +115,7 @@ def analyze_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             "recovered": recovered,
         },
         "verification": verification,
+        "evidence": evidence,
         "hallucination_signals": _hallucination_signals(events),
         "metadata_counters": {
             key: metadata.get(key, 0)
@@ -350,6 +353,14 @@ def _trace_directory_summary(
         "error_count": len(errors),
         "verification_gap_count": sum(
             1 for analysis in analysis_payloads if analysis.get("verification", {}).get("gap")
+        ),
+        "evidence_status_counts": _count_values(
+            analysis.get("evidence", {}).get("status", "unmeasured")
+            for analysis in analysis_payloads
+        ),
+        "evidence_unverified_change_count": sum(
+            len(analysis.get("evidence", {}).get("unverified_changes", []))
+            for analysis in analysis_payloads
         ),
         "runs_with_failures": len(runs_with_failures),
         "recovered_runs": len(recovered_runs),

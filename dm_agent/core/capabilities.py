@@ -30,6 +30,7 @@ class CapabilityContext:
     event_bus: EventBus
     client_for: Callable[[str], Any]
     trace_writer: Any | None = None
+    get_run_state: Callable[[], dict[str, Any]] | None = None
 
 
 @runtime_checkable

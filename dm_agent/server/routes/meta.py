@@ -114,6 +114,15 @@ CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
         "label": "Verified Edit Transaction",
         "help": "完成前校验语法和受影响测试；校验未通过时恢复修改前快照。",
     },
+    {
+        "flag": "--enable-evidence-graph",
+        "key": "enable_evidence_graph",
+        "kind": "bool",
+        "default": False,
+        "category": "behavior",
+        "label": "Decision Evidence Graph",
+        "help": "关联任务、计划、观察、修改、验证与结论，并输出可审计覆盖状态。",
+    },
 )
 
 

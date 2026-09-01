@@ -28,6 +28,7 @@ from .events import (
     RunEndEvent,
     RunStartEvent,
 )
+from .evidence import plan_snapshot
 from .guards import ReadBeforeEditGuard
 from .observation import ObservationBounder, is_failure_observation
 from .persistence import (
@@ -197,6 +198,7 @@ class ReactAgent:
             event_bus=self.event_bus,
             client_for=client_for,
             trace_writer=self.trace_writer,
+            get_run_state=self._capability_run_state,
         )
         for capability in self.capabilities:
             capability.install(capability_context)
@@ -848,6 +850,7 @@ class ReactAgent:
                 self.compressor.reset()
             else:
                 self.compressor.restore_state(resume_state.compressor_state)
+        self._restore_capability_state(resume_state.capability_state)
         warn_on_config_mismatch(resume_state.agent_config, self._config_snapshot())
         return plan, resume_from
 
@@ -871,10 +874,33 @@ class ReactAgent:
             metadata=json_safe_metadata(metadata),
             plan=plan_to_checkpoint(plan),
             compressor_state=self.compressor.export_state() if self.compressor else None,
+            capability_state=self._export_capability_state(),
             agent_config=self._config_snapshot(max_steps=limit),
             cwd=str(Path.cwd()),
         )
         self._persistence.save(path, checkpoint)
+
+    def _capability_run_state(self) -> dict[str, Any]:
+        """Return a narrow read-only state view for optional capabilities."""
+        plan = self.planner.current_plan if self.planner else []
+        return {"plan": plan_snapshot(plan)}
+
+    def _export_capability_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
+        for capability in self.capabilities:
+            key = getattr(capability, "checkpoint_key", "")
+            export = getattr(capability, "export_state", None)
+            if isinstance(key, str) and key and callable(export):
+                state[key] = export()
+        return state
+
+    def _restore_capability_state(self, state: dict[str, Any]) -> None:
+        for capability in self.capabilities:
+            key = getattr(capability, "checkpoint_key", "")
+            restore = getattr(capability, "restore_state", None)
+            saved = state.get(key) if isinstance(key, str) else None
+            if callable(restore) and isinstance(saved, dict):
+                restore(saved)
 
     @staticmethod
     def _is_failure_observation(observation: str, *, action: str | None = None) -> bool:

@@ -223,6 +223,15 @@ def _analysis_for_trace(*, verified: bool) -> dict[str, Any]:
             "before_finish": verified,
             "gap": not verified,
         },
+        "evidence": {
+            "enabled": False,
+            "status": "unmeasured",
+            "node_count": 0,
+            "edge_count": 0,
+            "counts": {},
+            "failed_verifications": 0,
+            "unverified_changes": [],
+        },
         "hallucination_signals": {
             "edit_without_read_count": 0,
             "edit_guard_blocks": 0,
@@ -389,6 +398,7 @@ def test_analyze_cli_human_and_json_outputs_are_exact(tmp_path: Path, capsys) ->
         "Final failure stage: none\n"
         "Recovery: failures=0, replans=0, replanned_after_failure=false, recovered=false\n"
         "Verification: actions=0, before_finish=false, gap=true\n"
+        "Evidence: status=unmeasured, nodes=0, edges=0, unverified_changes=0\n"
         "Hallucination signals: edit_without_read=0, guard_blocks=0, truncations=0, "
         "missing_paths=0\n"
         "Health: warning (0.80)\n"
@@ -418,6 +428,8 @@ def test_analyze_dir_cli_human_json_and_markdown_outputs_are_exact(tmp_path: Pat
             "analyzed_traces": 2,
             "error_count": 0,
             "verification_gap_count": 1,
+            "evidence_status_counts": {"unmeasured": 2},
+            "evidence_unverified_change_count": 0,
             "runs_with_failures": 0,
             "recovered_runs": 0,
             "recovery_success_rate": None,
@@ -444,11 +456,14 @@ def test_analyze_dir_cli_human_json_and_markdown_outputs_are_exact(tmp_path: Pat
         "Traces: 2/2 analyzed\n"
         "Errors: 0\n"
         "Verification gaps: 1\n"
+        "Unverified evidence changes: 0\n"
         "Hallucination signals: edit_without_read=0, guard_blocks=0, truncations=0, "
         "missing_paths=0\n"
         "Trace health:\n"
         "- good: 1\n"
         "- warning: 1\n"
+        "Evidence status:\n"
+        "- unmeasured: 2\n"
         "Final failure stages:\n"
         "- none: 2\n"
     )
@@ -479,11 +494,16 @@ def test_analyze_dir_cli_human_json_and_markdown_outputs_are_exact(tmp_path: Pat
         "- Traces analyzed: `2/2`\n"
         "- Errors: `0`\n"
         "- Verification gaps: `1`\n"
+        "- Unverified evidence changes: `0`\n"
         "\n"
         "## Trace Health\n"
         "\n"
         "- `good`: `1`\n"
         "- `warning`: `1`\n"
+        "\n"
+        "## Evidence Status\n"
+        "\n"
+        "- `unmeasured`: `2`\n"
         "\n"
         "## Recovery & Hallucination Signals\n"
         "\n"
@@ -499,10 +519,10 @@ def test_analyze_dir_cli_human_json_and_markdown_outputs_are_exact(tmp_path: Pat
         "\n"
         "## Trace Details\n"
         "\n"
-        "| Trace | Status | Health | Final failure | Verification gap | Replans |\n"
-        "| --- | --- | --- | --- | ---: | ---: |\n"
-        "| `a-gap.jsonl` | `success` | `warning` | `none` | yes | 0 |\n"
-        "| `b-verified.jsonl` | `success` | `good` | `none` | no | 0 |\n"
+        "| Trace | Status | Health | Evidence | Final failure | Verification gap | Replans |\n"
+        "| --- | --- | --- | --- | --- | ---: | ---: |\n"
+        "| `a-gap.jsonl` | `success` | `warning` | `unmeasured` | `none` | yes | 0 |\n"
+        "| `b-verified.jsonl` | `success` | `good` | `unmeasured` | `none` | no | 0 |\n"
     )
 
 

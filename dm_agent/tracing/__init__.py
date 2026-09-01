@@ -1,6 +1,7 @@
 """Trace capture, analysis, diff, and replay helpers for DM-Code-Agent."""
 
 from .analysis import analyze_events, analyze_trace_directory
+from .evidence import analyze_evidence_events, rebuild_evidence_graph
 from .fork import fork_session
 from .render import render_trace_directory_markdown
 from .session import (
@@ -21,6 +22,7 @@ __all__ = [
     "SessionWriter",
     "TraceWriter",
     "analyze_events",
+    "analyze_evidence_events",
     "analyze_trace_directory",
     "conversation_from_entries",
     "diff_events",
@@ -34,6 +36,7 @@ __all__ = [
     "new_entry_id",
     "normalize_entries",
     "rebuild_context",
+    "rebuild_evidence_graph",
     "render_trace_directory_markdown",
     "summarize_events",
 ]

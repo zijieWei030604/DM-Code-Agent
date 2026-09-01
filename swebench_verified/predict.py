@@ -29,7 +29,11 @@ from typing import Any
 from dm_agent.clients.llm_factory import PROVIDER_DEFAULTS, create_llm_client
 from dm_agent.core import ReactAgent
 from dm_agent.evals.real_runner import PROVIDER_API_KEY_ENV, UsageTrackingClient
-from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
+from dm_agent.extensions.capabilities import (
+    EvidenceGraphCapability,
+    SemanticWorkspaceCapability,
+    VerifiedEditCapability,
+)
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.paths import load_env_files
 from dm_agent.tools import default_tools
@@ -424,6 +428,7 @@ def predict_one(
     keep_workspace: bool,
     enable_repo_map: bool = False,
     enable_verified_edits: bool = False,
+    enable_evidence_graph: bool = False,
 ) -> dict[str, Any]:
     """跑完一道题，返回一条预测记录（含足够的诊断字段）。"""
     instance_id = instance["instance_id"]
@@ -456,6 +461,7 @@ def predict_one(
                     "semantic_workspace_enabled": enable_repo_map or enable_verified_edits,
                     "semantic_impact_enabled": enable_repo_map or enable_verified_edits,
                     "verified_edits_enabled": enable_verified_edits,
+                    "evidence_graph_enabled": enable_evidence_graph,
                 },
             )
 
@@ -475,6 +481,8 @@ def predict_one(
                     command_runner=execution_backend.run_validation,
                 )
             )
+        if enable_evidence_graph:
+            capabilities.append(EvidenceGraphCapability())
         agent = ReactAgent(
             client,
             tools,

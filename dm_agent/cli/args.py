@@ -134,6 +134,12 @@ def parse_args(argv: Any) -> argparse.Namespace:
         help="启用编辑事务：完成前校验语法和受影响测试，失败时自动回滚。",
     )
     parser.add_argument(
+        "--enable-evidence-graph",
+        action="store_true",
+        default=saved_config.get("enable_evidence_graph", False),
+        help="启用低干预决策证据图：关联计划、观察、修改、验证与结论。",
+    )
+    parser.add_argument(
         "--llm-max-retries",
         type=int,
         default=saved_config.get("llm_max_retries", 2),

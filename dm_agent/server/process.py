@@ -48,6 +48,7 @@ BOOL_FLAGS: dict[str, str] = {
     "enable_adaptive_replanning": "--enable-adaptive-replanning",
     "enable_repo_map": "--enable-repo-map",
     "enable_verified_edits": "--enable-verified-edits",
+    "enable_evidence_graph": "--enable-evidence-graph",
 }
 
 # 数值开关 → (CLI 开关, 最小值, 最大值)。超范围直接拒绝，不静默截断。

@@ -43,6 +43,7 @@ class Config:
     enable_edit_guard: bool = True
     enable_repo_map: bool = False
     enable_verified_edits: bool = False
+    enable_evidence_graph: bool = False
     llm_max_retries: int = 2
     enable_adaptive_replanning: bool = False
     max_replans: int = -1
@@ -86,6 +87,7 @@ def save_config_to_file(config: Config) -> None:
             "enable_edit_guard": config.enable_edit_guard,
             "enable_repo_map": config.enable_repo_map,
             "enable_verified_edits": config.enable_verified_edits,
+            "enable_evidence_graph": config.enable_evidence_graph,
             "llm_max_retries": config.llm_max_retries,
             "enable_adaptive_replanning": config.enable_adaptive_replanning,
             "max_replans": config.max_replans,
@@ -135,6 +137,7 @@ def resolve_advanced_features(config: Config) -> dict[str, bool]:
     return {
         "adaptive_replanning": config.enable_adaptive_replanning,
         "verified_edits": config.enable_verified_edits,
+        "evidence_graph": config.enable_evidence_graph,
     }
 
 
@@ -146,6 +149,7 @@ def format_advanced_feature_status(config: Config) -> str:
         for key, label in [
             ("adaptive_replanning", "adaptive-replan"),
             ("verified_edits", "verified-edits"),
+            ("evidence_graph", "evidence-graph"),
         ]
         if advanced[key]
     ]

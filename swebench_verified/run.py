@@ -76,6 +76,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Validate edits before finish and roll them back when validation fails.",
     )
+    parser.add_argument(
+        "--enable-evidence-graph",
+        action="store_true",
+        help="Record and summarize decision evidence for each prediction.",
+    )
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument(
         "--selection-manifest",
@@ -200,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                     keep_workspace=args.keep_workspace,
                     enable_repo_map=args.enable_repo_map,
                     enable_verified_edits=args.enable_verified_edits,
+                    enable_evidence_graph=args.enable_evidence_graph,
                 )
             except Exception as exc:  # 拉镜像/磁盘等环境问题：记下来继续下一题
                 record = {

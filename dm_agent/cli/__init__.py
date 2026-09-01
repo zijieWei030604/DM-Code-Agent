@@ -205,6 +205,7 @@ def main(argv: Any = None) -> int:
         enable_edit_guard=args.enable_edit_guard,
         enable_repo_map=args.enable_repo_map,
         enable_verified_edits=args.enable_verified_edits,
+        enable_evidence_graph=args.enable_evidence_graph,
         llm_max_retries=args.llm_max_retries,
         enable_adaptive_replanning=args.enable_adaptive_replanning,
         max_replans=args.max_replans,

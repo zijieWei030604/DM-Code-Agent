@@ -17,7 +17,11 @@ from dm_agent import (
 )
 from dm_agent.core.capabilities import AgentCapability
 from dm_agent.core.checkpoint import RunCheckpoint
-from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
+from dm_agent.extensions.capabilities import (
+    EvidenceGraphCapability,
+    SemanticWorkspaceCapability,
+    VerifiedEditCapability,
+)
 from dm_agent.mcp import MCPManager, load_mcp_config
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.skills import SkillManager
@@ -111,6 +115,8 @@ def create_agent(
         capabilities.append(
             VerifiedEditCapability(Path.cwd(), engine=workspace_engine, policy=VerificationPolicy())
         )
+    if config.enable_evidence_graph:
+        capabilities.append(EvidenceGraphCapability())
     return ReactAgent(
         client,
         tools,
@@ -212,6 +218,7 @@ def _assemble_agent(
                 or config.enable_verified_edits,
                 "semantic_impact_enabled": config.enable_repo_map or config.enable_verified_edits,
                 "verified_edits_enabled": advanced["verified_edits"],
+                "evidence_graph_enabled": advanced["evidence_graph"],
                 "max_replans": config.max_replans,
             },
         )

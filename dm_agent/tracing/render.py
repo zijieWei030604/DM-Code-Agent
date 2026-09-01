@@ -55,6 +55,7 @@ def _analyze(
 
     recovery = analysis["recovery"]
     verification = analysis["verification"]
+    evidence = analysis.get("evidence", {})
     health = analysis["trace_health"]
     print("Trace analysis")
     print(f"Task: {analysis.get('task', '')}")
@@ -73,6 +74,13 @@ def _analyze(
         f"actions={verification['count']}, "
         f"before_finish={str(verification['before_finish']).lower()}, "
         f"gap={str(verification['gap']).lower()}"
+    )
+    print(
+        "Evidence: "
+        f"status={evidence.get('status', 'unmeasured')}, "
+        f"nodes={evidence.get('node_count', 0)}, "
+        f"edges={evidence.get('edge_count', 0)}, "
+        f"unverified_changes={len(evidence.get('unverified_changes', []))}"
     )
     hallucination = analysis.get("hallucination_signals", {})
     print(
@@ -112,6 +120,7 @@ def _analyze_dir(
     print(f"Traces: {summary['analyzed_traces']}/{summary['total_files']} analyzed")
     print(f"Errors: {summary['error_count']}")
     print(f"Verification gaps: {summary['verification_gap_count']}")
+    print(f"Unverified evidence changes: {summary.get('evidence_unverified_change_count', 0)}")
     recovery_rate = summary.get("recovery_success_rate")
     if recovery_rate is not None:
         print(
@@ -130,6 +139,9 @@ def _analyze_dir(
     print("Trace health:")
     for grade, count in summary["trace_health_counts"].items():
         print(f"- {grade}: {count}")
+    print("Evidence status:")
+    for status, count in summary.get("evidence_status_counts", {}).items():
+        print(f"- {status}: {count}")
     print("Final failure stages:")
     for stage, count in summary["final_failure_stage_counts"].items():
         print(f"- {stage}: {count}")
@@ -153,12 +165,17 @@ def render_trace_directory_markdown(report: dict[str, Any]) -> str:
         f"- Traces analyzed: `{summary.get('analyzed_traces', 0)}/{summary.get('total_files', 0)}`",
         f"- Errors: `{summary.get('error_count', 0)}`",
         f"- Verification gaps: `{summary.get('verification_gap_count', 0)}`",
+        "- Unverified evidence changes: " f"`{summary.get('evidence_unverified_change_count', 0)}`",
         "",
         "## Trace Health",
         "",
     ]
     for grade, count in (summary.get("trace_health_counts") or {}).items():
         lines.append(f"- `{grade}`: `{count}`")
+
+    lines.extend(["", "## Evidence Status", ""])
+    for status, count in (summary.get("evidence_status_counts") or {}).items():
+        lines.append(f"- `{status}`: `{count}`")
 
     recovery_rate = summary.get("recovery_success_rate")
     hallucination = summary.get("hallucination_signals") or {}
@@ -189,8 +206,8 @@ def render_trace_directory_markdown(report: dict[str, Any]) -> str:
             "",
             "## Trace Details",
             "",
-            "| Trace | Status | Health | Final failure | Verification gap | Replans |",
-            "| --- | --- | --- | --- | ---: | ---: |",
+            "| Trace | Status | Health | Evidence | Final failure | Verification gap | Replans |",
+            "| --- | --- | --- | --- | --- | ---: | ---: |",
         ]
     )
     for item in report.get("analyses", []):
@@ -198,11 +215,13 @@ def render_trace_directory_markdown(report: dict[str, Any]) -> str:
         health = analysis.get("trace_health") or {}
         verification = analysis.get("verification") or {}
         recovery = analysis.get("recovery") or {}
+        evidence = analysis.get("evidence") or {}
         lines.append(
-            "| {path} | {status} | {health} | {final_failure} | {gap} | {replans} |".format(
+            "| {path} | {status} | {health} | {evidence} | {final_failure} | {gap} | {replans} |".format(
                 path=f"`{_display_trace_path(str(item.get('path', '')), report)}`",
                 status=f"`{analysis.get('status', '')}`",
                 health=f"`{health.get('grade', 'unknown')}`",
+                evidence=f"`{evidence.get('status', 'unmeasured')}`",
                 final_failure=f"`{analysis.get('final_failure_stage', 'unknown')}`",
                 gap="yes" if verification.get("gap") else "no",
                 replans=int(recovery.get("replan_count") or 0),
