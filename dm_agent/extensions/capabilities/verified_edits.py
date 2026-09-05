@@ -160,7 +160,7 @@ class VerifiedEditCapability:
         return None
 
     def _after_tool_result(self, event: AfterToolResultEvent) -> None:
-        if event.tool_name not in WRITE_ACTIONS or not event.tool_succeeded:
+        if event.tool_name not in WRITE_ACTIONS or not event.has_effect:
             return
         path = self._resolve_path(event.arguments.get("path"))
         snapshot = self._snapshots.get(path) if path else None

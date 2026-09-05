@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, cast
 
-from dm_agent.tools.base import Tool
+from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tools.file_tools import edit_file as builtin_edit_file
 
 from .events import AfterToolResultEvent, BeforeToolCallEvent, EventBus, HookErrorHandler
@@ -22,7 +22,7 @@ from .guards import (
     is_identity_content_edit,
     observation_reports_missing_path,
 )
-from .observation import ObservationBounder
+from .observation import ObservationBounder, is_failure_observation
 from .persistence import RunPersistence
 from .run_state import RunContext
 
@@ -44,6 +44,7 @@ class ToolInvocation:
     blocked: bool = False
     tool_succeeded: bool = False
     no_change: bool = False
+    result: ToolResult | None = None
 
 
 def coerce_task_complete_arguments(action_input: Any) -> dict[str, Any]:
@@ -116,6 +117,12 @@ class ToolInvoker:
         )
         block = self.event_bus.emit_before_tool_call(before_event, on_error=self.on_error)
         action_input = before_event.arguments
+        if validate_tool_arguments(action_input) is not None:
+            return ToolInvocation(
+                arguments=action_input,
+                observation="Tool arguments must be a JSON object.",
+                error_kind="invalid_arguments",
+            )
         if block is not None:
             # 被拦下的调用不计入计划完成，也不备份。
             return ToolInvocation(
@@ -134,15 +141,32 @@ class ToolInvoker:
 
         error_kind = ""
         tool_succeeded = False
+        result = None
+        journal = self.persistence.call_journal
+        call_id = (
+            journal.begin(action, context.step_number, context.run_id, read_only=tool.read_only)
+            if journal
+            else ""
+        )
         try:
-            raw_observation = str(tool.execute(action_input))
+            output = (
+                tool.result_runner(action_input)
+                if tool.result_runner
+                else tool.execute(action_input)
+            )
+            result = output if isinstance(output, ToolResult) else None
+            raw_observation = str(output)
         except Exception as exc:
             metadata["tool_error_count"] += 1
             metadata["failure_reason"] = str(exc)
             raw_observation = f"Tool execution failed: {exc}"
             error_kind = "tool_error"
         else:
-            tool_succeeded = True
+            tool_succeeded = (
+                result.status == "success"
+                if result is not None
+                else not is_failure_observation(raw_observation, action=action)
+            )
 
         bounded_observation = self.bounder.bound(
             raw_observation,
@@ -165,12 +189,16 @@ class ToolInvoker:
             no_change=confirmed_no_change,
             no_change_reason="identical_content" if confirmed_no_change else "",
             metadata=metadata,
+            result=result,
         )
         observation = self.event_bus.emit_after_tool_result(after_event, on_error=self.on_error)
+        if journal:
+            journal.finish(call_id)
         return ToolInvocation(
             arguments=action_input,
             observation=observation,
             error_kind=error_kind,
             tool_succeeded=tool_succeeded,
             no_change=after_event.no_change,
+            result=result,
         )

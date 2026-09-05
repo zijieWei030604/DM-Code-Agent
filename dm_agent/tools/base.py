@@ -3,8 +3,24 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """Machine-readable execution outcome; message is only its presentation."""
+
+    status: Literal["success", "failed", "unavailable", "cancelled", "unknown"]
+    message: str
+    error_code: str = ""
+    exit_code: int | None = None
+    changed_files: tuple[str, ...] = ()
+    check_scope: tuple[str, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass
@@ -13,9 +29,11 @@ class Tool:
 
     name: str  # 工具名称
     description: str  # 工具描述
-    runner: Callable[[dict[str, Any]], str]  # 工具执行函数
+    runner: Callable[[dict[str, Any]], str | ToolResult]  # 工具执行函数
+    result_runner: Callable[[dict[str, Any]], ToolResult] | None = None
+    read_only: bool = False
 
-    def execute(self, arguments: dict[str, Any]) -> str:
+    def execute(self, arguments: dict[str, Any]) -> str | ToolResult:
         """
         执行工具
         """

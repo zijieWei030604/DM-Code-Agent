@@ -8,7 +8,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .base import _require_str
+from .base import ToolResult, _require_str
+from .write_journal import begin_write, complete_write, fingerprint
 
 # 编辑后回显的上下文行数与总行数上限。上限存在的理由：观察会进对话历史，
 # 替换一大段代码时不设限会把窗口撑爆；`--max-observation-chars` 是全局兜底，
@@ -46,7 +47,7 @@ def _atomic_write_text(path: Path, content: str) -> str:
     """原子写入：同目录临时文件 + os.replace，避免中断留下半写文件。
 
     Windows 上目标被占用时 os.replace 可能抛 PermissionError；小睡后重试一次，
-    仍失败则回退普通写入并在返回值中注明。返回空串表示原子写成功。
+    仍失败则保留目标并抛出异常。返回空串表示原子写成功。
 
     ``newline=""`` 关掉平台改写、由 :func:`_dominant_newline` 决定实际行尾，
     两者缺一不可：默认的 ``newline=None`` 会把 ``\\n`` 换成 ``os.linesep``，于是在
@@ -54,15 +55,21 @@ def _atomic_write_text(path: Path, content: str) -> str:
     改一行，产出的 diff 是 +317/-317 的整文件重写。
     """
     payload = _with_newline(content, _dominant_newline(path))
+    journal = begin_write(path, payload.encode("utf-8"))
     tmp_path = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     try:
-        tmp_path.write_text(payload, encoding="utf-8", newline="")
+        with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
             os.replace(tmp_path, path)
+            complete_write(journal)
             return ""
         except PermissionError:
             time.sleep(0.05)
             os.replace(tmp_path, path)
+            complete_write(journal)
             return ""
     except OSError:
         try:
@@ -70,8 +77,7 @@ def _atomic_write_text(path: Path, content: str) -> str:
                 tmp_path.unlink()
         except OSError:
             pass
-        path.write_text(payload, encoding="utf-8", newline="")
-        return " (non-atomic fallback)"
+        raise
 
 
 def create_file(arguments: dict[str, Any]) -> str:
@@ -85,6 +91,37 @@ def create_file(arguments: dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     note = _atomic_write_text(path, content)
     return f"已将 {len(content)} 个字符写入 {path}。{note}{_check_python_syntax(path, content)}".rstrip()
+
+
+def create_file_result(arguments: dict[str, Any]) -> ToolResult:
+    return _write_result(arguments, create=True)
+
+
+def edit_file_result(arguments: dict[str, Any]) -> ToolResult:
+    return _write_result(arguments, create=False)
+
+
+def _write_result(arguments: dict[str, Any], *, create: bool) -> ToolResult:
+    path = Path(_require_str(arguments, "path"))
+    before = fingerprint(path)
+    message = create_file(arguments) if create else edit_file(arguments)
+    after = fingerprint(path)
+    if after is None:
+        return ToolResult("failed", message, error_code="file_not_found")
+    changed = before != after
+    syntax_ok = True
+    if path.suffix == ".py":
+        try:
+            ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, ValueError):
+            syntax_ok = False
+    return ToolResult(
+        "success" if syntax_ok and changed else "failed",
+        message,
+        error_code="" if syntax_ok and changed else ("no_change" if syntax_ok else "syntax_error"),
+        changed_files=(str(path.resolve()),) if changed else (),
+        metadata={"before_hash": before, "after_hash": after, "no_change": not changed},
+    )
 
 
 def read_file(arguments: dict[str, Any]) -> str:

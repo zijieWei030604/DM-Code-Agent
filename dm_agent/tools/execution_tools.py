@@ -9,7 +9,7 @@ from importlib.util import find_spec
 from pathlib import Path
 from typing import Any
 
-from .base import _require_str
+from .base import ToolResult, _require_str
 
 # run_linter 支持的检查器，按推荐顺序（ruff 最快且覆盖面最广）。
 _LINTER_TOOLS = ("ruff", "flake8", "pylint", "mypy", "black")
@@ -28,6 +28,10 @@ def available_linters() -> list[str]:
 
 
 def run_python(arguments: dict[str, Any]) -> str:
+    return str(run_python_result(arguments))
+
+
+def run_python_result(arguments: dict[str, Any]) -> ToolResult:
     """运行 Python 代码或脚本"""
     code = arguments.get("code")
     path_value = arguments.get("path")
@@ -55,10 +59,18 @@ def run_python(arguments: dict[str, Any]) -> str:
     if result.stderr:
         segments.append(f"stderr:\n{result.stderr.strip()}")
     segments.append(f"returncode: {result.returncode}")
-    return "\n".join(segment for segment in segments if segment).strip() or "returncode: 0"
+    return ToolResult(
+        "success" if result.returncode == 0 else "failed",
+        "\n".join(segment for segment in segments if segment).strip(),
+        exit_code=result.returncode,
+    )
 
 
 def run_shell(arguments: dict[str, Any]) -> str:
+    return str(run_shell_result(arguments))
+
+
+def run_shell_result(arguments: dict[str, Any]) -> ToolResult:
     """运行 Shell 命令"""
     command = _require_str(arguments, "command")
     result = subprocess.run(
@@ -70,10 +82,18 @@ def run_shell(arguments: dict[str, Any]) -> str:
     if result.stderr:
         segments.append(f"stderr:\n{result.stderr.strip()}")
     segments.append(f"returncode: {result.returncode}")
-    return "\n".join(segment for segment in segments if segment).strip() or "returncode: 0"
+    return ToolResult(
+        "success" if result.returncode == 0 else "failed",
+        "\n".join(segment for segment in segments if segment).strip(),
+        exit_code=result.returncode,
+    )
 
 
 def run_tests(arguments: dict[str, Any]) -> str:
+    return str(run_tests_result(arguments))
+
+
+def run_tests_result(arguments: dict[str, Any]) -> ToolResult:
     """运行 Python 测试套件（支持 pytest 和 unittest）"""
     test_path = arguments.get("test_path", ".")
     framework = arguments.get("framework", "pytest")
@@ -87,7 +107,7 @@ def run_tests(arguments: dict[str, Any]) -> str:
 
     path = Path(test_path)
     if not path.exists():
-        return f"测试路径 {path} 不存在。"
+        return ToolResult("failed", f"测试路径 {path} 不存在。", error_code="file_not_found")
 
     if framework == "pytest":
         command = [sys.executable, "-m", "pytest"]
@@ -117,10 +137,19 @@ def run_tests(arguments: dict[str, Any]) -> str:
     segments.append(f"returncode: {result.returncode}")
 
     output = "\n".join(segment for segment in segments if segment).strip()
-    return output if output else "returncode: 0"
+    return ToolResult(
+        "success" if result.returncode == 0 else "failed",
+        output,
+        exit_code=result.returncode,
+        check_scope=(str(path),),
+    )
 
 
 def run_linter(arguments: dict[str, Any]) -> str:
+    return str(run_linter_result(arguments))
+
+
+def run_linter_result(arguments: dict[str, Any]) -> ToolResult:
     """运行代码检查工具（支持 ruff、pylint、flake8、mypy、black）"""
     path_value = _require_str(arguments, "path")
     tool = arguments.get("tool", "ruff")
@@ -132,7 +161,7 @@ def run_linter(arguments: dict[str, Any]) -> str:
 
     path = Path(path_value)
     if not path.exists():
-        return f"路径 {path} 不存在。"
+        return ToolResult("failed", f"路径 {path} 不存在。", error_code="file_not_found")
 
     if tool == "black":
         # black 用于格式化，添加 --check 只检查不修改
@@ -153,11 +182,19 @@ def run_linter(arguments: dict[str, Any]) -> str:
     if result.returncode != 0 and f"No module named {tool}" in (result.stderr or ""):
         available = [name for name in available_linters() if name != tool]
         if available:
-            return (
-                f"当前环境未提供 {tool}。可用的检查工具：{'、'.join(available)}，"
-                f"请改用其中之一重试。"
+            return ToolResult(
+                "unavailable",
+                (
+                    f"当前环境未提供 {tool}。可用的检查工具：{'、'.join(available)}，"
+                    f"请改用其中之一重试。"
+                ),
+                error_code="checker_unavailable",
             )
-        return f"当前环境未提供 {tool}，也没有其他可用的检查工具，本步可跳过。"
+        return ToolResult(
+            "unavailable",
+            f"当前环境未提供 {tool}，也没有其他可用的检查工具，本步可跳过。",
+            error_code="checker_unavailable",
+        )
 
     segments: list[str] = []
 
@@ -168,6 +205,9 @@ def run_linter(arguments: dict[str, Any]) -> str:
     segments.append(f"returncode: {result.returncode}")
 
     output = "\n".join(segment for segment in segments if segment).strip()
-    if output:
-        return output
-    return f"{tool} 检查通过，未发现问题。"
+    return ToolResult(
+        "success" if result.returncode == 0 else "failed",
+        output,
+        exit_code=result.returncode,
+        check_scope=(str(path),),
+    )

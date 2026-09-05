@@ -46,7 +46,12 @@ def _action(action: str, action_input) -> str:
 
 def _tools():
     return [
-        Tool("echo", "Echo text", lambda arguments: f"echo:{arguments.get('text', '')}"),
+        Tool(
+            "echo",
+            "Echo text",
+            lambda arguments: f"echo:{arguments.get('text', '')}",
+            read_only=True,
+        ),
         Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done")),
     ]
 

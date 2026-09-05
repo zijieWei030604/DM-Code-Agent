@@ -25,6 +25,7 @@ from typing import Any
 from dm_agent.tracing.session import latest_checkpoint_entry, load_session_entries
 from dm_agent.tracing.writer import SessionWriter, TraceWriter
 
+from .call_journal import CallJournal
 from .checkpoint import RunCheckpoint, backup_file, save_checkpoint
 from .planner import PlanStep
 from .run_state import RunContext, Step
@@ -61,9 +62,11 @@ class RunPersistence:
         # 旧的直接使用 RunPersistence 的调用方仍可走兼容 fallback；Agent 主路径
         # 使用共享 SessionWriter，因此 checkpoint 与普通会话条目共用同一条写入链。
         self._session_writer: TraceWriter | None = None
+        self.call_journal: CallJournal | None = None
 
     def prepare_session_checkpoint(self, path: str | Path) -> None:
         """在 run_start 前准备 JSONL checkpoint sink，让首条消息也能被扇出。"""
+        self.call_journal = CallJournal(Path(path))
         if not is_session_checkpoint(path):
             return
         if isinstance(self.trace_writer, SessionWriter):
@@ -154,7 +157,11 @@ def load_resume_state(path: str | Path, *, at: str | None = None) -> RunCheckpoi
     if snapshot is not None:
         if at:
             raise ValueError("--resume-at 只适用于 JSONL 会话日志，单文件快照没有条目 id。")
-        return RunCheckpoint.from_dict(snapshot)
+        checkpoint = RunCheckpoint.from_dict(snapshot)
+        CallJournal(source).check_resume(
+            checkpoint.step_count, str(checkpoint.metadata.get("run_id", ""))
+        )
+        return checkpoint
 
     try:
         entries = load_session_entries(source)
@@ -172,7 +179,11 @@ def load_resume_state(path: str | Path, *, at: str | None = None) -> RunCheckpoi
     state = (entry.get("payload") or {}).get("state")
     if not isinstance(state, dict):
         raise ValueError(f"Checkpoint entry {entry.get('id')} carries no resumable state.")
-    return RunCheckpoint.from_dict(state)
+    checkpoint = RunCheckpoint.from_dict(state)
+    CallJournal(source).check_resume(
+        checkpoint.step_count, str(checkpoint.metadata.get("run_id", ""))
+    )
+    return checkpoint
 
 
 def _as_json_object(text: str) -> dict[str, Any] | None:

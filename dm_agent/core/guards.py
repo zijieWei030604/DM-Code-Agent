@@ -60,7 +60,7 @@ class ReadBeforeEditGuard:
 
     def after_tool_result(self, event: AfterToolResultEvent) -> None:
         """只登记 runner 正常返回的文件访问，保持旧守卫语义。"""
-        if not event.tool_succeeded:
+        if not event.has_effect:
             return
         path = event.arguments.get("path")
         if not isinstance(path, str) or not path:

@@ -12,10 +12,21 @@ from .code_analysis_tools import (
     parse_ast,
 )
 from .code_index_tools import build_code_index, dependency_graph, search_symbol
-from .execution_tools import run_linter, run_python, run_shell, run_tests
+from .execution_tools import (
+    run_linter,
+    run_linter_result,
+    run_python,
+    run_python_result,
+    run_shell,
+    run_shell_result,
+    run_tests,
+    run_tests_result,
+)
 from .file_tools import (
     create_file,
+    create_file_result,
     edit_file,
+    edit_file_result,
     list_directory,
     read_file,
     search_in_file,
@@ -86,6 +97,7 @@ def _builtin_tools() -> list[Tool]:
             name="create_file",
             description='Create or overwrite a text file. Arguments: {"path": string, "content": string}.',
             runner=create_file,
+            result_runner=create_file_result,
         ),
         Tool(
             name="edit_file",
@@ -103,6 +115,7 @@ def _builtin_tools() -> list[Tool]:
                 "resulting lines back to you — check them before moving on."
             ),
             runner=edit_file,
+            result_runner=edit_file_result,
         ),
         Tool(
             name="search_in_file",
@@ -118,11 +131,13 @@ def _builtin_tools() -> list[Tool]:
                 'Execute Python code using the local interpreter. Arguments: either {"code": string} or {"path": string, "args": optional string or list}.'
             ),
             runner=run_python,
+            result_runner=run_python_result,
         ),
         Tool(
             name="run_shell",
             description='Execute a shell command. Arguments: {"command": string}.',
             runner=run_shell,
+            result_runner=run_shell_result,
         ),
         Tool(
             name="run_tests",
@@ -131,6 +146,7 @@ def _builtin_tools() -> list[Tool]:
                 '"framework": optional "pytest"|"unittest" (default \'pytest\'), "verbose": optional bool (default false)}.'
             ),
             runner=run_tests,
+            result_runner=run_tests_result,
         ),
         Tool(
             name="run_linter",
@@ -141,6 +157,7 @@ def _builtin_tools() -> list[Tool]:
                 "of linters this environment does provide -- switch to one of those."
             ),
             runner=run_linter,
+            result_runner=run_linter_result,
         ),
         Tool(
             name="parse_ast",

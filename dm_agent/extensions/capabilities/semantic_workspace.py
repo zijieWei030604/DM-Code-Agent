@@ -42,7 +42,7 @@ class SemanticWorkspaceCapability:
         )
 
     def _after_tool_result(self, event: AfterToolResultEvent) -> None:
-        if event.tool_name not in WRITE_ACTIONS or not event.tool_succeeded or event.no_change:
+        if event.tool_name not in WRITE_ACTIONS or not event.has_effect or event.no_change:
             return
         path = event.arguments.get("path")
         if not isinstance(path, str) or not path:

@@ -207,6 +207,7 @@ class ReactAgent:
             "before_tool_call",
             self._edit_guard.before_tool_call,
             name="builtin.read_before_edit_guard",
+            kind="policy",
         )
         self.event_bus.on(
             "after_tool_result",
@@ -357,6 +358,7 @@ class ReactAgent:
         started_at = time.perf_counter()
         steps: list[Step] = []
         limit = max_steps or self.max_steps
+        self._persistence.call_journal = None
         if checkpoint_path is not None:
             self._persistence.prepare_session_checkpoint(checkpoint_path)
         self._edit_guard.reset()
@@ -711,7 +713,14 @@ class ReactAgent:
             observation = invocation.observation
             error_kind = invocation.error_kind
             # ``no_change`` 是显式的“预期效果未发生”信号，不是“工具只读”。
-            no_progress = invocation.blocked or invocation.no_change
+            no_progress = (
+                invocation.blocked or invocation.no_change or not invocation.tool_succeeded
+            )
+            invocation_failed = (
+                invocation.result.status == "failed"
+                if invocation.result is not None
+                else self._is_failure_observation(observation, action=action)
+            )
             accepted = False
             if action == "task_complete" and invocation.tool_succeeded:
                 accepted, observation = self._completion_gate.review(
@@ -723,6 +732,7 @@ class ReactAgent:
                 )
                 if not accepted:
                     error_kind = "critic_rejected"
+                    invocation_failed = True
 
             step = Step(
                 thought=thought,
@@ -738,7 +748,7 @@ class ReactAgent:
                     action=action,
                     action_input=action_input,
                     observation=observation,
-                    failed=self._is_failure_observation(observation, action=action),
+                    failed=invocation_failed,
                 )
 
             # 更新计划进度（如果有计划；被拦下或明确无进展的调用不算完成）。
@@ -755,7 +765,7 @@ class ReactAgent:
             # 调用回调函数实时输出步骤
             self._publish_step(step, step_num)
 
-            if self._is_failure_observation(observation, action=action) and plan and self.planner:
+            if invocation_failed and plan and self.planner:
                 plan = self._replan_after_failure(
                     task,
                     plan,
@@ -871,7 +881,7 @@ class ReactAgent:
             step_count=step_count,
             conversation_history=[dict(message) for message in self.conversation_history],
             steps=[dict(step.__dict__) for step in steps],
-            metadata=json_safe_metadata(metadata),
+            metadata=json_safe_metadata({**metadata, "run_id": self._run_context.run_id}),
             plan=plan_to_checkpoint(plan),
             compressor_state=self.compressor.export_state() if self.compressor else None,
             capability_state=self._export_capability_state(),

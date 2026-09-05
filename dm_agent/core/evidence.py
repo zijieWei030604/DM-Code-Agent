@@ -87,6 +87,7 @@ class EvidenceGraph:
         self._edge_keys: set[tuple[str, str, str]] = set()
         self._counters: dict[str, int] = {}
         self.current_plan_id = ""
+        self.workspace_version = ""
         self.summary_pending = False
         self.contradiction_blocked_once = False
         if task:
@@ -164,6 +165,8 @@ class EvidenceGraph:
     def add_change(
         self, *, tool: str, path: str, step_number: int
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
+        if self.workspace_version:
+            self.workspace_version = f"pending-change-{step_number}"
         node = self._new_node(
             "change",
             f"Changed {path or '<workspace>'}",
@@ -189,7 +192,9 @@ class EvidenceGraph:
         for observation in sorted(
             observations, key=lambda item: item.step_number or 0, reverse=True
         )[:3]:
-            edge = self._add_edge(node.node_id, observation.node_id, "motivated_by")
+            edge = self._add_edge(
+                node.node_id, observation.node_id, "motivated_by", confidence="inferred"
+            )
             if edge:
                 edges.append(edge)
         self.summary_pending = True
@@ -201,13 +206,23 @@ class EvidenceGraph:
         tool: str,
         step_number: int,
         passed: bool,
+        workspace_version: str = "",
+        check: str = "",
+        scope: Sequence[str] = (),
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         direct = tool == "run_tests"
         node = self._new_node(
             "verification",
             f"{tool} {'passed' if passed else 'failed'}",
             step_number,
-            {"tool": tool, "passed": passed, "direct": direct},
+            {
+                "tool": tool,
+                "passed": passed,
+                "direct": direct,
+                "workspace_version": workspace_version,
+                "check": check or tool,
+                "scope": list(scope),
+            },
         )
         edges: list[EvidenceEdge] = []
         changes = [
@@ -282,8 +297,22 @@ class EvidenceGraph:
         relevant = [
             node
             for node in verifications
-            if (node.step_number or 0) >= latest_change and latest_change > 0
+            if (node.step_number or 0) >= latest_change
+            and latest_change > 0
+            and (
+                not self.workspace_version
+                or node.metadata.get("workspace_version") == self.workspace_version
+            )
         ]
+        latest_checks: dict[tuple[str, str, tuple[str, ...]], EvidenceNode] = {}
+        for node in relevant:
+            key = (
+                str(node.metadata.get("workspace_version", "")),
+                str(node.metadata.get("check", node.metadata.get("tool", ""))),
+                tuple(node.metadata.get("scope", [])),
+            )
+            latest_checks[key] = node
+        relevant = list(latest_checks.values())
         if any(not bool(node.metadata.get("passed")) for node in relevant):
             return "contradicted"
         passed = [node for node in relevant if bool(node.metadata.get("passed"))]
@@ -326,7 +355,12 @@ class EvidenceGraph:
     def prompt_summary(self, *, max_chars: int = 800) -> str:
         audit = self.audit()
         changes = self._nodes_of_kind("change")
-        verifications = self._nodes_of_kind("verification")
+        verifications = [
+            node
+            for node in self._nodes_of_kind("verification")
+            if not self.workspace_version
+            or node.metadata.get("workspace_version") == self.workspace_version
+        ]
         lines = ["[Task Evidence]", f"Status: {audit['status']}"]
         if changes:
             paths = [str(node.metadata.get("path") or "<workspace>") for node in changes[-3:]]
@@ -350,6 +384,7 @@ class EvidenceGraph:
     def to_dict(self) -> dict[str, Any]:
         return {
             "task": self.task,
+            "workspace_version": self.workspace_version,
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "edges": [edge.to_dict() for edge in self.edges],
             "counters": dict(self._counters),
@@ -362,6 +397,7 @@ class EvidenceGraph:
     def from_dict(cls, data: Mapping[str, Any]) -> EvidenceGraph:
         graph = cls()
         graph.task = str(data.get("task", ""))
+        graph.workspace_version = str(data.get("workspace_version", ""))
         for raw in data.get("nodes") or []:
             if not isinstance(raw, Mapping):
                 continue

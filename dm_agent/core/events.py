@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from dm_agent.tools.base import ToolResult
 
 EventName = Literal[
     "before_tool_call",
@@ -51,6 +54,12 @@ class AfterToolResultEvent:
     metadata: dict[str, Any] = field(default_factory=dict, repr=False)
     no_change: bool = False
     no_change_reason: str = ""
+    result: ToolResult | None = None
+
+    @property
+    def has_effect(self) -> bool:
+        """A failed validation may still have changed the filesystem."""
+        return self.tool_succeeded or bool(self.result and self.result.changed_files)
 
 
 @dataclass
@@ -149,6 +158,7 @@ class HookFailure:
 class _RegisteredHandler:
     name: str
     callback: Callable[[Any], Any]
+    kind: str = "middleware"
 
 
 class EventBus:
@@ -180,6 +190,7 @@ class EventBus:
         handler: Callable[[Any], Any],
         *,
         name: str | None = None,
+        kind: Literal["middleware", "observer", "policy"] = "middleware",
     ) -> None:
         """注册处理器；同一事件严格按调用 ``on`` 的顺序执行。"""
         if event not in self._EVENT_NAMES:
@@ -187,7 +198,9 @@ class EventBus:
         handler_name = name.strip() if isinstance(name, str) else ""
         if not handler_name:
             handler_name = _handler_name(handler)
-        self._handlers[event].append(_RegisteredHandler(handler_name, handler))
+        if kind == "policy" and event not in {"before_tool_call", "before_finish"}:
+            raise ValueError("Policies require a decision hook.")
+        self._handlers[event].append(_RegisteredHandler(handler_name, handler, kind))
 
     def has_handlers(self, event: EventName) -> bool:
         """该事件上是否已注册处理器。"""
@@ -201,12 +214,14 @@ class EventBus:
     ) -> dict[str, Any] | None:
         """执行工具前置链；遇到第一个 ``block=True`` 时停止并返回。"""
         for position, handler in enumerate(self._handlers["before_tool_call"], start=1):
-            previous_arguments = dict(event.arguments)
+            previous_arguments = deepcopy(event.arguments)
             previous_content_anchor_safe = event.content_anchor_safe
             succeeded, result = self._call("before_tool_call", handler, position, event, on_error)
             if not succeeded:
                 event.arguments = previous_arguments
                 event.content_anchor_safe = previous_content_anchor_safe
+                if handler.kind == "policy":
+                    return {"block": True, "reason": f"Policy unavailable: {handler.name}"}
                 continue
             if result is None:
                 continue
@@ -216,6 +231,8 @@ class EventBus:
                 self._report_invalid_result(
                     "before_tool_call", handler, position, event, result, on_error
                 )
+                if handler.kind == "policy":
+                    return {"block": True, "reason": f"Invalid policy result: {handler.name}"}
                 continue
             if bool(result.get("block")):
                 reason = str(result.get("reason") or "Tool call blocked by lifecycle handler.")
@@ -260,12 +277,16 @@ class EventBus:
         """执行完成前置链；遇到第一个 ``block=True`` 时停止并返回否决理由。"""
         for position, handler in enumerate(self._handlers["before_finish"], start=1):
             succeeded, result = self._call("before_finish", handler, position, event, on_error)
+            if not succeeded and handler.kind == "policy":
+                return {"block": True, "reason": f"Policy unavailable: {handler.name}"}
             if not succeeded or result is None:
                 continue
             if not isinstance(result, Mapping):
                 self._report_invalid_result(
                     "before_finish", handler, position, event, result, on_error
                 )
+                if handler.kind == "policy":
+                    return {"block": True, "reason": f"Invalid policy result: {handler.name}"}
                 continue
             if bool(result.get("block")):
                 reason = str(result.get("reason") or "Completion rejected by lifecycle handler.")
@@ -347,6 +368,9 @@ class EventBus:
         on_error: HookErrorHandler | None,
     ) -> tuple[bool, Any]:
         try:
+            if handler.kind == "observer":
+                handler.callback(deepcopy(event))
+                return True, None
             return True, handler.callback(event)
         except Exception as exc:
             self._report_failure(event_name, handler, position, event, exc, on_error)
