@@ -527,7 +527,13 @@ class ReactAgent:
 
             # 获取 AI 响应
             try:
-                raw = self._request_client.respond(messages_to_send, temperature=self.temperature)
+                request_options: dict[str, Any] = {"temperature": self.temperature}
+                if getattr(self._request_client, "supports_tool_calling", False):
+                    request_options["tool_definitions"] = [
+                        tool.function_definition() for tool in self.tools.values()
+                    ]
+                    request_options["tool_choice"] = "auto"
+                raw = self._request_client.respond(messages_to_send, **request_options)
             except Exception as exc:
                 if self.trace_writer:
                     self.trace_writer.record(

@@ -239,7 +239,10 @@ class MCPManager:
             return result
 
         return Tool(
-            name=f"mcp_{server_name}_{tool_name}", description=full_description, runner=runner
+            name=f"mcp_{server_name}_{tool_name}",
+            description=full_description,
+            runner=runner,
+            input_schema=input_schema,
         )
 
     def _try_reconnect(self, server_name: str) -> MCPClient | None:

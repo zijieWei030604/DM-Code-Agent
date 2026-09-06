@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 try:
@@ -16,6 +17,8 @@ from .base_client import BaseLLMClient, LLMError, classify_retryable_exception
 
 class OpenAIClient(BaseLLMClient):
     """OpenAI API 的轻量级封装（使用官方 SDK）。"""
+
+    supports_tool_calling = True
 
     def __init__(
         self,
@@ -50,19 +53,22 @@ class OpenAIClient(BaseLLMClient):
     def complete(
         self,
         messages: list[dict[str, str]],
+        *,
+        tool_definitions: list[dict[str, Any]] | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """向 OpenAI API 发送生成请求。"""
 
         try:
-            # 将消息格式转换为输入字符串
-            input_text = self._convert_messages_to_input(messages)
-
             # 调用 OpenAI responses API
-            response = self.client.responses.create(
-                model=self.model,
-                input=input_text,
-            )
+            request: dict[str, Any] = {"model": self.model, "input": messages}
+            if tool_definitions:
+                request["tools"] = [
+                    {"type": "function", **definition, "strict": False}
+                    for definition in tool_definitions
+                ]
+                request["tool_choice"] = extra.get("tool_choice", "auto")
+            response = self.client.responses.create(**request)
 
             # 返回包含响应的字典
             return {"response": response}
@@ -82,6 +88,19 @@ class OpenAIClient(BaseLLMClient):
         response = data.get("response")
         if response:
             try:
+                for item in getattr(response, "output", ()):
+                    if getattr(item, "type", "") == "function_call":
+                        arguments = json.loads(getattr(item, "arguments", "{}"))
+                        if not isinstance(arguments, dict):
+                            raise ValueError("tool arguments must be a JSON object")
+                        return json.dumps(
+                            {
+                                "thought": "",
+                                "action": item.name,
+                                "action_input": arguments,
+                            },
+                            ensure_ascii=False,
+                        )
                 return response.output_text.strip()
             except Exception as e:
                 raise LLMError(f"无法从 OpenAI 响应中提取文本: {e}") from e

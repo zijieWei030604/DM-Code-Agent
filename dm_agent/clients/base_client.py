@@ -61,6 +61,8 @@ def classify_retryable_exception(exc: Exception) -> bool:
 class BaseLLMClient(ABC):
     """LLM 客户端的抽象基类。"""
 
+    supports_tool_calling = False
+
     def __init__(
         self,
         api_key: str,

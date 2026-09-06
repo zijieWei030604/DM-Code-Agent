@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import requests
 
@@ -112,3 +114,57 @@ def test_deepseek_retry_settings_flow_through_factory():
     assert client.max_retries == 5
     assert client.retry_backoff == 0.25
     assert client.retry_status_codes == frozenset({429})
+
+
+def test_deepseek_uses_schema_and_only_first_tool_call():
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path":"users.py"}',
+                                        }
+                                    },
+                                    {
+                                        "function": {
+                                            "name": "run_tests",
+                                            "arguments": "{}",
+                                        }
+                                    },
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = _client_with_session(session)
+    definition = {
+        "name": "read_file",
+        "description": "Read a file",
+        "parameters": {"type": "object", "properties": {}},
+    }
+
+    text = client.respond(
+        [{"role": "user", "content": "read users.py"}],
+        tool_definitions=[definition],
+        tool_choice="auto",
+    )
+
+    function = session.calls[0]["json"]["tools"][0]["function"]
+    assert function["name"] == "read_file"
+    assert function["strict"] is False
+    assert json.loads(text) == {
+        "thought": "",
+        "action": "read_file",
+        "action_input": {"path": "users.py"},
+    }

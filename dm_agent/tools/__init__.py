@@ -37,6 +37,108 @@ if TYPE_CHECKING:
     from dm_agent.extensions import ExtensionAPI, ExtensionRegistry
 
 
+def _object_schema(
+    properties: dict[str, dict[str, Any]],
+    required: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    if required:
+        schema["required"] = list(required)
+    return schema
+
+
+_STR = {"type": "string"}
+_INT = {"type": "integer"}
+_BOOL = {"type": "boolean"}
+
+BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "list_directory": _object_schema({"path": _STR, "recursive": _BOOL, "file_type": _STR}),
+    "read_file": _object_schema({"path": _STR, "line_start": _INT, "line_end": _INT}, ("path",)),
+    "create_file": _object_schema({"path": _STR, "content": _STR}, ("path", "content")),
+    "edit_file": _object_schema(
+        {
+            "path": _STR,
+            "old_string": _STR,
+            "new_string": _STR,
+            "operation": {"type": "string", "enum": ["insert", "replace", "delete"]},
+            "line_start": _INT,
+            "line_end": _INT,
+            "content": _STR,
+        },
+        ("path",),
+    ),
+    "search_in_file": _object_schema(
+        {"path": _STR, "pattern": _STR, "context_lines": _INT}, ("path", "pattern")
+    ),
+    "run_python": _object_schema(
+        {
+            "code": _STR,
+            "path": _STR,
+            "args": {"anyOf": [_STR, {"type": "array", "items": _STR}]},
+        }
+    ),
+    "run_shell": _object_schema({"command": _STR}, ("command",)),
+    "run_tests": _object_schema(
+        {
+            "test_path": _STR,
+            "framework": {"type": "string", "enum": ["pytest", "unittest"]},
+            "verbose": _BOOL,
+        }
+    ),
+    "run_linter": _object_schema(
+        {
+            "path": _STR,
+            "tool": {
+                "type": "string",
+                "enum": ["ruff", "flake8", "pylint", "mypy", "black"],
+            },
+        },
+        ("path",),
+    ),
+    "parse_ast": _object_schema({"path": _STR}, ("path",)),
+    "get_function_signature": _object_schema(
+        {"path": _STR, "function_name": _STR}, ("path", "function_name")
+    ),
+    "find_dependencies": _object_schema({"path": _STR}, ("path",)),
+    "get_code_metrics": _object_schema({"path": _STR}, ("path",)),
+    "build_code_index": _object_schema({"root": _STR, "max_files": _INT, "include_tests": _BOOL}),
+    "search_symbol": _object_schema(
+        {
+            "name": _STR,
+            "root": _STR,
+            "kind": {"type": "string", "enum": ["class", "function", "method"]},
+            "exact": _BOOL,
+            "max_files": _INT,
+        },
+        ("name",),
+    ),
+    "dependency_graph": _object_schema(
+        {"root": _STR, "max_files": _INT, "include_external": _BOOL}
+    ),
+    "inspect_python_symbol": _object_schema(
+        {"path": _STR, "qualified_name": _STR}, ("path", "qualified_name")
+    ),
+    "edit_python_symbol": _object_schema(
+        {
+            "path": _STR,
+            "qualified_name": _STR,
+            "expected_hash": _STR,
+            "operation": {
+                "type": "string",
+                "enum": ["replace_body", "replace_symbol"],
+            },
+            "content": _STR,
+        },
+        ("path", "qualified_name", "expected_hash", "operation", "content"),
+    ),
+    "task_complete": _object_schema({"message": _STR}),
+}
+
+
 def task_complete(arguments: dict[str, Any]) -> str:
     """
     标记任务完成的工具。调用此工具将自动结束任务。
@@ -76,7 +178,7 @@ def task_complete(arguments: dict[str, Any]) -> str:
 
 def _builtin_tools() -> list[Tool]:
     """构造顺序稳定的内置工具实例。"""
-    return [
+    tools = [
         Tool(
             name="list_directory",
             description=(
@@ -235,6 +337,9 @@ def _builtin_tools() -> list[Tool]:
             runner=task_complete,
         ),
     ]
+    for tool in tools:
+        tool.input_schema = BUILTIN_TOOL_SCHEMAS[tool.name]
+    return tools
 
 
 def register_builtin_tools(api: ExtensionAPI) -> None:

@@ -13,6 +13,7 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from .dataset import fetch_instances
 from .predict import docker_preflight, predict_one
@@ -37,6 +38,35 @@ DEFAULT_WORKSPACES = Path(tempfile.gettempdir()) / "dm-agent-swebench"
 
 def _default_manifest_path(output: Path) -> Path:
     return output.with_suffix(".selection.json")
+
+
+def _select_manifest_instances(
+    candidates: list[dict[str, Any]], manifest_path: Path
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    existing = load_selection_manifest(manifest_path)
+    raw_ids = existing.get("instance_ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise ValueError("selection manifest requires a non-empty instance_ids list")
+
+    requested_ids: list[str] = []
+    seen: set[str] = set()
+    for item in raw_ids:
+        if not isinstance(item, str) or not item:
+            raise ValueError("selection manifest instance_ids must be non-empty strings")
+        if item in seen:
+            raise ValueError(f"selection manifest duplicates instance_id {item}")
+        seen.add(item)
+        requested_ids.append(item)
+
+    by_id = {str(instance["instance_id"]): instance for instance in candidates}
+    missing = [instance_id for instance_id in requested_ids if instance_id not in by_id]
+    if missing:
+        raise ValueError(
+            "selection manifest contains unknown instance_id(s): " + ", ".join(missing[:5])
+        )
+
+    selected = [by_id[instance_id] for instance_id in requested_ids]
+    return selected, build_selection_manifest(candidates, selected, len(selected))
 
 
 def _load_resume_records(output: Path, selected_ids: set[str]) -> list[dict[str, object]]:
@@ -109,10 +139,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.limit < 0:
         parser.error("--limit must be non-negative")
 
-    candidates = fetch_instances(cache_path=args.cache)
-    instances = select_instances(candidates, args.limit)
-    manifest = build_selection_manifest(candidates, instances, args.limit)
     manifest_path = args.selection_manifest or _default_manifest_path(args.output)
+    candidates = fetch_instances(cache_path=args.cache)
+    if args.selection_manifest is not None and manifest_path.exists():
+        try:
+            instances, manifest = _select_manifest_instances(candidates, manifest_path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            print(f"selection manifest 无法使用：{exc}", file=sys.stderr)
+            return 2
+    else:
+        instances = select_instances(candidates, args.limit)
+        manifest = build_selection_manifest(candidates, instances, args.limit)
 
     if args.resume and args.output.exists():
         if not manifest_path.exists():

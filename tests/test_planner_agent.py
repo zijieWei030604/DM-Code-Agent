@@ -20,6 +20,10 @@ class FakeRespondClient:
         return self.responses.pop(0)
 
 
+class NativeToolFakeClient(FakeRespondClient):
+    supports_tool_calling = True
+
+
 def test_task_planner_parses_json_inside_text():
     client = FakeRespondClient(
         [
@@ -67,6 +71,39 @@ def test_react_agent_can_finish_without_tool_call():
     assert result["final_answer"] == "done"
     assert result["steps"][0]["action"] == "finish"
     assert result["metadata"]["status"] == "success"
+
+
+def test_react_agent_sends_provider_neutral_single_call_tool_definitions():
+    client = NativeToolFakeClient(
+        [
+            json.dumps(
+                {
+                    "thought": "",
+                    "action": "finish",
+                    "action_input": "done",
+                }
+            )
+        ]
+    )
+    schema = {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "additionalProperties": False,
+    }
+    agent = ReactAgent(
+        client,
+        [Tool("task_complete", "Finish", lambda arguments: "finished", input_schema=schema)],
+        enable_planning=False,
+        enable_compression=False,
+    )
+
+    result = agent.run("finish immediately")
+
+    assert result["final_answer"] == "done"
+    assert client.requests[0][1]["tool_choice"] == "auto"
+    assert client.requests[0][1]["tool_definitions"] == [
+        {"name": "task_complete", "description": "Finish", "parameters": schema}
+    ]
 
 
 def test_react_agent_stops_on_common_terminal_action_alias():

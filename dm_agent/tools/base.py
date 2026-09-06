@@ -32,12 +32,26 @@ class Tool:
     runner: Callable[[dict[str, Any]], str | ToolResult]  # 工具执行函数
     result_runner: Callable[[dict[str, Any]], ToolResult] | None = None
     read_only: bool = False
+    input_schema: dict[str, Any] | None = None
 
     def execute(self, arguments: dict[str, Any]) -> str | ToolResult:
         """
         执行工具
         """
         return self.runner(arguments)
+
+    def function_definition(self) -> dict[str, Any]:
+        """Return the provider-neutral function definition for this tool."""
+        parameters = self.input_schema or {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": True,
+        }
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": parameters,
+        }
 
 
 def _require_str(arguments: dict[str, Any], key: str) -> str:

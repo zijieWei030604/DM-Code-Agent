@@ -73,6 +73,7 @@ class UsageTrackingClient:
         self.model = client.model
         self.base_url = client.base_url
         self.timeout = client.timeout
+        self.supports_tool_calling = bool(getattr(client, "supports_tool_calling", False))
         self.usage = UsageTotals()
 
     def complete(self, messages: list[dict[str, str]], **extra: Any) -> dict[str, Any]:

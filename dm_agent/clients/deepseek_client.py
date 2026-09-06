@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -19,6 +20,8 @@ class DeepSeekError(LLMError):
 
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek 聊天补全 API 的轻量级封装。"""
+
+    supports_tool_calling = True
 
     def __init__(
         self,
@@ -66,6 +69,7 @@ class DeepSeekClient(BaseLLMClient):
         messages: list[dict[str, str]],
         *,
         response_format: dict[str, Any] | None = None,
+        tool_definitions: list[dict[str, Any]] | None = None,
         stream: bool = False,
         **extra: Any,
     ) -> dict[str, Any]:
@@ -80,6 +84,11 @@ class DeepSeekClient(BaseLLMClient):
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        if tool_definitions:
+            payload["tools"] = [
+                {"type": "function", "function": {**definition, "strict": False}}
+                for definition in tool_definitions
+            ]
         payload.update(extra)
 
         url = f"{self.base_url}/{self.endpoint.lstrip('/')}"
@@ -136,6 +145,9 @@ class DeepSeekClient(BaseLLMClient):
             if isinstance(choice, dict):
                 message = choice.get("message")
                 if isinstance(message, dict):
+                    tool_calls = message.get("tool_calls")
+                    if isinstance(tool_calls, list) and tool_calls:
+                        return self._tool_call_as_agent_json(tool_calls[0])
                     content = message.get("content")
                     if isinstance(content, str) and content.strip():
                         return content.strip()
@@ -149,6 +161,27 @@ class DeepSeekClient(BaseLLMClient):
                             return "".join(parts).strip()
 
         raise DeepSeekError("无法从 DeepSeek 响应中提取文本。")
+
+    @staticmethod
+    def _tool_call_as_agent_json(tool_call: Any) -> str:
+        if not isinstance(tool_call, dict):
+            raise DeepSeekError("DeepSeek 返回了无效的工具调用。")
+        function = tool_call.get("function")
+        if not isinstance(function, dict) or not isinstance(function.get("name"), str):
+            raise DeepSeekError("DeepSeek 工具调用缺少函数名称。")
+        raw_arguments = function.get("arguments", "{}")
+        try:
+            arguments = (
+                json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
+            )
+        except json.JSONDecodeError as exc:
+            raise DeepSeekError(f"DeepSeek 工具参数不是有效 JSON: {exc}") from exc
+        if not isinstance(arguments, dict):
+            raise DeepSeekError("DeepSeek 工具参数必须是 JSON object。")
+        return json.dumps(
+            {"thought": "", "action": function["name"], "action_input": arguments},
+            ensure_ascii=False,
+        )
 
     @staticmethod
     def _format_error(response: requests.Response) -> str:

@@ -204,6 +204,60 @@ def test_selection_only_writes_manifest_without_docker_or_prediction(tmp_path, m
     assert len(manifest["repo_counts"]) == 3
 
 
+def test_existing_selection_manifest_drives_prediction_order(tmp_path, monkeypatch):
+    output = tmp_path / "preds.jsonl"
+    manifest_path = tmp_path / "custom.selection.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "dataset": "princeton-nlp/SWE-bench_Verified",
+                "split": "test",
+                "requested_limit": 2,
+                "selected_count": 2,
+                "instance_ids": ["gamma-2", "alpha-3"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    predicted: list[str] = []
+
+    def predict_one(instance: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        predicted.append(instance["instance_id"])
+        return {
+            "instance_id": instance["instance_id"],
+            "dm_status": "success",
+            "dm_patch_chars": 1,
+            "dm_steps": 1,
+            "dm_duration_seconds": 0.1,
+        }
+
+    monkeypatch.setattr(run, "fetch_instances", lambda **_kwargs: _candidates())
+    monkeypatch.setattr(run, "docker_preflight", lambda: "")
+    monkeypatch.setattr(run, "predict_one", predict_one)
+
+    assert (
+        run.main(
+            [
+                "--limit",
+                "2",
+                "--output",
+                str(output),
+                "--selection-manifest",
+                str(manifest_path),
+            ]
+        )
+        == 0
+    )
+
+    assert predicted == ["gamma-2", "alpha-3"]
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert [record["instance_id"] for record in records] == ["gamma-2", "alpha-3"]
+    normalized = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert normalized["instance_ids"] == ["gamma-2", "alpha-3"]
+    assert normalized["repo_counts"] == {"org/alpha": 1, "org/gamma": 1}
+
+
 def test_docker_preflight_failure_does_not_replace_existing_output_contract(tmp_path, monkeypatch):
     output = tmp_path / "preds.jsonl"
     manifest_path = tmp_path / "preds.selection.json"
