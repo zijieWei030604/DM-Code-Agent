@@ -527,3 +527,41 @@ def test_memory_without_invalidate_on_success_keeps_failures_fresh():
     failure_items = [item for item in memory.items if item.text.startswith("Observed failure")]
     assert failure_items
     assert all(item.metadata.get("superseded_at_turn") is None for item in failure_items)
+
+
+def test_evidence_memory_is_versioned_scoped_and_invalidated():
+    memory = Mem0StyleMemory()
+    project_scope = {"agent_id": "dm-code-agent", "project_id": "project-a"}
+    memory.add_evidence(
+        "pytest passed for users.py",
+        scope=project_scope,
+        metadata={"files": ["users.py"]},
+        source_event_id="run-1:4",
+        workspace_version="abc123",
+        check_scope=("tests/test_users.py",),
+    )
+
+    hit = memory.search(
+        "users.py pytest",
+        scope={**project_scope, "session_id": "run-2"},
+    )[0].item
+    assert hit.source == "evidence"
+    assert hit.confidence == 0.9
+    assert hit.workspace_version == "abc123"
+    assert hit.check_scope == ("tests/test_users.py",)
+
+    assert memory.invalidate_files(["users.py"], workspace_version="def456") == 1
+    assert hit.status == "stale"
+
+
+def test_session_heuristic_does_not_leak_but_project_evidence_does():
+    memory = Mem0StyleMemory()
+    memory.add("model guess about app.py", scope={"project_id": "p", "session_id": "s1"})
+    memory.add_evidence(
+        "read_file confirmed app.py",
+        scope={"project_id": "p"},
+        metadata={"files": ["app.py"]},
+    )
+
+    hits = memory.search("app.py", scope={"project_id": "p", "session_id": "s2"})
+    assert [hit.item.source for hit in hits] == ["evidence"]

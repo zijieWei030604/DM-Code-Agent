@@ -33,6 +33,7 @@ def build_user_prompt(
     plan: Sequence[PlanStep] | None = None,
     *,
     repository_map: str = "",
+    native_tool_calling: bool = False,
 ) -> str:
     """构建用户提示词。
 
@@ -58,7 +59,8 @@ def build_user_prompt(
                 f"{status} 步骤 {plan_step.step_number}: {plan_step.action} - {plan_step.reason}"
             )
 
-    lines.append(RESPONSE_FORMAT_HINT)
+    if not native_tool_calling:
+        lines.append(RESPONSE_FORMAT_HINT)
     return "\n".join(lines)
 
 

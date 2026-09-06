@@ -83,7 +83,11 @@ class UsageTrackingClient:
         return complete(messages, **extra)
 
     def extract_text(self, data: dict[str, Any]) -> str:
-        return self.client.extract_text(data)
+        text = self.client.extract_text(data)
+        self.last_response_mode = str(getattr(self.client, "last_response_mode", ""))
+        self.last_tool_call_count = int(getattr(self.client, "last_tool_call_count", 0))
+        self.last_selected_tool = str(getattr(self.client, "last_selected_tool", ""))
+        return text
 
     def respond(self, messages: list[dict[str, str]], **extra: Any) -> str:
         self.usage.request_count += 1

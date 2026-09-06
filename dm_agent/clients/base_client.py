@@ -88,6 +88,9 @@ class BaseLLMClient(ABC):
         self.respond_retries = respond_retries
         self.respond_retry_backoff = respond_retry_backoff
         self.total_respond_retries = 0
+        self.last_response_mode = ""
+        self.last_tool_call_count = 0
+        self.last_selected_tool = ""
 
     @abstractmethod
     def complete(

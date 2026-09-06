@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from dm_agent.memory.context_budget import estimate_messages_tokens
+from dm_agent.memory.context_budget import (
+    ContextBudgetBreakdown,
+    build_context_budget,
+    estimate_messages_tokens,
+)
 from dm_agent.memory.context_compressor import Compaction, ContextCompressor, apply_compaction
 
 from .run_state import RunContext
@@ -54,10 +58,15 @@ class ContextWindow:
         compressor: ContextCompressor | None,
         enabled: bool,
         trace_writer: Any | None = None,
+        output_token_reserve: int = 2048,
+        safety_margin_tokens: int = 512,
     ) -> None:
         self.compressor = compressor
         self.enabled = enabled
         self.trace_writer = trace_writer
+        self.output_token_reserve = max(0, output_token_reserve)
+        self.safety_margin_tokens = max(0, safety_margin_tokens)
+        self.last_budget_breakdown: ContextBudgetBreakdown | None = None
         self._last_logged_memory_items = 0
         self._last_logged_saved_messages = 0
         self._last_recorded_compaction: Compaction | None = None
@@ -67,6 +76,7 @@ class ContextWindow:
         self._last_logged_memory_items = 0
         self._last_logged_saved_messages = 0
         self._last_recorded_compaction = None
+        self.last_budget_breakdown = None
 
     def build_messages(
         self,
@@ -74,6 +84,7 @@ class ContextWindow:
         history: list[dict[str, str]],
         *,
         context: RunContext,
+        tool_definitions: list[dict[str, Any]] | None = None,
     ) -> list[dict[str, str]]:
         """返回本步要发给 LLM 的消息；必要时先把旧上下文折叠成本地记忆。
 
@@ -83,11 +94,25 @@ class ContextWindow:
         """
         messages = [{"role": "system", "content": system_prompt}, *history]
         compressor = self.compressor
+        total_budget = compressor.token_budget if compressor else 0
+        self.last_budget_breakdown = build_context_budget(
+            total_budget=total_budget,
+            system_prompt=system_prompt,
+            history=history,
+            tool_definitions=tool_definitions or (),
+            output_reserve=self.output_token_reserve,
+            safety_margin=self.safety_margin_tokens,
+        )
         if not (self.enabled and compressor):
             return messages
         self._sync_current_memory_metadata(context)
 
-        if compressor.should_compress(history):
+        effective_history_budget = (
+            self.last_budget_breakdown.available_history_tokens
+            if self.last_budget_breakdown.total_budget > 0
+            else None
+        )
+        if compressor.should_compress(history, token_budget=effective_history_budget):
             # ``plan_compaction`` 会写 memory、推进 cadence、更新 LLM 摘要计数；先快照，
             # 净收益不成立时恢复，保证“没折叠”也真的没有留下隐式状态变化。
             state_before_candidate = compressor.snapshot_candidate_state()

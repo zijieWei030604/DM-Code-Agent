@@ -7,7 +7,7 @@ import json
 from dm_agent.core import EventBus, ReactAgent
 from dm_agent.core.events import AfterToolResultEvent
 from dm_agent.memory.context_compressor import Compaction, Mem0StyleMemory
-from dm_agent.tools.base import Tool
+from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tracing import TraceWriter, load_trace_events
 
 
@@ -491,3 +491,37 @@ def test_run_hook_exception_is_isolated_and_traced(tmp_path):
     assert result["metadata"]["status"] == "success"
     assert len(hook_errors) == 1
     assert hook_errors[0]["payload"]["hook"] == "on_run_end"
+
+
+def test_successful_tool_result_becomes_versioned_evidence_memory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    client = FakeRespondClient(
+        [_action("read_file", {"path": "app.py"}), _action("finish", "done")]
+    )
+    agent = ReactAgent(
+        client,
+        [
+            Tool(
+                "read_file",
+                "Read file",
+                lambda arguments: ToolResult(
+                    status="success",
+                    message="VALUE = 1",
+                    check_scope=("app.py",),
+                ),
+                read_only=True,
+            )
+        ],
+        enable_planning=False,
+        enable_compression=True,
+    )
+
+    agent.run("inspect app.py", max_steps=2)
+
+    assert agent.compressor is not None
+    evidence = [item for item in agent.compressor.memory.items if item.source == "evidence"]
+    assert len(evidence) == 1
+    assert evidence[0].metadata["files"] == ["app.py"]
+    assert evidence[0].workspace_version
+    assert evidence[0].source_event_id.endswith(":1")

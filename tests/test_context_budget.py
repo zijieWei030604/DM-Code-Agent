@@ -6,11 +6,29 @@ from dm_agent.core.agent import ReactAgent
 from dm_agent.memory.context_budget import (
     MIN_HEAD_CHARS,
     FileLedger,
+    build_context_budget,
     estimate_messages_tokens,
     estimate_tokens,
     estimate_tokens_from_chars,
     truncate_observation,
 )
+
+
+def test_context_budget_accounts_for_schema_and_output_reserve() -> None:
+    breakdown = build_context_budget(
+        total_budget=1000,
+        system_prompt="s" * 400,
+        history=[{"role": "user", "content": "h" * 400}],
+        tool_definitions=[{"name": "read_file", "parameters": {"type": "object"}}],
+        output_reserve=100,
+        safety_margin=50,
+    )
+
+    assert breakdown.system_tokens == 100
+    assert breakdown.history_tokens == 100
+    assert breakdown.tool_schema_tokens > 0
+    assert breakdown.available_history_tokens < 750
+    assert breakdown.to_dict()["total_budget"] == 1000
 
 
 def test_estimate_tokens_from_chars_boundaries() -> None:

@@ -62,6 +62,74 @@ class TruncationResult:
     head_end_line: int  # 1-based line (within the original text) where the head stops
 
 
+@dataclass(frozen=True)
+class ContextBudgetBreakdown:
+    """Estimated token allocation for one complete provider request."""
+
+    total_budget: int
+    system_tokens: int
+    history_tokens: int
+    tool_schema_tokens: int
+    output_reserve: int
+    safety_margin: int
+    available_history_tokens: int
+
+    @property
+    def estimated_total_tokens(self) -> int:
+        return (
+            self.system_tokens
+            + self.history_tokens
+            + self.tool_schema_tokens
+            + self.output_reserve
+            + self.safety_margin
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "total_budget": self.total_budget,
+            "system_tokens": self.system_tokens,
+            "history_tokens": self.history_tokens,
+            "tool_schema_tokens": self.tool_schema_tokens,
+            "output_reserve": self.output_reserve,
+            "safety_margin": self.safety_margin,
+            "available_history_tokens": self.available_history_tokens,
+            "estimated_total_tokens": self.estimated_total_tokens,
+        }
+
+
+def estimate_json_tokens(value: Any) -> int:
+    """Estimate a JSON request fragment using the same deterministic heuristic."""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    return estimate_tokens(text)
+
+
+def build_context_budget(
+    *,
+    total_budget: int,
+    system_prompt: str,
+    history: Iterable[dict[str, Any]],
+    tool_definitions: Iterable[dict[str, Any]] = (),
+    output_reserve: int = 2048,
+    safety_margin: int = 512,
+) -> ContextBudgetBreakdown:
+    """Allocate a total request budget and expose every estimated component."""
+    total = max(0, int(total_budget))
+    system_tokens = estimate_tokens(system_prompt)
+    history_tokens = estimate_messages_tokens(history)
+    tool_schema_tokens = estimate_json_tokens(list(tool_definitions))
+    reserved = system_tokens + tool_schema_tokens + max(0, output_reserve) + max(0, safety_margin)
+    available = max(total - reserved, 0) if total else 0
+    return ContextBudgetBreakdown(
+        total_budget=total,
+        system_tokens=system_tokens,
+        history_tokens=history_tokens,
+        tool_schema_tokens=tool_schema_tokens,
+        output_reserve=max(0, output_reserve),
+        safety_margin=max(0, safety_margin),
+        available_history_tokens=available,
+    )
+
+
 def _head_chars_for(max_chars: int) -> int:
     return max(min(max_chars, MIN_HEAD_CHARS), int(max_chars * _HEAD_SHARE))
 

@@ -90,9 +90,17 @@ class OpenAIClient(BaseLLMClient):
             try:
                 for item in getattr(response, "output", ()):
                     if getattr(item, "type", "") == "function_call":
+                        calls = [
+                            candidate
+                            for candidate in getattr(response, "output", ())
+                            if getattr(candidate, "type", "") == "function_call"
+                        ]
                         arguments = json.loads(getattr(item, "arguments", "{}"))
                         if not isinstance(arguments, dict):
                             raise ValueError("tool arguments must be a JSON object")
+                        self.last_response_mode = "native_tool_call"
+                        self.last_tool_call_count = len(calls)
+                        self.last_selected_tool = str(item.name)
                         return json.dumps(
                             {
                                 "thought": "",
@@ -101,6 +109,9 @@ class OpenAIClient(BaseLLMClient):
                             },
                             ensure_ascii=False,
                         )
+                self.last_response_mode = "json_fallback"
+                self.last_tool_call_count = 0
+                self.last_selected_tool = ""
                 return response.output_text.strip()
             except Exception as e:
                 raise LLMError(f"无法从 OpenAI 响应中提取文本: {e}") from e

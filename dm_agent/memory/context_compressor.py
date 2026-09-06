@@ -51,6 +51,12 @@ class MemoryItem:
     created_at_turn: int = 0
     last_accessed_turn: int = 0
     access_count: int = 0
+    source: str = "heuristic"
+    confidence: float = 0.3
+    source_event_id: str = ""
+    workspace_version: str = ""
+    check_scope: tuple[str, ...] = ()
+    status: str = "active"
 
     def reinforce(self, *, turn: int, importance_delta: float = 0.05) -> None:
         self.importance = min(1.0, self.importance + importance_delta)
@@ -118,6 +124,11 @@ class Mem0StyleMemory:
         metadata: dict[str, Any] | None = None,
         importance: float = 0.5,
         turn: int = 0,
+        source: str = "heuristic",
+        confidence: float = 0.3,
+        source_event_id: str = "",
+        workspace_version: str = "",
+        check_scope: Sequence[str] = (),
     ) -> str:
         text = _compact(text, limit=700)
         if not text:
@@ -126,7 +137,14 @@ class Mem0StyleMemory:
             type = "episodic"
         scope = {str(key): str(value) for key, value in (scope or {}).items() if value}
         metadata = dict(metadata or {})
-        memory_id = self._fingerprint(text=text, type=type, scope=scope)
+        source = source if source in {"evidence", "heuristic"} else "heuristic"
+        memory_id = self._fingerprint(
+            text=text,
+            type=type,
+            scope=scope,
+            source=source,
+            workspace_version=workspace_version,
+        )
 
         existing = self._items.get(memory_id)
         if existing:
@@ -143,9 +161,56 @@ class Mem0StyleMemory:
             importance=max(0.0, min(1.0, importance)),
             created_at_turn=turn,
             last_accessed_turn=turn,
+            source=source,
+            confidence=max(0.0, min(1.0, confidence)),
+            source_event_id=source_event_id,
+            workspace_version=workspace_version,
+            check_scope=tuple(str(value) for value in check_scope if value),
         )
         self._enforce_limit()
         return memory_id
+
+    def add_evidence(
+        self,
+        text: str,
+        *,
+        scope: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        turn: int = 0,
+        source_event_id: str = "",
+        workspace_version: str = "",
+        check_scope: Sequence[str] = (),
+        confidence: float = 0.9,
+    ) -> str:
+        """Store a tool-backed fact separately from model-derived hints."""
+        return self.add(
+            text,
+            type="semantic",
+            scope=scope,
+            metadata=metadata,
+            importance=0.8,
+            turn=turn,
+            source="evidence",
+            confidence=confidence,
+            source_event_id=source_event_id,
+            workspace_version=workspace_version,
+            check_scope=check_scope,
+        )
+
+    def invalidate_files(self, files: Iterable[str], *, workspace_version: str = "") -> int:
+        """Mark evidence about subsequently changed files as stale."""
+        changed = {str(path) for path in files if path}
+        invalidated = 0
+        for item in self._items.values():
+            if item.source != "evidence" or item.status != "active":
+                continue
+            if changed & set(item.metadata.get("files") or []):
+                item.status = "stale"
+                item.importance *= 0.25
+                if workspace_version:
+                    item.metadata["invalidated_by_workspace_version"] = workspace_version
+                invalidated += 1
+        return invalidated
 
     def add_messages(
         self,
@@ -233,7 +298,7 @@ class Mem0StyleMemory:
                 + min(item.access_count, 5) * 0.02
                 + recency * 0.05
             )
-            if item.metadata.get("superseded_at_turn") is not None:
+            if item.metadata.get("superseded_at_turn") is not None or item.status != "active":
                 score *= 0.25
             scored.append((item, score))
 
@@ -259,24 +324,50 @@ class Mem0StyleMemory:
         if not hits:
             return ""
 
-        lines = [
-            "<agent_memory>",
-            "Relevant memories from previous context. Treat them as hints; verify before editing.",
-        ]
-        for hit in hits:
-            item = hit.item
-            files = item.metadata.get("files") or []
-            suffix = f" files={','.join(files[:3])}" if files else ""
-            stale_note = (
-                " (possibly stale: later success touched these files)"
-                if item.metadata.get("superseded_at_turn") is not None
-                else ""
-            )
-            lines.append(
-                f"{hit.rank}. [{item.type} score={hit.score:.3f}{suffix}] {item.text}{stale_note}"
-            )
+        evidence_hits = [hit for hit in hits if hit.item.source == "evidence"]
+        heuristic_hits = [hit for hit in hits if hit.item.source != "evidence"]
+        if not evidence_hits:
+            lines = [
+                "<agent_memory>",
+                "Relevant memories from previous context. Treat them as hints; verify before editing.",
+            ]
+            lines.extend(self._render_heuristic_hit(hit) for hit in heuristic_hits)
+            lines.append("</agent_memory>")
+            return "\n".join(lines)
+
+        lines = ["<agent_memory>"]
+        if evidence_hits:
+            lines.append("Evidence-backed facts (valid only for the recorded version and scope):")
+            lines.extend(self._render_hit(hit) for hit in evidence_hits)
+        if heuristic_hits:
+            lines.append("Heuristic memories (model-derived hints; verify before use):")
+            lines.extend(self._render_heuristic_hit(hit) for hit in heuristic_hits)
         lines.append("</agent_memory>")
         return "\n".join(lines)
+
+    @staticmethod
+    def _render_hit(hit: MemoryHit) -> str:
+        item = hit.item
+        files = item.metadata.get("files") or []
+        suffix = f" files={','.join(files[:3])}" if files else ""
+        version = f" version={item.workspace_version[:12]}" if item.workspace_version else ""
+        stale_note = " (stale; revalidate)" if item.status != "active" else ""
+        return (
+            f"{hit.rank}. [{item.type}/{item.source} confidence={item.confidence:.2f} "
+            f"score={hit.score:.3f}{suffix}{version}] {item.text}{stale_note}"
+        )
+
+    @staticmethod
+    def _render_heuristic_hit(hit: MemoryHit) -> str:
+        item = hit.item
+        files = item.metadata.get("files") or []
+        suffix = f" files={','.join(files[:3])}" if files else ""
+        stale_note = (
+            " (possibly stale: later success touched these files)"
+            if item.metadata.get("superseded_at_turn") is not None
+            else ""
+        )
+        return f"{hit.rank}. [{item.type} score={hit.score:.3f}{suffix}] {item.text}{stale_note}"
 
     def _extract_from_message(self, message: dict[str, str]) -> list[dict[str, Any]]:
         content = str(message.get("content", ""))
@@ -373,12 +464,16 @@ class Mem0StyleMemory:
         self._items = {item.id: item for item in ranked[: self.max_items]}
 
     @staticmethod
-    def _fingerprint(*, text: str, type: str, scope: dict[str, str]) -> str:
+    def _fingerprint(
+        *, text: str, type: str, scope: dict[str, str], source: str, workspace_version: str
+    ) -> str:
         payload = "|".join(
             [
                 type,
                 text.strip().lower(),
                 json_like_scope(scope),
+                source,
+                workspace_version,
             ]
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
@@ -399,6 +494,12 @@ class Mem0StyleMemory:
                     "created_at_turn": item.created_at_turn,
                     "last_accessed_turn": item.last_accessed_turn,
                     "access_count": item.access_count,
+                    "source": item.source,
+                    "confidence": item.confidence,
+                    "source_event_id": item.source_event_id,
+                    "workspace_version": item.workspace_version,
+                    "check_scope": list(item.check_scope),
+                    "status": item.status,
                 }
                 for item in self._items.values()
             ],
@@ -420,6 +521,12 @@ class Mem0StyleMemory:
                 created_at_turn=int(raw.get("created_at_turn", 0)),
                 last_accessed_turn=int(raw.get("last_accessed_turn", 0)),
                 access_count=int(raw.get("access_count", 0)),
+                source=str(raw.get("source", "heuristic")),
+                confidence=float(raw.get("confidence", 0.3)),
+                source_event_id=str(raw.get("source_event_id", "")),
+                workspace_version=str(raw.get("workspace_version", "")),
+                check_scope=tuple(str(value) for value in raw.get("check_scope", []) if value),
+                status=str(raw.get("status", "active")),
             )
             if item.id:
                 self._items[item.id] = item
@@ -570,6 +677,31 @@ class ContextCompressor:
         self.last_estimated_tokens = 0
         self.last_beneficial_compaction = None
 
+    def set_scope(self, **scope: str) -> None:
+        """Select the project/session scope used for subsequent memory retrieval."""
+        self.scope = {str(key): str(value) for key, value in scope.items() if value}
+
+    def record_tool_evidence(
+        self,
+        text: str,
+        *,
+        files: Sequence[str] = (),
+        source_event_id: str = "",
+        workspace_version: str = "",
+        check_scope: Sequence[str] = (),
+        confidence: float = 0.9,
+    ) -> str:
+        return self.memory.add_evidence(
+            text,
+            scope={key: value for key, value in self.scope.items() if key != "session_id"},
+            metadata={"files": list(files)},
+            turn=self._compression_count,
+            source_event_id=source_event_id,
+            workspace_version=workspace_version,
+            check_scope=check_scope,
+            confidence=confidence,
+        )
+
     def accept_beneficial_compaction(self, compaction: Compaction) -> None:
         """记住一次已通过 token 净收益检查的折叠，供后续请求粘性复用。"""
         self.last_beneficial_compaction = compaction
@@ -604,7 +736,12 @@ class ContextCompressor:
         """兼容候选折叠调用点：回滚未通过净收益检查的状态。"""
         self.restore_runtime_state(state)
 
-    def should_compress(self, history: list[dict[str, str]]) -> bool:
+    def should_compress(
+        self,
+        history: list[dict[str, str]],
+        *,
+        token_budget: int | None = None,
+    ) -> bool:
         user_messages = [msg for msg in history if msg.get("role") == "user"]
         self.turn_count = len(user_messages)
         non_system_messages = [msg for msg in history if msg.get("role") != "system"]
@@ -612,7 +749,9 @@ class ContextCompressor:
         new_turns_since_last = self.turn_count - self._last_compressed_turn_count
         cadence_reached = new_turns_since_last >= self.compress_every
         self.last_estimated_tokens = estimate_messages_tokens(history)
-        over_budget = 0 < self.token_budget < self.last_estimated_tokens
+        effective_budget = self.token_budget if token_budget is None else max(0, token_budget)
+        budget_enabled = self.token_budget > 0 or token_budget is not None
+        over_budget = budget_enabled and self.last_estimated_tokens > effective_budget
         self.last_trigger = ""
         if has_old_messages and (cadence_reached or over_budget):
             self.last_trigger = "cadence" if cadence_reached else "token_budget"
@@ -730,8 +869,9 @@ def _split_camel_case(token: str) -> list[str]:
 
 
 def _scope_matches(item_scope: dict[str, str], requested: dict[str, str]) -> bool:
-    # 仅比较 requested 中取值非空的维度；空值表示「不限定该维度」。
-    return all(item_scope.get(key) == value for key, value in requested.items() if value)
+    # A project-scoped fact is visible in a narrower session query, while a
+    # session-scoped hint never leaks into another session.
+    return all(requested.get(key) == value for key, value in item_scope.items() if value)
 
 
 def _merge_metadata(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:

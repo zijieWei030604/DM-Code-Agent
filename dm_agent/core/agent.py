@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -22,6 +23,7 @@ from .checkpoint import RunCheckpoint
 from .completion import CompletionGate, build_run_result, format_final_answer
 from .context_window import ContextWindow
 from .events import (
+    AfterToolResultEvent,
     EventBus,
     HookFailure,
     LLMRequestClient,
@@ -29,7 +31,7 @@ from .events import (
     RunStartEvent,
 )
 from .evidence import plan_snapshot
-from .guards import ReadBeforeEditGuard
+from .guards import READ_ACTIONS, WRITE_ACTIONS, ReadBeforeEditGuard
 from .observation import ObservationBounder, is_failure_observation
 from .persistence import (
     RunPersistence,
@@ -129,7 +131,10 @@ class ReactAgent:
         self.tools_list = tools  # 保留工具列表用于规划器
         self.max_steps = max_steps
         self.temperature = temperature
-        self.system_prompt = system_prompt or build_code_agent_prompt(tools)
+        self.native_tool_calling = bool(getattr(client, "supports_tool_calling", False))
+        self.system_prompt = system_prompt or build_code_agent_prompt(
+            tools, native_tool_calling=self.native_tool_calling
+        )
         self.step_callback = step_callback
         # 多轮对话历史记录
         self.conversation_history: list[dict[str, str]] = []
@@ -214,6 +219,13 @@ class ReactAgent:
             self._edit_guard.after_tool_result,
             name="builtin.read_before_edit_ledger",
         )
+        if self.compressor:
+            self.event_bus.on(
+                "after_tool_result",
+                self._remember_tool_evidence,
+                name="builtin.evidence_memory",
+                kind="observer",
+            )
 
     def run(
         self,
@@ -267,6 +279,44 @@ class ReactAgent:
     def _record_hook_error(self, failure: HookFailure) -> None:
         if self.trace_writer:
             self.trace_writer.record("hook_error", failure.to_trace_payload())
+
+    def _remember_tool_evidence(self, event: AfterToolResultEvent) -> None:
+        """Capture bounded tool facts separately from model-derived memories."""
+        compressor = self.compressor
+        if compressor is None or not event.tool_succeeded:
+            return
+        result = event.result
+        path = event.arguments.get("path")
+        files = list(result.changed_files if result else ())
+        if isinstance(path, str) and path and path not in files:
+            files.append(path)
+        is_verification = event.tool_name in {"run_tests", "run_linter", "run_python"}
+        if event.tool_name not in READ_ACTIONS | WRITE_ACTIONS and not is_verification:
+            return
+
+        version = self._evidence_version(files)
+        if event.tool_name in WRITE_ACTIONS:
+            compressor.memory.invalidate_files(files, workspace_version=version)
+        compressor.record_tool_evidence(
+            f"{event.tool_name} succeeded: {' '.join(event.observation.split())[:500]}",
+            files=files,
+            source_event_id=f"{event.run_id}:{event.step_number}",
+            workspace_version=version,
+            check_scope=result.check_scope if result else (),
+            confidence=0.95 if is_verification else 0.85,
+        )
+
+    @staticmethod
+    def _evidence_version(files: Sequence[str]) -> str:
+        digest = hashlib.sha256()
+        for name in sorted(set(files)):
+            path = Path(name)
+            digest.update(name.encode("utf-8", errors="replace"))
+            try:
+                digest.update(path.read_bytes())
+            except OSError:
+                digest.update(b"<missing>")
+        return digest.hexdigest()[:16] if files else ""
 
     def _append_history(
         self,
@@ -386,6 +436,13 @@ class ReactAgent:
             }
         )
         self._run_context.begin(run_id=run_token, metadata=metadata)
+        if self.compressor:
+            project_id = hashlib.sha256(str(Path.cwd().resolve()).encode("utf-8")).hexdigest()[:16]
+            self.compressor.set_scope(
+                agent_id="dm-code-agent",
+                project_id=project_id,
+                session_id=run_token,
+            )
         start_event = RunStartEvent(
             task=task,
             attempt=attempt,
@@ -502,6 +559,7 @@ class ReactAgent:
                 task,
                 plan,
                 repository_map=repo_map_result.content,
+                native_tool_calling=self.native_tool_calling,
             )
             self._append_history("user", task_prompt, kind="task")
 
@@ -519,19 +577,23 @@ class ReactAgent:
                     limit=limit,
                 )
             # 第二步：整理旧上下文为本地记忆（如果需要）
+            tool_definitions = (
+                [tool.function_definition() for tool in self.tools.values()]
+                if self.native_tool_calling
+                else []
+            )
             messages_to_send = self._context_window.build_messages(
                 self.system_prompt,
                 self.conversation_history,
                 context=self._run_context,
+                tool_definitions=tool_definitions,
             )
 
             # 获取 AI 响应
             try:
                 request_options: dict[str, Any] = {"temperature": self.temperature}
                 if getattr(self._request_client, "supports_tool_calling", False):
-                    request_options["tool_definitions"] = [
-                        tool.function_definition() for tool in self.tools.values()
-                    ]
+                    request_options["tool_definitions"] = tool_definitions
                     request_options["tool_choice"] = "auto"
                 raw = self._request_client.respond(messages_to_send, **request_options)
             except Exception as exc:
@@ -542,12 +604,38 @@ class ReactAgent:
                     )
                 raise
             if self.trace_writer:
+                response_mode = str(
+                    getattr(self._request_client, "last_response_mode", "")
+                    or ("json_fallback" if self.native_tool_calling else "prompt_json")
+                )
+                tool_call_count = int(getattr(self._request_client, "last_tool_call_count", 0) or 0)
+                selected_tool = str(getattr(self._request_client, "last_selected_tool", "") or "")
                 self.trace_writer.record_llm_call(
                     step_number=step_num,
                     messages=messages_to_send,
                     temperature=self.temperature,
                     raw_response=raw,
+                    response_mode=response_mode,
+                    tool_call_count=tool_call_count,
+                    selected_tool=selected_tool,
+                    budget_breakdown=(
+                        self._context_window.last_budget_breakdown.to_dict()
+                        if self._context_window.last_budget_breakdown
+                        else None
+                    ),
                 )
+            response_mode = str(
+                getattr(self._request_client, "last_response_mode", "")
+                or ("json_fallback" if self.native_tool_calling else "prompt_json")
+            )
+            if response_mode == "native_tool_call":
+                metadata["native_tool_call_count"] += 1
+                metadata["discarded_tool_call_count"] += max(
+                    int(getattr(self._request_client, "last_tool_call_count", 0) or 0) - 1,
+                    0,
+                )
+            elif response_mode == "json_fallback":
+                metadata["json_fallback_count"] += 1
 
             try:
                 parsed_response = parse_agent_response(raw)

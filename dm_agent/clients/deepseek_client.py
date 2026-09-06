@@ -147,9 +147,18 @@ class DeepSeekClient(BaseLLMClient):
                 if isinstance(message, dict):
                     tool_calls = message.get("tool_calls")
                     if isinstance(tool_calls, list) and tool_calls:
+                        self.last_response_mode = "native_tool_call"
+                        self.last_tool_call_count = len(tool_calls)
+                        function = tool_calls[0].get("function")
+                        self.last_selected_tool = (
+                            str(function.get("name", "")) if isinstance(function, dict) else ""
+                        )
                         return self._tool_call_as_agent_json(tool_calls[0])
                     content = message.get("content")
                     if isinstance(content, str) and content.strip():
+                        self.last_response_mode = "json_fallback"
+                        self.last_tool_call_count = 0
+                        self.last_selected_tool = ""
                         return content.strip()
                     if isinstance(content, list):
                         parts = [
@@ -158,6 +167,9 @@ class DeepSeekClient(BaseLLMClient):
                             if isinstance(part, dict) and part.get("type") == "output_text"
                         ]
                         if parts:
+                            self.last_response_mode = "json_fallback"
+                            self.last_tool_call_count = 0
+                            self.last_selected_tool = ""
                             return "".join(parts).strip()
 
         raise DeepSeekError("无法从 DeepSeek 响应中提取文本。")

@@ -139,6 +139,10 @@ class TraceWriter:
         messages: list[dict[str, str]],
         temperature: float,
         raw_response: str | None = None,
+        response_mode: str = "",
+        tool_call_count: int = 0,
+        selected_tool: str = "",
+        budget_breakdown: dict[str, int] | None = None,
     ) -> None:
         prompt_chars = sum(len(message.get("content", "")) for message in messages)
         payload: dict[str, Any] = {
@@ -149,6 +153,14 @@ class TraceWriter:
             "prompt_chars": prompt_chars,
             "estimated_prompt_tokens": estimate_tokens_from_chars(prompt_chars),
         }
+        if response_mode:
+            payload["response_mode"] = response_mode
+        if tool_call_count:
+            payload["tool_call_count"] = tool_call_count
+        if selected_tool:
+            payload["selected_tool"] = selected_tool
+        if budget_breakdown:
+            payload["context_budget"] = budget_breakdown
         if self.capture_llm_io:
             payload["messages"] = messages
             payload["raw_response"] = raw_response
