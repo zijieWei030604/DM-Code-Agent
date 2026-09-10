@@ -22,6 +22,7 @@ class DeepSeekClient(BaseLLMClient):
     """DeepSeek 聊天补全 API 的轻量级封装。"""
 
     supports_tool_calling = True
+    supports_json_schema = True
 
     def __init__(
         self,
@@ -70,6 +71,7 @@ class DeepSeekClient(BaseLLMClient):
         *,
         response_format: dict[str, Any] | None = None,
         tool_definitions: list[dict[str, Any]] | None = None,
+        json_schema: dict[str, Any] | None = None,
         stream: bool = False,
         **extra: Any,
     ) -> dict[str, Any]:
@@ -77,6 +79,9 @@ class DeepSeekClient(BaseLLMClient):
 
         if stream:
             raise NotImplementedError("此客户端未实现流式传输。")
+
+        if json_schema is not None:
+            return self._complete_structured_response(messages, json_schema, extra)
 
         payload: dict[str, Any] = {
             "model": self.model,
@@ -92,6 +97,38 @@ class DeepSeekClient(BaseLLMClient):
         payload.update(extra)
 
         url = f"{self.base_url}/{self.endpoint.lstrip('/')}"
+        return self._post_with_retry(url, payload)
+
+    def _complete_structured_response(
+        self,
+        messages: list[dict[str, str]],
+        json_schema: dict[str, Any],
+        extra: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Use the Responses API for provider-enforced JSON Schema output.
+
+        DeepSeek exposes strict JSON Schema output through its Responses API.
+        Ordinary agent tool calls retain the existing Chat Completions path.
+        """
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "input": messages,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "structured_response",
+                    "schema": json_schema,
+                    "strict": True,
+                }
+            },
+            **extra,
+        }
+        return self._post_with_retry(f"{self.base_url}/responses", payload)
+
+    def _post_with_retry(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Submit one provider payload with the client's existing retry policy."""
+
         for retry_index in range(self.max_retries + 1):
             attempt = retry_index + 1
             has_retry_budget = retry_index < self.max_retries
@@ -138,6 +175,23 @@ class DeepSeekClient(BaseLLMClient):
         if isinstance(output_text, str) and output_text.strip():
             return output_text.strip()
 
+        # Responses API can return text only inside output message parts.
+        output = data.get("output")
+        if isinstance(output, list):
+            parts = [
+                part.get("text", "")
+                for item in output
+                if isinstance(item, dict)
+                for part in item.get("content", [])
+                if isinstance(part, dict) and part.get("type") == "output_text"
+            ]
+            text = "".join(part for part in parts if isinstance(part, str)).strip()
+            if text:
+                self.last_response_mode = "json_schema"
+                self.last_tool_call_count = 0
+                self.last_selected_tool = ""
+                return text
+
         # Chat completions 风格
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
@@ -173,6 +227,9 @@ class DeepSeekClient(BaseLLMClient):
                             return "".join(parts).strip()
 
         raise DeepSeekError("无法从 DeepSeek 响应中提取文本。")
+
+    def close(self) -> None:
+        self.session.close()
 
     @staticmethod
     def _tool_call_as_agent_json(tool_call: Any) -> str:

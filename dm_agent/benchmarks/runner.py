@@ -688,6 +688,9 @@ def _run_benchmark_task_in_workspace(
                 },
             }
         finally:
+            close_agent = getattr(agent, "close", None)
+            if callable(close_agent):
+                close_agent()
             if trace_writer:
                 trace_writer.close()
 

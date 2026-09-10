@@ -140,6 +140,7 @@ def create_agent(
         event_bus=(
             extension_registry.create_event_bus() if extension_registry is not None else None
         ),
+        owned_resources=([workspace_engine] if workspace_engine is not None else []),
     )
 
 
@@ -251,6 +252,7 @@ def run_single_task(
     # 初始化 MCP
     mcp_config = load_mcp_config()
     mcp_manager = MCPManager(mcp_config)
+    agent: ReactAgent | None = None
     trace_writer: SessionWriter | None = None
 
     try:
@@ -316,6 +318,8 @@ def run_single_task(
         print(f"{UI.paint('[ERR] 发生错误', Fore.RED, bright=True)} {e}", file=sys.stderr)
         return 1
     finally:
+        if agent:
+            agent.close()
         if trace_writer:
             trace_writer.close()
         # 清理 MCP 资源
@@ -368,6 +372,7 @@ def run_conversation_stdin(
 
     mcp_config = load_mcp_config()
     mcp_manager = MCPManager(mcp_config)
+    agent: ReactAgent | None = None
     trace_writer: SessionWriter | None = None
 
     try:
@@ -459,6 +464,8 @@ def run_conversation_stdin(
         reason = "interrupted"
         return 0
     finally:
+        if agent:
+            agent.close()
         if trace_writer:
             trace_writer.record("conversation_end", {"turns": turn, "reason": reason})
             trace_writer.close()

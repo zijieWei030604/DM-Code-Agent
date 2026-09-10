@@ -31,6 +31,7 @@ from .runner import (
 from .ui import UI, ask_bool_setting, create_step_callback, print_menu, show_skills, show_tools
 
 if TYPE_CHECKING:
+    from dm_agent.core.agent import ReactAgent
     from dm_agent.extensions import ExtensionRegistry
 
 
@@ -205,6 +206,7 @@ def multi_turn_conversation(
         "这份记忆只在当前 CLI 进程内连续；输入 exit 退出，输入 reset 重置。",
     )
 
+    agent: ReactAgent | None = None
     try:
         # 创建客户端和智能体
         client = create_llm_client(
@@ -281,6 +283,9 @@ def multi_turn_conversation(
 
     except Exception as e:
         UI.status("error", "初始化错误", str(e))
+    finally:
+        if agent:
+            agent.close()
 
 
 def execute_task(
@@ -297,6 +302,7 @@ def execute_task(
         UI.status("error", "任务描述不能为空")
         return
 
+    agent: ReactAgent | None = None
     try:
         # 创建客户端和智能体
         client = create_llm_client(
@@ -342,6 +348,9 @@ def execute_task(
         UI.status("warn", "任务已被用户中断")
     except Exception as e:
         UI.status("error", "发生错误", str(e))
+    finally:
+        if agent:
+            agent.close()
 
 
 def interactive_mode(config: Config, extension_registry: ExtensionRegistry | None = None) -> int:

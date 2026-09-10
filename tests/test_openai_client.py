@@ -17,6 +17,9 @@ class FakeOpenAI:
     def __init__(self, **options: object) -> None:
         type(self).options = options
 
+    def close(self) -> None:
+        pass
+
 
 class FakeResponses:
     request: ClassVar[dict[str, object]] = {}
@@ -60,9 +63,21 @@ def test_openai_client_uses_sdk_default_endpoint_when_base_url_is_empty(monkeypa
     monkeypatch.setattr(openai_client, "OpenAI", FakeOpenAI)
     monkeypatch.setattr(openai_client, "OPENAI_AVAILABLE", True)
 
-    openai_client.OpenAIClient("test-key", model="gpt-5")
+    client = openai_client.OpenAIClient("test-key", model="gpt-5")
 
     assert "base_url" not in FakeOpenAI.options
+    assert client.supports_json_schema is True
+
+
+def test_openai_compatible_endpoint_does_not_overclaim_json_schema(monkeypatch) -> None:
+    monkeypatch.setattr(openai_client, "OpenAI", FakeOpenAI)
+    monkeypatch.setattr(openai_client, "OPENAI_AVAILABLE", True)
+
+    client = openai_client.OpenAIClient(
+        "test-key", model="gpt-5", base_url="https://proxy.example/v1"
+    )
+
+    assert client.supports_json_schema is False
 
 
 def test_openai_uses_responses_tools_and_only_first_function_call(monkeypatch) -> None:
@@ -97,4 +112,27 @@ def test_openai_uses_responses_tools_and_only_first_function_call(monkeypatch) -
         "thought": "",
         "action": "read_file",
         "action_input": {"path": "users.py"},
+    }
+
+
+def test_openai_passes_json_schema_to_responses_format(monkeypatch) -> None:
+    monkeypatch.setattr(openai_client, "OpenAI", FakeCallingOpenAI)
+    monkeypatch.setattr(openai_client, "OPENAI_AVAILABLE", True)
+    client = openai_client.OpenAIClient("test-key", model="gpt-5")
+    schema = {
+        "type": "object",
+        "properties": {"plan": {"type": "array"}},
+        "required": ["plan"],
+        "additionalProperties": False,
+    }
+
+    client.complete([{"role": "user", "content": "plan"}], json_schema=schema)
+
+    assert FakeResponses.request["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "structured_response",
+            "schema": schema,
+            "strict": True,
+        }
     }

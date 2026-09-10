@@ -96,6 +96,7 @@ class ReactAgent:
         enable_repo_map: bool = False,
         repository_map: RepositoryMap | None = None,
         event_bus: EventBus | None = None,
+        owned_resources: Sequence[Any] = (),
     ) -> None:
         """初始化 ReactAgent。
 
@@ -109,6 +110,8 @@ class ReactAgent:
         if not tools:
             raise ValueError("必须为 ReactAgent 提供至少一个工具。")
         self.client = client
+        self._owned_resources = list(owned_resources)
+        self._closed = False
         self.trace_writer = (
             trace_writer if isinstance(trace_writer, SessionWriter) else SessionWriter(trace_writer)
         )
@@ -1039,6 +1042,29 @@ class ReactAgent:
         self._run_context.history_entry_ids.clear()
         if self.compressor:
             self.compressor.reset()
+
+    def close(self) -> None:
+        """Idempotently release resources owned by this Agent instance."""
+        if self._closed:
+            return
+        self._closed = True
+        resources = [self._repo_map, *reversed(self._owned_resources), self.client]
+        seen: set[int] = set()
+        for resource in resources:
+            if resource is None or id(resource) in seen:
+                continue
+            seen.add(id(resource))
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:
+                if self.trace_writer:
+                    self.trace_writer.record(
+                        "resource_close_error",
+                        {"resource": type(resource).__name__, "message": str(exc)},
+                    )
 
     def get_context_stats(self) -> dict[str, Any]:
         """Return current in-memory conversation and context-memory state."""

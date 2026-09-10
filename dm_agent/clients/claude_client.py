@@ -106,3 +106,8 @@ class ClaudeClient(BaseLLMClient):
                 raise LLMError(f"无法从 Claude 响应中提取文本: {e}") from e
 
         raise LLMError("无法从 Claude 响应中提取文本。")
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()

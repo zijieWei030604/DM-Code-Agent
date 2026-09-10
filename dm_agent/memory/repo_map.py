@@ -69,5 +69,11 @@ class RepositoryMap:
             fingerprint=fingerprint,
         )
 
+    def close(self) -> None:
+        """Close only engines created internally by this map."""
+        for engine in self._engines.values():
+            engine.close()
+        self._engines.clear()
+
 
 __all__ = ["RepoMapResult", "RepositoryMap"]

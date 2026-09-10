@@ -522,6 +522,9 @@ def predict_one(
 
         # Close and remove the external index before Git stages the task workspace.
         # This keeps SQLite WAL/SHM files out of model patches for third-party repos.
+        close_agent = getattr(agent, "close", None)
+        if callable(close_agent):
+            close_agent()
         if workspace_engine is not None:
             workspace_engine.close()
         workspace_engine = None

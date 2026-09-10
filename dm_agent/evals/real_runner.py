@@ -74,6 +74,7 @@ class UsageTrackingClient:
         self.base_url = client.base_url
         self.timeout = client.timeout
         self.supports_tool_calling = bool(getattr(client, "supports_tool_calling", False))
+        self.supports_json_schema = bool(getattr(client, "supports_json_schema", False))
         self.usage = UsageTotals()
 
     def complete(self, messages: list[dict[str, str]], **extra: Any) -> dict[str, Any]:
@@ -108,6 +109,11 @@ class UsageTrackingClient:
         )
         self.usage.estimated_tokens = self.usage.total_tokens or approx_tokens
         return text
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
 
 def get_real_tasks() -> list[EvalTask]:
@@ -331,6 +337,8 @@ def run_real_task(
                         "duration_seconds": 0.0,
                     },
                 }
+            finally:
+                agent.close()
 
         success, failure_reason = _validate(task, raw_result, workspace)
 

@@ -78,6 +78,11 @@ class GeminiClient(BaseLLMClient):
 
         raise LLMError("无法从 Gemini 响应中提取文本。")
 
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
+
     def _convert_messages_to_contents(self, messages: list[dict[str, str]]) -> str:
         """将标准消息格式转换为 Gemini 内容格式。"""
         # 合并所有消息内容

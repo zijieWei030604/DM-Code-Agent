@@ -62,6 +62,7 @@ class BaseLLMClient(ABC):
     """LLM 客户端的抽象基类。"""
 
     supports_tool_calling = False
+    supports_json_schema = False
 
     def __init__(
         self,
@@ -152,3 +153,7 @@ class BaseLLMClient(ABC):
         """
         data = self.complete_with_retry(messages, **extra)
         return self.extract_text(data)
+
+    def close(self) -> None:
+        """Release provider resources; stateless clients may keep the no-op default."""
+        return None

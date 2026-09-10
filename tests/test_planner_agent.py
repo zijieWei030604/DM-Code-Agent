@@ -24,6 +24,64 @@ class NativeToolFakeClient(FakeRespondClient):
     supports_tool_calling = True
 
 
+class StructuredFakeClient(FakeRespondClient):
+    supports_json_schema = True
+
+
+def test_task_planner_uses_strict_schema_when_client_supports_it():
+    client = StructuredFakeClient(['{"plan":[{"step":1,"action":"read_file","reason":"inspect"}]}'])
+    planner = TaskPlanner(
+        client,
+        [Tool("read_file", "Read a file", lambda arguments: "content")],
+    )
+
+    plan = planner.plan("inspect a file")
+
+    schema = client.requests[0][1]["json_schema"]
+    step_schema = schema["properties"]["plan"]["items"]
+    assert step_schema["properties"]["action"]["enum"] == ["read_file", "task_complete"]
+    assert step_schema["additionalProperties"] is False
+    assert [step.action for step in plan] == ["read_file"]
+
+
+def test_task_planner_keeps_prompt_json_fallback_for_other_clients():
+    client = FakeRespondClient(['{"plan":[{"step":1,"action":"read_file","reason":"inspect"}]}'])
+    planner = TaskPlanner(
+        client,
+        [Tool("read_file", "Read a file", lambda arguments: "content")],
+    )
+
+    planner.plan("inspect a file")
+
+    assert "json_schema" not in client.requests[0][1]
+
+
+def test_react_agent_closes_owned_resources_once():
+    class Closable:
+        def __init__(self):
+            self.close_count = 0
+
+        def close(self):
+            self.close_count += 1
+
+    client = FakeRespondClient([])
+    client.close = Closable().close
+    resource = Closable()
+    agent = ReactAgent(
+        client,
+        [Tool("task_complete", "Finish", lambda arguments: "finished")],
+        enable_planning=False,
+        enable_compression=False,
+        owned_resources=[resource],
+    )
+
+    agent.close()
+    agent.close()
+
+    assert resource.close_count == 1
+    assert client.close.__self__.close_count == 1
+
+
 def test_task_planner_parses_json_inside_text():
     client = FakeRespondClient(
         [

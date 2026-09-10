@@ -19,6 +19,7 @@ class OpenAIClient(BaseLLMClient):
     """OpenAI API 的轻量级封装（使用官方 SDK）。"""
 
     supports_tool_calling = True
+    supports_json_schema = True
 
     def __init__(
         self,
@@ -48,6 +49,9 @@ class OpenAIClient(BaseLLMClient):
         }
         if self.base_url:
             client_options["base_url"] = self.base_url
+            # Compatibility endpoints vary; only advertise strict Responses
+            # schemas for the official endpoint unless a provider opts in later.
+            self.supports_json_schema = False
         self.client = OpenAI(**client_options)
 
     def complete(
@@ -55,6 +59,7 @@ class OpenAIClient(BaseLLMClient):
         messages: list[dict[str, str]],
         *,
         tool_definitions: list[dict[str, Any]] | None = None,
+        json_schema: dict[str, Any] | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """向 OpenAI API 发送生成请求。"""
@@ -68,6 +73,15 @@ class OpenAIClient(BaseLLMClient):
                     for definition in tool_definitions
                 ]
                 request["tool_choice"] = extra.get("tool_choice", "auto")
+            if json_schema:
+                request["text"] = {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "structured_response",
+                        "schema": json_schema,
+                        "strict": True,
+                    }
+                }
             response = self.client.responses.create(**request)
 
             # 返回包含响应的字典
@@ -117,6 +131,9 @@ class OpenAIClient(BaseLLMClient):
                 raise LLMError(f"无法从 OpenAI 响应中提取文本: {e}") from e
 
         raise LLMError("无法从 OpenAI 响应中提取文本。")
+
+    def close(self) -> None:
+        self.client.close()
 
     def _convert_messages_to_input(self, messages: list[dict[str, str]]) -> str:
         """将标准消息格式转换为输入字符串。"""

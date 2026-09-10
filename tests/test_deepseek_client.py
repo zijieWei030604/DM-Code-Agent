@@ -26,6 +26,7 @@ class FakeSession:
         self.outcomes = list(outcomes)
         self.headers = {}
         self.calls = []
+        self.closed = False
 
     def post(self, url, *, json, timeout):
         self.calls.append({"url": url, "json": json, "timeout": timeout})
@@ -33,6 +34,9 @@ class FakeSession:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+    def close(self):
+        self.closed = True
 
 
 def _client_with_session(session, **kwargs):
@@ -168,3 +172,65 @@ def test_deepseek_uses_schema_and_only_first_tool_call():
         "action": "read_file",
         "action_input": {"path": "users.py"},
     }
+
+
+def test_deepseek_uses_responses_api_for_strict_json_schema():
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"plan": []}',
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+        ]
+    )
+    client = _client_with_session(session)
+    schema = {
+        "type": "object",
+        "properties": {"plan": {"type": "array"}},
+        "required": ["plan"],
+        "additionalProperties": False,
+    }
+
+    text = client.respond(
+        [{"role": "user", "content": "create a plan"}],
+        json_schema=schema,
+        temperature=0.3,
+    )
+
+    request = session.calls[0]
+    assert client.supports_json_schema is True
+    assert request["url"] == "https://api.deepseek.com/responses"
+    assert request["json"]["input"] == [{"role": "user", "content": "create a plan"}]
+    assert "messages" not in request["json"]
+    assert request["json"]["text"] == {
+        "format": {
+            "type": "json_schema",
+            "name": "structured_response",
+            "schema": schema,
+            "strict": True,
+        }
+    }
+    assert text == '{"plan": []}'
+    assert client.last_response_mode == "json_schema"
+
+
+def test_deepseek_closes_its_http_session():
+    session = FakeSession([])
+    client = _client_with_session(session)
+
+    client.close()
+
+    assert session.closed is True

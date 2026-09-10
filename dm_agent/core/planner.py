@@ -194,6 +194,55 @@ class TaskPlanner:
         self.tools = tools
         self.current_plan: list[PlanStep] = []  # 当前计划列表
 
+    def _plan_schema(self) -> dict[str, Any]:
+        actions = list(dict.fromkeys([tool.name for tool in self.tools] + ["task_complete"]))
+        return {
+            "type": "object",
+            "properties": {
+                "plan": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 8,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step": {"type": "integer", "minimum": 1},
+                            "action": {
+                                "type": "string",
+                                "enum": actions,
+                            },
+                            "reason": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["step", "action", "reason"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["plan"],
+            "additionalProperties": False,
+        }
+
+    def _request_plan(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        options: dict[str, Any] = {"temperature": 0.3}
+        if getattr(self.client, "supports_json_schema", False):
+            options["json_schema"] = self._plan_schema()
+        response = self.client.respond(messages, **options)
+        plan_data = self._parse_plan_response(response)
+        items = plan_data.get("plan")
+        if not isinstance(items, list) or not 1 <= len(items) <= 8:
+            raise ValueError("plan 必须包含 1-8 个步骤")
+        available = {tool.name for tool in self.tools} | {"task_complete"}
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("plan step 必须是 JSON object")
+            if not isinstance(item.get("step"), int) or int(item["step"]) < 1:
+                raise ValueError("plan step 必须是正整数")
+            if item.get("action") not in available:
+                raise ValueError(f"plan 使用了未知工具：{item.get('action')}")
+            if not isinstance(item.get("reason"), str) or not item["reason"].strip():
+                raise ValueError("plan reason 必须是非空字符串")
+        return plan_data
+
     def plan(self, task: str) -> list[PlanStep]:
         """
         为任务生成执行计划
@@ -252,11 +301,9 @@ class TaskPlanner:
 """
         # 发送请求并获得client端的响应
         messages = [{"role": "user", "content": prompt}]
-        response = self.client.respond(messages, temperature=0.3)
-
         # 解析计划
         try:
-            plan_data = self._parse_plan_response(response)
+            plan_data = self._request_plan(messages)
             steps = []
             for item in plan_data.get("plan", []):
                 steps.append(
@@ -451,10 +498,8 @@ class TaskPlanner:
 """
         # 流程类似plan()
         messages = [{"role": "user", "content": prompt}]
-        response = self.client.respond(messages, temperature=0.3)
-
         try:
-            plan_data = self._parse_plan_response(response)
+            plan_data = self._request_plan(messages)
             # 保留已完成步骤的进度，新步骤编号顺延——重规划不再把已完成
             # 工作显示为待办，进度统计跨 replan 连续。
             carried = [step for step in completed_steps if step.completed]
