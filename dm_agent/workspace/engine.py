@@ -183,6 +183,7 @@ class SemanticWorkspaceEngine:
     def update(self, paths: Iterable[str | Path] | None = None) -> IndexStats:
         candidates = self._candidate_paths(paths)
         cache_hits = parse_errors = indexed = 0
+        impact_changes: dict[str, set[str]] = {}
         live = {path.relative_to(self.root).as_posix() for path in candidates if path.exists()}
         for path in candidates:
             relative = path.relative_to(self.root).as_posix()
@@ -198,23 +199,38 @@ class SemanticWorkspaceEngine:
             if row is not None and row["content_hash"] == digest:
                 cache_hits += 1
                 continue
+            old_symbols = self._symbol_names_for_path(relative)
             try:
                 symbols, references = self.backend.parse(Path(relative), raw.decode("utf-8"))
             except (UnicodeError, SyntaxError, ValueError):
                 parse_errors += 1
                 self._replace_file(relative, digest, [], [])
+                impact_changes[relative] = old_symbols
                 continue
             self._replace_file(relative, digest, symbols, references)
+            impact_changes[relative] = old_symbols | {symbol.qualified_name for symbol in symbols}
             indexed += 1
         if paths is None:
             stored = {
                 str(row["path"]) for row in self._connection.execute("SELECT path FROM files")
             }
             for stale in stored - live:
+                impact_changes[stale] = self._symbol_names_for_path(stale)
                 self._delete_file(stale)
-        self._impact_graph.update(candidates, remove_missing=paths is None)
+        self._impact_graph.update(
+            impact_changes,
+            full_refresh=paths is None,
+        )
         self._connection.commit()
         return IndexStats(len(candidates), indexed, cache_hits, parse_errors)
+
+    def _symbol_names_for_path(self, relative: str) -> set[str]:
+        return {
+            str(row["qualified_name"])
+            for row in self._connection.execute(
+                "SELECT qualified_name FROM symbols WHERE path = ?", (relative,)
+            )
+        }
 
     def search_symbols(self, query: str, *, limit: int = 20) -> list[SymbolRecord]:
         terms = [token for token in _TASK_TOKEN_RE.findall(query) if token]

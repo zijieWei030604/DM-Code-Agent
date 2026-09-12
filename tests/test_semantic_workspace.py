@@ -121,6 +121,93 @@ def test_semantic_workspace_incrementally_removes_stale_impact_edges(tmp_path):
     engine.close()
 
 
+def _impact_edges(engine):
+    return {
+        tuple(row)
+        for row in engine._connection.execute(
+            """SELECT source_path, source_symbol, target_path, target_symbol,
+                      relation, line, confidence
+               FROM impact_edges ORDER BY source_path, source_symbol, target_path, target_symbol"""
+        )
+    }
+
+
+def test_semantic_workspace_locally_rebuilds_changed_callers_only(tmp_path):
+    service = tmp_path / "service.py"
+    caller = tmp_path / "caller.py"
+    unrelated = tmp_path / "unrelated.py"
+    service.write_text(
+        "def old_value():\n    return 1\n\ndef new_value():\n    return 2\n", encoding="utf-8"
+    )
+    caller.write_text(
+        "from service import old_value\n\ndef use_value():\n    return old_value()\n",
+        encoding="utf-8",
+    )
+    unrelated.write_text(
+        "from math import ceil\n\ndef round_up(value):\n    return ceil(value)\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+    before = _impact_edges(engine)
+    assert any(edge[0] == "caller.py" and edge[3] == "old_value" for edge in before)
+
+    caller.write_text(
+        "from service import new_value\n\ndef use_value():\n    return new_value()\n",
+        encoding="utf-8",
+    )
+    engine.update([caller])
+    after = _impact_edges(engine)
+
+    assert not any(edge[0] == "caller.py" and edge[3] == "old_value" for edge in after)
+    assert any(edge[0] == "caller.py" and edge[3] == "new_value" for edge in after)
+    assert {edge for edge in before if edge[0] == "unrelated.py"} == {
+        edge for edge in after if edge[0] == "unrelated.py"
+    }
+    engine.close()
+
+
+def test_semantic_workspace_locally_rebuilds_consumers_for_symbol_addition_and_removal(tmp_path):
+    service = tmp_path / "service.py"
+    service.write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import process\n\ndef consume():\n    return process()\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    service.write_text("def process():\n    return 1\n", encoding="utf-8")
+    engine.update([service])
+    added = _impact_edges(engine)
+    assert any(edge[0] == "consumer.py" and edge[3] == "process" for edge in added)
+
+    service.write_text("VALUE = 2\n", encoding="utf-8")
+    engine.update([service])
+    removed = _impact_edges(engine)
+    assert not any(edge[0] == "consumer.py" and edge[3] == "process" for edge in removed)
+    engine.close()
+
+
+def test_semantic_workspace_local_edges_match_full_rebuild(tmp_path):
+    service = tmp_path / "service.py"
+    service.write_text("def old_value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import old_value\n\ndef consume():\n    return old_value()\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    service.write_text("def new_value():\n    return 2\n", encoding="utf-8")
+    engine.update([service])
+    local_edges = _impact_edges(engine)
+    engine._impact_graph.update({}, full_refresh=True)
+
+    assert _impact_edges(engine) == local_edges
+    engine.close()
+
+
 def test_semantic_workspace_deduplicates_property_getter_and_setter(tmp_path):
     module = tmp_path / "module.py"
     module.write_text(

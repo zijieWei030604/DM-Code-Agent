@@ -75,14 +75,24 @@ class ImpactGraph:
         self.connection = connection
         self._create_schema()
 
-    def update(self, paths: Iterable[Path], *, remove_missing: bool = False) -> int:
+    def update(
+        self,
+        changes: dict[str, set[str]],
+        *,
+        full_refresh: bool = False,
+    ) -> int:
         """Refresh derived impact edges from the shared semantic index.
 
         ``files`` / ``symbols`` / ``refs`` are the single source of truth. The
-        impact graph only stores dependency edges derived from those tables, so
-        incremental and full updates both rebuild the edge projection.
+        impact graph only stores dependency edges derived from those tables.
+        A full index scan rebuilds the complete projection. Targeted source
+        updates rebuild only sources that could have been affected by the
+        changed files' old or new symbols.
         """
-        self._rebuild_edges()
+        if full_refresh:
+            self._rebuild_edges()
+        elif changes:
+            self._rebuild_changed_edges(changes)
         return int(self.connection.execute("SELECT COUNT(*) FROM impact_edges").fetchone()[0])
 
     def analyze(
@@ -176,7 +186,9 @@ class ImpactGraph:
                  target_path TEXT NOT NULL, target_symbol TEXT NOT NULL,
                  relation TEXT NOT NULL, line INTEGER NOT NULL, confidence REAL NOT NULL);
                CREATE INDEX IF NOT EXISTS impact_edges_target_idx
-                 ON impact_edges(target_path, target_symbol);""")
+                 ON impact_edges(target_path, target_symbol);
+               CREATE INDEX IF NOT EXISTS impact_edges_source_idx
+                 ON impact_edges(source_path);""")
 
     def _delete_file(self, path: str) -> None:
         self.connection.execute("DELETE FROM impact_edges WHERE source_path = ?", (path,))
@@ -184,6 +196,47 @@ class ImpactGraph:
 
     def _rebuild_edges(self) -> None:
         self.connection.execute("DELETE FROM impact_edges")
+        self._insert_edges_for_sources(None)
+
+    def _rebuild_changed_edges(self, changes: dict[str, set[str]]) -> None:
+        changed_paths = set(changes)
+        sources = self._affected_sources(changed_paths, changes)
+        if not sources:
+            return
+        placeholders = ", ".join("?" for _ in sources)
+        self.connection.execute(
+            f"DELETE FROM impact_edges WHERE source_path IN ({placeholders})",
+            tuple(sorted(sources)),
+        )
+        self._insert_edges_for_sources(sources)
+
+    def _affected_sources(
+        self,
+        changed_paths: set[str],
+        changes: dict[str, set[str]],
+    ) -> set[str]:
+        sources = set(changed_paths)
+        path_placeholders = ", ".join("?" for _ in changed_paths)
+        for row in self.connection.execute(
+            f"SELECT DISTINCT source_path FROM impact_edges "
+            f"WHERE target_path IN ({path_placeholders})",
+            tuple(sorted(changed_paths)),
+        ):
+            sources.add(str(row["source_path"]))
+
+        leaf_names = {name.rsplit(".", 1)[-1] for names in changes.values() for name in names}
+        module_names = {_module_name(Path(path)) for path in changed_paths}
+        for row in self.connection.execute("SELECT path, name, target_hint FROM refs"):
+            target_hint = str(row["target_hint"] or "")
+            if str(row["name"]) in leaf_names or any(
+                target_hint == module or target_hint.startswith(f"{module}.")
+                for module in module_names
+                if module
+            ):
+                sources.add(str(row["path"]))
+        return sources
+
+    def _insert_edges_for_sources(self, sources: set[str] | None) -> None:
         rows = self.connection.execute(
             "SELECT path, qualified_name AS name FROM symbols"
         ).fetchall()
@@ -197,9 +250,13 @@ class ImpactGraph:
             path = str(row["path"])
             modules[_module_name(Path(path))] = path
         edges = set()
-        for row in self.connection.execute(
-            "SELECT path, name, line, owner, target_hint, relation FROM refs"
-        ):
+        query = "SELECT path, name, line, owner, target_hint, relation FROM refs"
+        parameters: tuple[str, ...] = ()
+        if sources:
+            placeholders = ", ".join("?" for _ in sources)
+            query += f" WHERE path IN ({placeholders})"
+            parameters = tuple(sorted(sources))
+        for row in self.connection.execute(query, parameters):
             targets = _resolve_targets(
                 str(row["path"]),
                 str(row["name"]),
