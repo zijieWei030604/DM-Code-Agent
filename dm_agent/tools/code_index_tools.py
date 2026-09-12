@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from .base import _require_str
+from .base import ToolResult, _require_str
 
 DEFAULT_INDEX_EXCLUDES = {
     ".git",
@@ -155,6 +155,38 @@ def dependency_graph(arguments: dict[str, Any]) -> str:
         "external_modules": sorted(external),
     }
     return json.dumps(result, indent=2, ensure_ascii=False)
+
+
+def _index_root_failure(arguments: dict[str, Any]) -> ToolResult | None:
+    root = Path(arguments.get("root", ".")).resolve()
+    if not root.exists():
+        return ToolResult(
+            "failed",
+            f"Directory {root} does not exist.",
+            error_code="directory_not_found",
+        )
+    if not root.is_dir():
+        return ToolResult(
+            "failed",
+            f"Path {root} is not a directory.",
+            error_code="not_a_directory",
+        )
+    return None
+
+
+def build_code_index_result(arguments: dict[str, Any]) -> ToolResult:
+    failure = _index_root_failure(arguments)
+    return failure or ToolResult("success", build_code_index(arguments))
+
+
+def search_symbol_result(arguments: dict[str, Any]) -> ToolResult:
+    failure = _index_root_failure(arguments)
+    return failure or ToolResult("success", search_symbol(arguments))
+
+
+def dependency_graph_result(arguments: dict[str, Any]) -> ToolResult:
+    failure = _index_root_failure(arguments)
+    return failure or ToolResult("success", dependency_graph(arguments))
 
 
 def _iter_python_files(root: Path, *, max_files: int, include_tests: bool) -> Iterable[Path]:

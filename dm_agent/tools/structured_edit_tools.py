@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .base import _require_str
+from .base import ToolResult, _require_str
 from .file_tools import _atomic_write_text
+from .write_journal import fingerprint
 
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _SUPPORTED_OPERATIONS = frozenset({"replace_symbol", "replace_body"})
@@ -221,4 +222,28 @@ def edit_python_symbol(arguments: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-__all__ = ["edit_python_symbol", "inspect_python_symbol"]
+def inspect_python_symbol_result(arguments: dict[str, Any]) -> ToolResult:
+    return ToolResult("success", inspect_python_symbol(arguments))
+
+
+def edit_python_symbol_result(arguments: dict[str, Any]) -> ToolResult:
+    path = Path(_require_str(arguments, "path"))
+    before = fingerprint(path)
+    message = edit_python_symbol(arguments)
+    after = fingerprint(path)
+    changed = before != after and after is not None
+    return ToolResult(
+        "success" if changed else "failed",
+        message,
+        error_code="" if changed else "no_change",
+        changed_files=(str(path.resolve()),) if changed else (),
+        metadata={"before_hash": before, "after_hash": after, "no_change": not changed},
+    )
+
+
+__all__ = [
+    "edit_python_symbol",
+    "edit_python_symbol_result",
+    "inspect_python_symbol",
+    "inspect_python_symbol_result",
+]

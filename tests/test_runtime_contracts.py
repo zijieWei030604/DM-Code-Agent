@@ -8,6 +8,7 @@ from dm_agent.core.persistence import RunPersistence
 from dm_agent.core.run_state import RunContext
 from dm_agent.core.tool_invoker import ToolInvoker
 from dm_agent.core.workspace_version import workspace_version
+from dm_agent.tools import _builtin_tools
 from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tools.write_journal import begin_write, recover_writes
 
@@ -123,3 +124,59 @@ def test_structured_status_does_not_depend_on_output_words():
         context=context,
     )
     assert passed.tool_succeeded
+
+
+def test_builtin_tools_all_expose_structured_result_runners():
+    missing = [tool.name for tool in _builtin_tools() if tool.result_runner is None]
+    assert missing == []
+
+
+def test_tool_exception_is_wrapped_as_structured_failure():
+    invoker = ToolInvoker(
+        event_bus=EventBus(),
+        bounder=ObservationBounder(max_chars=1000),
+        persistence=RunPersistence(),
+    )
+    context = RunContext(
+        run_id="run",
+        step_number=1,
+        metadata={"tool_error_count": 0, "failure_reason": ""},
+    )
+
+    def broken(_arguments):
+        raise RuntimeError("boom")
+
+    invocation = invoker.invoke(
+        Tool("broken", "", broken),
+        action="broken",
+        action_input={},
+        context=context,
+    )
+
+    assert not invocation.tool_succeeded
+    assert invocation.error_kind == "tool_error"
+    assert invocation.result == ToolResult(
+        "failed",
+        "Tool execution failed: boom",
+        error_code="tool_error",
+    )
+
+
+def test_structured_read_failure_exposes_precise_error_code(tmp_path):
+    read_tool = next(tool for tool in _builtin_tools() if tool.name == "read_file")
+    invoker = ToolInvoker(
+        event_bus=EventBus(),
+        bounder=ObservationBounder(max_chars=1000),
+        persistence=RunPersistence(),
+    )
+    invocation = invoker.invoke(
+        read_tool,
+        action="read_file",
+        action_input={"path": str(tmp_path / "missing.py")},
+        context=RunContext(run_id="run", step_number=1),
+    )
+
+    assert not invocation.tool_succeeded
+    assert invocation.error_kind == "file_not_found"
+    assert invocation.result is not None
+    assert invocation.result.status == "failed"

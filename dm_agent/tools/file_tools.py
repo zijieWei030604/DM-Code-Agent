@@ -168,6 +168,18 @@ def read_file(arguments: dict[str, Any]) -> str:
     return "\n".join(selected_lines)
 
 
+def read_file_result(arguments: dict[str, Any]) -> ToolResult:
+    """Return read output with an explicit status instead of scanning file contents."""
+    message = read_file(arguments)
+    if message.startswith("文件 ") and message.endswith("不存在。"):
+        return ToolResult("failed", message, error_code="file_not_found")
+    if message.startswith("路径 ") and message.endswith("不是文件。"):
+        return ToolResult("failed", message, error_code="not_a_file")
+    if message.startswith("起始行号 ") and "超出文件范围" in message:
+        return ToolResult("failed", message, error_code="line_out_of_range")
+    return ToolResult("success", message)
+
+
 def list_directory(arguments: dict[str, Any]) -> str:
     """列出目录内容"""
     path_value = arguments.get("path", ".")
@@ -220,6 +232,16 @@ def list_directory(arguments: dict[str, Any]) -> str:
                 entries.append(item.name + "/")
 
     return "\n".join(entries) if entries else "<空>"
+
+
+def list_directory_result(arguments: dict[str, Any]) -> ToolResult:
+    """Return directory output with explicit path failure codes."""
+    message = list_directory(arguments)
+    if message.startswith("目录 ") and message.endswith("不存在。"):
+        return ToolResult("failed", message, error_code="directory_not_found")
+    if message.startswith("路径 ") and message.endswith("不是目录。"):
+        return ToolResult("failed", message, error_code="not_a_directory")
+    return ToolResult("success", message)
 
 
 def _check_python_syntax(path: Path, content: str) -> str:
@@ -472,3 +494,15 @@ def search_in_file(arguments: dict[str, Any]) -> str:
         return f"在 {path} 中未找到匹配 '{pattern}' 的内容。"
 
     return f"在 {path} 中找到 {len(matches)} 处匹配：\n\n" + "\n\n".join(matches)
+
+
+def search_in_file_result(arguments: dict[str, Any]) -> ToolResult:
+    """Return search output while treating a clean no-match as success."""
+    message = search_in_file(arguments)
+    if message.startswith("文件 ") and message.endswith("不存在。"):
+        return ToolResult("failed", message, error_code="file_not_found")
+    if message.startswith("路径 ") and message.endswith("不是文件。"):
+        return ToolResult("failed", message, error_code="not_a_file")
+    if message.startswith("正则表达式错误："):
+        return ToolResult("failed", message, error_code="invalid_pattern")
+    return ToolResult("success", message)

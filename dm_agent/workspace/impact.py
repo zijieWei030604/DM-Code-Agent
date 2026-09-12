@@ -14,6 +14,13 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ImpactNode:
+    #path        受影响符号所在文件
+    # symbol      受影响符号名称
+    # relation    关系：imports / calls / inherits
+    # distance    离修改点几跳
+    # confidence  关系推断可信度
+    # via_path    它依赖的目标文件
+    # via_symbol  它依赖的目标符号
     path: str
     symbol: str
     relation: str

@@ -93,6 +93,7 @@ class ToolInvoker:
     ) -> ToolInvocation:
         """执行一次工具调用；入参非法或被钩子拦下时不会真正调用 runner。"""
         metadata = context.metadata
+        result: ToolResult | None
         if action == "task_complete":
             action_input = coerce_task_complete_arguments(action_input)
         else:
@@ -101,10 +102,16 @@ class ToolInvoker:
                 failure_reason, observation = invalid
                 metadata["argument_error_count"] += 1
                 metadata["failure_reason"] = failure_reason
+                result = ToolResult(
+                    "failed",
+                    observation,
+                    error_code="invalid_arguments",
+                )
                 return ToolInvocation(
                     arguments=action_input,
                     observation=observation,
                     error_kind="invalid_arguments",
+                    result=result,
                 )
 
         before_event = BeforeToolCallEvent(
@@ -118,10 +125,17 @@ class ToolInvoker:
         block = self.event_bus.emit_before_tool_call(before_event, on_error=self.on_error)
         action_input = before_event.arguments
         if validate_tool_arguments(action_input) is not None:
+            observation = "Tool arguments must be a JSON object."
+            result = ToolResult(
+                "failed",
+                observation,
+                error_code="invalid_arguments",
+            )
             return ToolInvocation(
                 arguments=action_input,
-                observation="Tool arguments must be a JSON object.",
+                observation=observation,
                 error_kind="invalid_arguments",
+                result=result,
             )
         if block is not None:
             # 被拦下的调用不计入计划完成，也不备份。
@@ -155,18 +169,25 @@ class ToolInvoker:
                 else tool.execute(action_input)
             )
             result = output if isinstance(output, ToolResult) else None
-            raw_observation = str(output)
+            raw_observation = result.message if result is not None else str(output)
         except Exception as exc:
             metadata["tool_error_count"] += 1
             metadata["failure_reason"] = str(exc)
             raw_observation = f"Tool execution failed: {exc}"
             error_kind = "tool_error"
+            result = ToolResult(
+                "failed",
+                raw_observation,
+                error_code=error_kind,
+            )
         else:
             tool_succeeded = (
                 result.status == "success"
                 if result is not None
                 else not is_failure_observation(raw_observation, action=action)
             )
+            if result is not None and not tool_succeeded:
+                error_kind = result.error_code
 
         bounded_observation = self.bounder.bound(
             raw_observation,

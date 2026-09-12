@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .base import _require_str
+from .base import ToolResult, _require_str
 
 
 def parse_ast(arguments: dict[str, Any]) -> str:
@@ -377,3 +377,61 @@ def get_code_metrics(arguments: dict[str, Any]) -> str:
 
     except Exception as e:
         return f"获取代码度量失败：{e}"
+
+
+def _analysis_result(
+    message: str,
+    *,
+    failure_prefixes: tuple[tuple[str, str], ...],
+) -> ToolResult:
+    """Convert the module's explicit failure replies into a structured outcome."""
+    for prefix, error_code in failure_prefixes:
+        if message.startswith(prefix):
+            return ToolResult("failed", message, error_code=error_code)
+    return ToolResult("success", message)
+
+
+def parse_ast_result(arguments: dict[str, Any]) -> ToolResult:
+    return _analysis_result(
+        parse_ast(arguments),
+        failure_prefixes=(
+            ("文件 ", "invalid_source"),
+            ("路径 ", "invalid_source"),
+            ("Python 语法错误：", "syntax_error"),
+            ("解析失败：", "parse_error"),
+        ),
+    )
+
+
+def get_function_signature_result(arguments: dict[str, Any]) -> ToolResult:
+    return _analysis_result(
+        get_function_signature(arguments),
+        failure_prefixes=(
+            ("文件 ", "file_not_found"),
+            ("路径 ", "not_a_file"),
+            ("未找到函数 ", "symbol_not_found"),
+            ("提取函数签名失败：", "parse_error"),
+        ),
+    )
+
+
+def find_dependencies_result(arguments: dict[str, Any]) -> ToolResult:
+    return _analysis_result(
+        find_dependencies(arguments),
+        failure_prefixes=(
+            ("文件 ", "file_not_found"),
+            ("路径 ", "not_a_file"),
+            ("分析依赖关系失败：", "parse_error"),
+        ),
+    )
+
+
+def get_code_metrics_result(arguments: dict[str, Any]) -> ToolResult:
+    return _analysis_result(
+        get_code_metrics(arguments),
+        failure_prefixes=(
+            ("文件 ", "file_not_found"),
+            ("路径 ", "not_a_file"),
+            ("获取代码度量失败：", "analysis_error"),
+        ),
+    )

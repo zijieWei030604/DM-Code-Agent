@@ -4,14 +4,25 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .base import Tool
+from .base import Tool, ToolResult
 from .code_analysis_tools import (
     find_dependencies,
+    find_dependencies_result,
     get_code_metrics,
+    get_code_metrics_result,
     get_function_signature,
+    get_function_signature_result,
     parse_ast,
+    parse_ast_result,
 )
-from .code_index_tools import build_code_index, dependency_graph, search_symbol
+from .code_index_tools import (
+    build_code_index,
+    build_code_index_result,
+    dependency_graph,
+    dependency_graph_result,
+    search_symbol,
+    search_symbol_result,
+)
 from .execution_tools import (
     run_linter,
     run_linter_result,
@@ -28,10 +39,18 @@ from .file_tools import (
     edit_file,
     edit_file_result,
     list_directory,
+    list_directory_result,
     read_file,
+    read_file_result,
     search_in_file,
+    search_in_file_result,
 )
-from .structured_edit_tools import edit_python_symbol, inspect_python_symbol
+from .structured_edit_tools import (
+    edit_python_symbol,
+    edit_python_symbol_result,
+    inspect_python_symbol,
+    inspect_python_symbol_result,
+)
 
 if TYPE_CHECKING:
     from dm_agent.extensions import ExtensionAPI, ExtensionRegistry
@@ -176,6 +195,10 @@ def task_complete(arguments: dict[str, Any]) -> str:
     return "任务已完成。"
 
 
+def task_complete_result(arguments: dict[str, Any]) -> ToolResult:
+    return ToolResult("success", task_complete(arguments))
+
+
 def _builtin_tools() -> list[Tool]:
     """构造顺序稳定的内置工具实例。"""
     tools = [
@@ -186,6 +209,7 @@ def _builtin_tools() -> list[Tool]:
                 "\"recursive\": optional bool (default false), \"file_type\": optional string filter like '.py' or '.js'}."
             ),
             runner=list_directory,
+            result_runner=list_directory_result,
         ),
         Tool(
             name="read_file",
@@ -194,6 +218,7 @@ def _builtin_tools() -> list[Tool]:
                 '"line_start": optional int, "line_end": optional int}.'
             ),
             runner=read_file,
+            result_runner=read_file_result,
         ),
         Tool(
             name="create_file",
@@ -226,6 +251,7 @@ def _builtin_tools() -> list[Tool]:
                 '"context_lines": optional int (default 2)}.'
             ),
             runner=search_in_file,
+            result_runner=search_in_file_result,
         ),
         Tool(
             name="run_python",
@@ -267,6 +293,7 @@ def _builtin_tools() -> list[Tool]:
                 'Parse Python file AST to extract structure (functions, classes, imports). Arguments: {"path": string}.'
             ),
             runner=parse_ast,
+            result_runner=parse_ast_result,
         ),
         Tool(
             name="get_function_signature",
@@ -274,11 +301,13 @@ def _builtin_tools() -> list[Tool]:
                 'Get function signature with type hints. Arguments: {"path": string, "function_name": string}.'
             ),
             runner=get_function_signature,
+            result_runner=get_function_signature_result,
         ),
         Tool(
             name="find_dependencies",
             description=('Analyze file dependencies (imports). Arguments: {"path": string}.'),
             runner=find_dependencies,
+            result_runner=find_dependencies_result,
         ),
         Tool(
             name="get_code_metrics",
@@ -286,6 +315,7 @@ def _builtin_tools() -> list[Tool]:
                 'Get code metrics (lines, functions, classes count). Arguments: {"path": string}.'
             ),
             runner=get_code_metrics,
+            result_runner=get_code_metrics_result,
         ),
         Tool(
             name="build_code_index",
@@ -294,6 +324,7 @@ def _builtin_tools() -> list[Tool]:
                 '"max_files": optional int (default 200), "include_tests": optional bool (default true)}.'
             ),
             runner=build_code_index,
+            result_runner=build_code_index_result,
         ),
         Tool(
             name="search_symbol",
@@ -303,6 +334,7 @@ def _builtin_tools() -> list[Tool]:
                 '"exact": optional bool, "max_files": optional int}.'
             ),
             runner=search_symbol,
+            result_runner=search_symbol_result,
         ),
         Tool(
             name="dependency_graph",
@@ -311,6 +343,7 @@ def _builtin_tools() -> list[Tool]:
                 '"max_files": optional int, "include_external": optional bool}.'
             ),
             runner=dependency_graph,
+            result_runner=dependency_graph_result,
         ),
         Tool(
             name="inspect_python_symbol",
@@ -320,6 +353,7 @@ def _builtin_tools() -> list[Tool]:
                 "Returns source, location, signature, and source_hash for a guarded follow-up edit."
             ),
             runner=inspect_python_symbol,
+            result_runner=inspect_python_symbol_result,
         ),
         Tool(
             name="edit_python_symbol",
@@ -330,11 +364,13 @@ def _builtin_tools() -> list[Tool]:
                 "The edit is rejected if the symbol changed, and invalid Python is never written."
             ),
             runner=edit_python_symbol,
+            result_runner=edit_python_symbol_result,
         ),
         Tool(
             name="task_complete",
             description='Mark the task as complete and finish execution. Arguments: {"message": optional string with completion summary}.',
             runner=task_complete,
+            result_runner=task_complete_result,
         ),
     ]
     for tool in tools:
