@@ -97,6 +97,15 @@ CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
         "help": "扩展的重规划决策策略与限制。基础重规划本来就一直开着。",
     },
     {
+        "flag": "--enable-semantic-workspace",
+        "key": "enable_semantic_workspace",
+        "kind": "bool",
+        "default": False,
+        "category": "behavior",
+        "label": "Semantic Workspace",
+        "help": "增量维护符号索引，并在有效修改后提供一次影响范围提示。",
+    },
+    {
         "flag": "--enable-repo-map",
         "key": "enable_repo_map",
         "kind": "bool",

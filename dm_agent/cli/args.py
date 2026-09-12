@@ -122,6 +122,12 @@ def parse_args(argv: Any) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-semantic-workspace",
+        action="store_true",
+        default=saved_config.get("enable_semantic_workspace", False),
+        help="启用持久化符号索引，并在有效修改后向 Agent 提供一次受限的影响摘要。",
+    )
+    parser.add_argument(
         "--enable-repo-map",
         action="store_true",
         default=saved_config.get("enable_repo_map", False),

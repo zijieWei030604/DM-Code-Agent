@@ -203,6 +203,7 @@ def main(argv: Any = None) -> int:
         max_observation_chars=args.max_observation_chars,
         context_token_budget=args.context_token_budget,
         enable_edit_guard=args.enable_edit_guard,
+        enable_semantic_workspace=args.enable_semantic_workspace,
         enable_repo_map=args.enable_repo_map,
         enable_verified_edits=args.enable_verified_edits,
         enable_evidence_graph=args.enable_evidence_graph,

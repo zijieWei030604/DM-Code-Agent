@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import tempfile
 from collections.abc import Iterable
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+
+from dm_agent.workspace import SemanticWorkspaceEngine
 
 from .base import ToolResult, _require_str
 
@@ -26,85 +31,52 @@ DEFAULT_INDEX_EXCLUDES = {
 }
 
 
-def build_code_index(arguments: dict[str, Any]) -> str:
-    """Build a lightweight Python symbol index for a repository tree."""
-    root = Path(arguments.get("root", ".")).resolve()
-    max_files = int(arguments.get("max_files", 200))
-    include_tests = bool(arguments.get("include_tests", True))
-
-    if not root.exists():
-        return f"Directory {root} does not exist."
-    if not root.is_dir():
-        return f"Path {root} is not a directory."
-
-    files = []
-    symbol_count = 0
-    parse_errors = []
-    for path in _iter_python_files(root, max_files=max_files, include_tests=include_tests):
-        relative = path.relative_to(root).as_posix()
-        try:
-            source = path.read_text(encoding="utf-8")
-            tree = ast.parse(source, filename=str(path))
-        except SyntaxError as exc:
-            parse_errors.append({"path": relative, "error": str(exc)})
-            continue
-
-        module = _module_name(root, path)
-        symbols = _index_symbols(tree, relative, module)
-        symbol_count += len(symbols)
-        files.append(
-            {
-                "path": relative,
-                "module": module,
-                "imports": _index_imports(tree, module),
-                "symbols": symbols,
-            }
-        )
-
-    result = {
-        "root": str(root),
-        "file_count": len(files),
-        "symbol_count": symbol_count,
-        "files": files,
-        "parse_errors": parse_errors,
-    }
-    return json.dumps(result, indent=2, ensure_ascii=False)
-
-
-def search_symbol(arguments: dict[str, Any]) -> str:
-    """Search Python symbols by exact name or substring in a repository tree."""
+def search_symbol(
+    arguments: dict[str, Any],
+    *,
+    engine: SemanticWorkspaceEngine | None = None,
+) -> str:
+    """Search the persistent semantic workspace for Python symbols."""
     name = _require_str(arguments, "name")
-    root = Path(arguments.get("root", ".")).resolve()
+    root = Path(arguments.get("root", engine.root if engine else ".")).resolve()
     kind = arguments.get("kind")
     exact = bool(arguments.get("exact", False))
     max_files = int(arguments.get("max_files", 200))
+    max_results = int(arguments.get("max_results", 50))
 
     if kind is not None and kind not in {"class", "function", "method"}:
         raise ValueError("kind must be one of: class, function, method")
+    if max_results < 1:
+        raise ValueError("max_results must be a positive integer")
+    if engine is not None and engine.root != root:
+        raise ValueError(f"search root {root} does not match semantic workspace {engine.root}")
 
-    index = json.loads(
-        build_code_index(
-            {
-                "root": str(root),
-                "max_files": max_files,
-                "include_tests": arguments.get("include_tests", True),
-            }
-        )
+    owned_engine = engine is None
+    current_engine = engine or SemanticWorkspaceEngine(
+        root,
+        database_path=_standalone_index_path(root),
+        max_scan_files=max_files,
     )
-    matches = []
-    for file_info in index.get("files", []):
-        for symbol in file_info.get("symbols", []):
-            if kind and symbol.get("kind") != kind:
+    try:
+        current_engine.update()
+        candidates = current_engine.search_symbols(name, limit=max(max_results * 4, 20))
+        matches = []
+        needle = name.casefold()
+        for symbol in candidates:
+            if kind and symbol.kind != kind:
                 continue
-            symbol_name = symbol.get("name", "")
-            qualified_name = symbol.get("qualified_name", "")
+            leaf = symbol.qualified_name.rsplit(".", 1)[-1]
             if exact:
-                matched = name in {symbol_name, qualified_name}
+                matched = name in {leaf, symbol.qualified_name}
             else:
-                needle = name.lower()
-                matched = needle in symbol_name.lower() or needle in qualified_name.lower()
+                matched = needle in leaf.casefold() or needle in symbol.qualified_name.casefold()
             if matched:
-                matches.append(symbol)
+                matches.append(asdict(symbol))
+            if len(matches) >= max_results:
+                break
+    finally:
+        if owned_engine:
+            current_engine.close()
 
     result = {
         "root": str(root),
@@ -157,6 +129,12 @@ def dependency_graph(arguments: dict[str, Any]) -> str:
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+def _standalone_index_path(root: Path) -> Path:
+    """Keep ad-hoc symbol-search indexes outside the inspected repository."""
+    root_hash = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+    return Path(tempfile.gettempdir()) / "dm_agent_search_indexes" / root_hash / "workspace.db"
+
+
 def _index_root_failure(arguments: dict[str, Any]) -> ToolResult | None:
     root = Path(arguments.get("root", ".")).resolve()
     if not root.exists():
@@ -174,14 +152,21 @@ def _index_root_failure(arguments: dict[str, Any]) -> ToolResult | None:
     return None
 
 
-def build_code_index_result(arguments: dict[str, Any]) -> ToolResult:
-    failure = _index_root_failure(arguments)
-    return failure or ToolResult("success", build_code_index(arguments))
-
-
-def search_symbol_result(arguments: dict[str, Any]) -> ToolResult:
-    failure = _index_root_failure(arguments)
-    return failure or ToolResult("success", search_symbol(arguments))
+def search_symbol_result(
+    arguments: dict[str, Any],
+    *,
+    engine: SemanticWorkspaceEngine | None = None,
+) -> ToolResult:
+    checked_arguments = dict(arguments)
+    if engine is not None and "root" not in checked_arguments:
+        checked_arguments["root"] = str(engine.root)
+    failure = _index_root_failure(checked_arguments)
+    if failure:
+        return failure
+    try:
+        return ToolResult("success", search_symbol(arguments, engine=engine))
+    except ValueError as exc:
+        return ToolResult("failed", str(exc), error_code="invalid_search")
 
 
 def dependency_graph_result(arguments: dict[str, Any]) -> ToolResult:
@@ -209,66 +194,6 @@ def _module_name(root: Path, path: Path) -> str:
     if parts and parts[-1] == "__init__":
         parts = parts[:-1]
     return ".".join(parts)
-
-
-def _index_symbols(tree: ast.Module, path: str, module: str) -> list[dict[str, Any]]:
-    symbols: list[dict[str, Any]] = []
-    for node in tree.body:
-        if isinstance(node, ast.ClassDef):
-            class_symbol = _symbol_payload(node, "class", path, module, node.name)
-            class_symbol["methods"] = []
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    qualified_name = f"{node.name}.{item.name}"
-                    method_symbol = _symbol_payload(item, "method", path, module, qualified_name)
-                    class_symbol["methods"].append(method_symbol)
-                    symbols.append(method_symbol)
-            symbols.append(class_symbol)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            symbols.append(_symbol_payload(node, "function", path, module, node.name))
-    return sorted(symbols, key=lambda item: (item["path"], item["line"], item["qualified_name"]))
-
-
-def _symbol_payload(
-    node: ast.AST,
-    kind: str,
-    path: str,
-    module: str,
-    qualified_name: str,
-) -> dict[str, Any]:
-    name = qualified_name.split(".")[-1]
-    payload = {
-        "name": name,
-        "qualified_name": f"{module}.{qualified_name}" if module else qualified_name,
-        "kind": kind,
-        "path": path,
-        "line": getattr(node, "lineno", None),
-        "end_line": getattr(node, "end_lineno", None),
-        "docstring": None,
-    }
-    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-        payload["docstring"] = ast.get_docstring(node)
-    return payload
-
-
-def _index_imports(tree: ast.AST, module: str) -> list[dict[str, Any]]:
-    imports = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append({"module": alias.name, "name": None, "line": node.lineno})
-        elif isinstance(node, ast.ImportFrom):
-            names = [alias.name for alias in node.names]
-            resolved_modules = _resolve_import_from_names(module, node.level, node.module, names)
-            for alias, resolved in zip(node.names, resolved_modules, strict=False):
-                imports.append(
-                    {
-                        "module": resolved,
-                        "name": alias.name,
-                        "line": node.lineno,
-                    }
-                )
-    return imports
 
 
 def _imported_modules(tree: ast.AST, module: str) -> set[str]:

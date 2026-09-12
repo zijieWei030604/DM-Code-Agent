@@ -97,6 +97,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--timeout", type=int, default=180)
     parser.add_argument("--trace-dir", type=Path, default=None)
     parser.add_argument(
+        "--enable-semantic-workspace",
+        action="store_true",
+        help="Maintain a semantic index and inject one bounded impact hint after each edit.",
+    )
+    parser.add_argument(
         "--enable-repo-map",
         action="store_true",
         help="Build and inject a dynamic repository map for each prediction.",
@@ -240,6 +245,7 @@ def main(argv: list[str] | None = None) -> int:
                     timeout=args.timeout,
                     trace_dir=args.trace_dir,
                     keep_workspace=args.keep_workspace,
+                    enable_semantic_workspace=args.enable_semantic_workspace,
                     enable_repo_map=args.enable_repo_map,
                     enable_verified_edits=args.enable_verified_edits,
                     enable_evidence_graph=args.enable_evidence_graph,

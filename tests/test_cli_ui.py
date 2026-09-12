@@ -142,6 +142,7 @@ def test_cli_advanced_features_default_off(monkeypatch):
     args = parse_args(["do maintenance"])
 
     assert args.enable_adaptive_replanning is False
+    assert args.enable_semantic_workspace is False
     assert args.enable_repo_map is False
     assert args.enable_evidence_graph is False
     assert args.max_replans == -1
@@ -154,6 +155,7 @@ def test_cli_advanced_features_wire_into_agent(monkeypatch):
         [
             "do maintenance",
             "--enable-adaptive-replanning",
+            "--enable-semantic-workspace",
             "--enable-repo-map",
             "--enable-evidence-graph",
             "--max-replans",
@@ -165,6 +167,7 @@ def test_cli_advanced_features_wire_into_agent(monkeypatch):
     config = Config(
         api_key="test-key",
         enable_adaptive_replanning=args.enable_adaptive_replanning,
+        enable_semantic_workspace=args.enable_semantic_workspace,
         enable_repo_map=args.enable_repo_map,
         enable_evidence_graph=args.enable_evidence_graph,
         max_replans=args.max_replans,
@@ -182,10 +185,15 @@ def test_cli_advanced_features_wire_into_agent(monkeypatch):
     assert agent.enable_adaptive_replanning is True
     assert agent.enable_repo_map is True
     assert any(
+        capability.__class__.__name__ == "SemanticWorkspaceCapability"
+        for capability in agent.capabilities
+    )
+    assert any(
         capability.__class__.__name__ == "EvidenceGraphCapability"
         for capability in agent.capabilities
     )
     assert agent.max_replans == 2
+    agent.close()
 
 
 def test_cli_advanced_feature_validation(monkeypatch):

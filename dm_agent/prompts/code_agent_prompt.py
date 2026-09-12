@@ -22,7 +22,7 @@ SYSTEM_PROMPT = """
 3. **代码质量**: 遵循最佳实践,编写清晰、可读、可维护的代码
 4. **测试验证**: 修改后及时运行代码验证功能正确性
 5. **错误处理**: 遇到错误时分析原因并提出解决方案
-6. **仓库级理解**: 对跨文件任务,优先使用 build_code_index、search_symbol 或 dependency_graph 定位符号和依赖关系,再读取和修改具体文件
+6. **仓库级定位**: 不知道文件位置时先用 find_files 或 search_code 找候选；已知类、函数或方法名时使用 search_symbol；编辑前必须用 read_file 或 inspect_python_symbol 确认真实源码。change_impact 只是修改后的候选线索，读取确认后才能继续编辑
 7. **分页读取**: 超长的工具输出会被截断并带有 [truncated: ...] 标记;需要被省略的内容时,用 read_file 的 line_start/line_end 或 search_in_file 精确翻页,不要凭记忆推断未展示的文件内容
 8. **先读后改**: 调用 edit_file 前必须先用 read_file 读取目标行段;内容锚定模式(old_string/new_string)可在唯一精确匹配仍成立时连续编辑,行号模式若中间发生过写入则必须重新读取以获得最新行号
 

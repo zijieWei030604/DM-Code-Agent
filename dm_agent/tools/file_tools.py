@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import fnmatch
+import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -16,6 +19,23 @@ from .write_journal import begin_write, complete_write, fingerprint
 # 不该指望它来处理这里本可以精确控制的情况。
 EDIT_ECHO_CONTEXT_LINES = 3
 EDIT_ECHO_MAX_LINES = 40
+SEARCH_RESULT_LIMIT = 200
+SEARCH_EXCLUDES = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "build",
+        "dist",
+        "node_modules",
+        "site-packages",
+    }
+)
 
 
 def _dominant_newline(path: Path) -> str:
@@ -242,6 +262,142 @@ def list_directory_result(arguments: dict[str, Any]) -> ToolResult:
     if message.startswith("路径 ") and message.endswith("不是目录。"):
         return ToolResult("failed", message, error_code="not_a_directory")
     return ToolResult("success", message)
+
+
+def find_files(arguments: dict[str, Any]) -> str:
+    """Recursively find files by path glob without reading their contents."""
+    pattern = _require_str(arguments, "pattern").replace("\\", "/")
+    root = Path(arguments.get("root", ".")).resolve()
+    max_results = _bounded_result_limit(arguments.get("max_results", 50))
+    failure = _search_root_failure(root)
+    if failure:
+        return failure.message
+
+    matches: list[str] = []
+    for path in _iter_search_files(root):
+        relative = path.relative_to(root).as_posix()
+        if _matches_path(relative, pattern):
+            matches.append(relative)
+            if len(matches) >= max_results:
+                break
+    payload = {
+        "root": str(root),
+        "pattern": pattern,
+        "match_count": len(matches),
+        "matches": matches,
+        "truncated": len(matches) >= max_results,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def find_files_result(arguments: dict[str, Any]) -> ToolResult:
+    root = Path(arguments.get("root", ".")).resolve()
+    failure = _search_root_failure(root)
+    return failure or ToolResult("success", find_files(arguments))
+
+
+def search_code(arguments: dict[str, Any]) -> str:
+    """Search text or a regular expression across repository files."""
+    query = _require_str(arguments, "query")
+    root = Path(arguments.get("root", ".")).resolve()
+    glob_pattern = str(arguments.get("glob", "*") or "*").replace("\\", "/")
+    use_regex = bool(arguments.get("regex", False))
+    case_sensitive = bool(arguments.get("case_sensitive", False))
+    max_results = _bounded_result_limit(arguments.get("max_results", 50))
+    failure = _search_root_failure(root)
+    if failure:
+        return failure.message
+
+    expression = None
+    if use_regex:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        expression = re.compile(query, flags)
+    needle = query if case_sensitive else query.casefold()
+
+    matches: list[dict[str, Any]] = []
+    scanned_files = 0
+    for path in _iter_search_files(root):
+        relative = path.relative_to(root).as_posix()
+        if not _matches_path(relative, glob_pattern):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "\x00" in content:
+            continue
+        scanned_files += 1
+        for line_number, line in enumerate(content.splitlines(), start=1):
+            matched = (
+                bool(expression.search(line))
+                if expression
+                else needle in (line if case_sensitive else line.casefold())
+            )
+            if not matched:
+                continue
+            matches.append(
+                {
+                    "path": relative,
+                    "line": line_number,
+                    "text": line.strip()[:500],
+                }
+            )
+            if len(matches) >= max_results:
+                break
+        if len(matches) >= max_results:
+            break
+    payload = {
+        "root": str(root),
+        "query": query,
+        "glob": glob_pattern,
+        "regex": use_regex,
+        "scanned_files": scanned_files,
+        "match_count": len(matches),
+        "matches": matches,
+        "truncated": len(matches) >= max_results,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def search_code_result(arguments: dict[str, Any]) -> ToolResult:
+    root = Path(arguments.get("root", ".")).resolve()
+    failure = _search_root_failure(root)
+    if failure:
+        return failure
+    try:
+        return ToolResult("success", search_code(arguments))
+    except re.error as exc:
+        return ToolResult("failed", f"Invalid regular expression: {exc}", "invalid_pattern")
+
+
+def _search_root_failure(root: Path) -> ToolResult | None:
+    if not root.exists():
+        return ToolResult("failed", f"Directory {root} does not exist.", "directory_not_found")
+    if not root.is_dir():
+        return ToolResult("failed", f"Path {root} is not a directory.", "not_a_directory")
+    return None
+
+
+def _bounded_result_limit(value: Any) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError("max_results must be a positive integer")
+    return min(value, SEARCH_RESULT_LIMIT)
+
+
+def _iter_search_files(root: Path):
+    for current, directories, filenames in os.walk(root):
+        directories[:] = sorted(name for name in directories if name not in SEARCH_EXCLUDES)
+        current_path = Path(current)
+        for filename in sorted(filenames):
+            yield current_path / filename
+
+
+def _matches_path(relative: str, pattern: str) -> bool:
+    return (
+        fnmatch.fnmatchcase(relative, pattern)
+        or fnmatch.fnmatchcase(Path(relative).name, pattern)
+        or Path(relative).match(pattern)
+    )
 
 
 def _check_python_syntax(path: Path, content: str) -> str:

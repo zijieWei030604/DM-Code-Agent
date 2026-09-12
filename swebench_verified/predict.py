@@ -36,7 +36,7 @@ from dm_agent.extensions.capabilities import (
 )
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.paths import load_env_files
-from dm_agent.tools import default_tools
+from dm_agent.tools import bind_semantic_workspace_tools, default_tools
 from dm_agent.tracing import TraceWriter
 from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
@@ -426,6 +426,7 @@ def predict_one(
     timeout: int,
     trace_dir: Path | None,
     keep_workspace: bool,
+    enable_semantic_workspace: bool = False,
     enable_repo_map: bool = False,
     enable_verified_edits: bool = False,
     enable_evidence_graph: bool = False,
@@ -458,8 +459,8 @@ def predict_one(
                     "model": model or PROVIDER_DEFAULTS.get(provider, {}).get("model"),
                     "exec_backend": "docker",
                     "container_image": container_image,
-                    "semantic_workspace_enabled": enable_repo_map or enable_verified_edits,
-                    "semantic_impact_enabled": enable_repo_map or enable_verified_edits,
+                    "semantic_workspace_enabled": enable_semantic_workspace,
+                    "semantic_impact_enabled": enable_semantic_workspace,
                     "verified_edits_enabled": enable_verified_edits,
                     "evidence_graph_enabled": enable_evidence_graph,
                 },
@@ -468,9 +469,10 @@ def predict_one(
         client = build_client(provider, model, timeout)
         tools = execution_backend.replace_execution_tools(default_tools(include_mcp=False))
         capabilities: list[Any] = []
-        if enable_repo_map or enable_verified_edits:
+        if enable_semantic_workspace or enable_repo_map or enable_verified_edits:
             workspace_engine = SemanticWorkspaceEngine(workspace, database_path=semantic_database)
-        if enable_repo_map and workspace_engine is not None:
+            bind_semantic_workspace_tools(tools, workspace_engine)
+        if enable_semantic_workspace and workspace_engine is not None:
             capabilities.append(SemanticWorkspaceCapability(workspace_engine))
         if enable_verified_edits:
             capabilities.append(
@@ -489,6 +491,7 @@ def predict_one(
             max_steps=max_steps,
             temperature=temperature,
             trace_writer=trace_writer,
+            enable_semantic_workspace=enable_semantic_workspace,
             enable_repo_map=enable_repo_map,
             repository_map=(
                 RepositoryMap(engine=workspace_engine)

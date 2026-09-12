@@ -7,14 +7,16 @@ import dm_agent.tools.file_tools as file_tools_module
 from dm_agent.core.observation import is_failure_observation
 from dm_agent.tools import task_complete
 from dm_agent.tools.code_analysis_tools import get_code_metrics, get_function_signature, parse_ast
-from dm_agent.tools.code_index_tools import build_code_index, dependency_graph, search_symbol
+from dm_agent.tools.code_index_tools import dependency_graph, search_symbol
 from dm_agent.tools.execution_tools import available_linters, run_linter, run_python
 from dm_agent.tools.file_tools import (
     EDIT_ECHO_MAX_LINES,
     _atomic_write_text,
     create_file,
     edit_file,
+    find_files,
     read_file,
+    search_code,
     search_in_file,
 )
 from dm_agent.tools.structured_edit_tools import edit_python_symbol, inspect_python_symbol
@@ -56,6 +58,23 @@ def test_file_tools_create_read_edit_and_search(tmp_path):
     search_result = search_in_file({"path": str(target), "pattern": "return", "context_lines": 1})
     assert "return 'hi'" in search_result
     assert ">>>" in search_result
+
+
+def test_repository_search_tools_find_paths_and_content(tmp_path):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "users.py").write_text("def load_user():\n    return 'Ada'\n", encoding="utf-8")
+    (package / "binary.bin").write_bytes(b"\x00load_user")
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "ignored.py").write_text("load_user = 1\n", encoding="utf-8")
+
+    files = json.loads(find_files({"root": str(tmp_path), "pattern": "**/users.py"}))
+    assert files["matches"] == ["pkg/users.py"]
+
+    matches = json.loads(search_code({"root": str(tmp_path), "query": "LOAD_USER", "glob": "*.py"}))
+    assert matches["match_count"] == 1
+    assert matches["matches"][0]["path"] == "pkg/users.py"
+    assert matches["matches"][0]["line"] == 1
 
 
 # --- edit_file 的两处防自伤改动 -------------------------------------------
@@ -380,18 +399,10 @@ def test_code_index_tools_find_symbols_and_dependencies(tmp_path):
         encoding="utf-8",
     )
 
-    index = json.loads(build_code_index({"root": str(tmp_path)}))
-    assert index["file_count"] == 3
-    assert index["symbol_count"] == 3
-    assert any(
-        symbol["qualified_name"] == "pkg.models.User"
-        for file_info in index["files"]
-        for symbol in file_info["symbols"]
-    )
-
     matches = json.loads(search_symbol({"root": str(tmp_path), "name": "load_user", "exact": True}))
     assert matches["match_count"] == 1
     assert matches["matches"][0]["path"] == "pkg/service.py"
+    assert not (tmp_path / ".dm_agent").exists()
 
     graph = json.loads(dependency_graph({"root": str(tmp_path)}))
     assert {"from": "pkg.service", "to": "pkg.models", "import": "pkg.models"} in graph["edges"]

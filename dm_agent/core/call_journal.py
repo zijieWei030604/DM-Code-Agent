@@ -12,6 +12,8 @@ _READ_ONLY = {
     "read_file",
     "list_directory",
     "search_in_file",
+    "find_files",
+    "search_code",
     "parse_ast",
     "inspect_python_symbol",
     "get_function_signature",

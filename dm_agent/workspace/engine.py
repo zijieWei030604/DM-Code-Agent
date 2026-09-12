@@ -45,6 +45,15 @@ class SymbolRecord:
 
 
 @dataclass(frozen=True)
+class ReferenceRecord:
+    name: str
+    line: int
+    owner: str = "<module>"
+    target_hint: str = ""
+    relation: str = "references"
+
+
+@dataclass(frozen=True)
 class IndexStats:
     scanned_files: int
     indexed_files: int
@@ -64,17 +73,17 @@ class SemanticBackend(Protocol):
 
     def parse(
         self, path: Path, source: str
-    ) -> tuple[list[SymbolRecord], list[tuple[str, int]]]: ...
+    ) -> tuple[list[SymbolRecord], list[ReferenceRecord]]: ...
 
 
 class PythonAstBackend:
     """Dependency-free backend used when no Tree-sitter/LSP adapter is installed."""
 
-    def parse(self, path: Path, source: str) -> tuple[list[SymbolRecord], list[tuple[str, int]]]:
+    def parse(self, path: Path, source: str) -> tuple[list[SymbolRecord], list[ReferenceRecord]]:
         tree = ast.parse(source, filename=str(path))
         relative = path.as_posix()
         symbols: list[SymbolRecord] = []
-        references: list[tuple[str, int]] = []
+        references: list[ReferenceRecord] = []
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 symbols.append(
@@ -111,11 +120,7 @@ class PythonAstBackend:
                         getattr(node, "end_lineno", node.lineno),
                     )
                 )
-        for walked in ast.walk(tree):
-            if isinstance(walked, ast.Name) and isinstance(walked.ctx, ast.Load):
-                references.append((walked.id, walked.lineno))
-            elif isinstance(walked, ast.Attribute) and isinstance(walked.ctx, ast.Load):
-                references.append((walked.attr, walked.lineno))
+        references = _ReferenceVisitor(path.as_posix()).collect(tree)
         return symbols, references
 
 
@@ -343,7 +348,10 @@ class SemanticWorkspaceEngine:
               line_end INTEGER NOT NULL, parent TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS symbols_path_idx ON symbols(path);
             CREATE INDEX IF NOT EXISTS symbols_name_idx ON symbols(qualified_name);
-            CREATE TABLE IF NOT EXISTS refs(path TEXT NOT NULL, name TEXT NOT NULL, line INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS refs(
+              path TEXT NOT NULL, name TEXT NOT NULL, line INTEGER NOT NULL,
+              owner TEXT NOT NULL DEFAULT '<module>', target_hint TEXT NOT NULL DEFAULT '',
+              relation TEXT NOT NULL DEFAULT 'references');
             CREATE INDEX IF NOT EXISTS refs_name_idx ON refs(name);""")
         try:
             self._connection.execute(
@@ -353,12 +361,25 @@ class SemanticWorkspaceEngine:
             return False
         return True
 
+    def _ensure_refs_columns(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(refs)").fetchall()
+        }
+        for name, ddl in {
+            "owner": "ALTER TABLE refs ADD COLUMN owner TEXT NOT NULL DEFAULT '<module>'",
+            "target_hint": "ALTER TABLE refs ADD COLUMN target_hint TEXT NOT NULL DEFAULT ''",
+            "relation": "ALTER TABLE refs ADD COLUMN relation TEXT NOT NULL DEFAULT 'references'",
+        }.items():
+            if name not in columns:
+                self._connection.execute(ddl)
+
     def _replace_file(
         self,
         relative: str,
         digest: str,
         symbols: list[SymbolRecord],
-        references: list[tuple[str, int]],
+        references: list[ReferenceRecord],
     ) -> None:
         self._delete_file(relative)
         self._connection.execute(
@@ -384,8 +405,19 @@ class SemanticWorkspaceEngine:
                     (cursor.lastrowid, symbol.qualified_name, symbol.signature),
                 )
         self._connection.executemany(
-            "INSERT INTO refs(path, name, line) VALUES (?, ?, ?)",
-            [(relative, name, line) for name, line in references],
+            """INSERT INTO refs(path, name, line, owner, target_hint, relation)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                (
+                    relative,
+                    reference.name,
+                    reference.line,
+                    reference.owner,
+                    reference.target_hint or reference.name,
+                    reference.relation,
+                )
+                for reference in references
+            ],
         )
 
     def _delete_file(self, relative: str) -> None:
@@ -434,6 +466,118 @@ class SemanticWorkspaceEngine:
         for row in rows:
             lines.append(f"{'    ' if row['parent'] else '  '}{row['signature']}")
         return "\n".join(lines)
+
+
+class _ReferenceVisitor(ast.NodeVisitor):
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.module = _module_name(Path(path))
+        self.aliases: dict[str, str] = {}
+        self.classes: list[str] = []
+        self.owners: list[str] = []
+        self.references: list[ReferenceRecord] = []
+
+    @property
+    def owner(self) -> str:
+        return self.owners[-1] if self.owners else "<module>"
+
+    def collect(self, tree: ast.AST) -> list[ReferenceRecord]:
+        self.visit(tree)
+        return self.references
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self.aliases[alias.asname or alias.name.split(".", 1)[0]] = alias.name
+            self._reference(alias.name.rsplit(".", 1)[-1], alias.name, "imports", node.lineno)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        base = _resolve_import(self.module, node.level, node.module)
+        if base:
+            self._reference(base.rsplit(".", 1)[-1], base, "imports", node.lineno)
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            target = f"{base}.{alias.name}" if base else alias.name
+            self.aliases[alias.asname or alias.name] = target
+            self._reference(alias.name, target, "imports", node.lineno)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        name = ".".join([*self.classes, node.name])
+        for base in node.bases:
+            dotted = _dotted(base)
+            if dotted:
+                self._reference(
+                    dotted.rsplit(".", 1)[-1], self._expand(dotted), "inherits", node.lineno, name
+                )
+        self.classes.append(node.name)
+        self.owners.append(name)
+        for child in node.body:
+            self.visit(child)
+        self.owners.pop()
+        self.classes.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._function(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._function(node)
+
+    def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        name = ".".join([*self.classes, node.name])
+        self.owners.append(name)
+        for child in node.body:
+            self.visit(child)
+        self.owners.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        dotted = _dotted(node.func)
+        if dotted:
+            expanded = self._expand(dotted)
+            self._reference(expanded.rsplit(".", 1)[-1], expanded, "calls", node.lineno)
+        self.generic_visit(node)
+
+    def _expand(self, dotted: str) -> str:
+        head, separator, tail = dotted.partition(".")
+        target = self.aliases.get(head, head)
+        return f"{target}.{tail}" if separator else target
+
+    def _reference(
+        self,
+        name: str,
+        target: str,
+        relation: str,
+        line: int,
+        owner: str | None = None,
+    ) -> None:
+        self.references.append(
+            ReferenceRecord(name, line, owner or self.owner, target or name, relation)
+        )
+
+
+def _resolve_import(current: str, level: int, module: str | None) -> str:
+    if level <= 0:
+        return module or ""
+    package = current.split(".")[:-1]
+    base = package[: max(0, len(package) - level + 1)]
+    if module:
+        base.extend(module.split("."))
+    return ".".join(part for part in base if part)
+
+
+def _dotted(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        owner = _dotted(node.value)
+        return f"{owner}.{node.attr}" if owner else node.attr
+    return ""
+
+
+def _module_name(path: Path) -> str:
+    parts = list(path.with_suffix("").parts)
+    if parts and parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
 
 
 def _function_signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:

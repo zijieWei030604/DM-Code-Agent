@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import ast
-import hashlib
 import sqlite3
 from collections import deque
 from collections.abc import Iterable
@@ -14,9 +12,9 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ImpactNode:
-    #path        受影响符号所在文件
+    # path        受影响符号所在文件
     # symbol      受影响符号名称
-    # relation    关系：imports / calls / inherits
+    # relation    关系：references
     # distance    离修改点几跳
     # confidence  关系推断可信度
     # via_path    它依赖的目标文件
@@ -69,27 +67,8 @@ class ImpactReport:
         return "\n".join(lines)
 
 
-@dataclass(frozen=True)
-class _Symbol:
-    path: str
-    name: str
-    kind: str
-
-
-@dataclass(frozen=True)
-class _Reference:
-    path: str
-    owner: str
-    name: str
-    target_hint: str
-    relation: str
-    line: int
-
-
 class ImpactGraph:
     """Maintain a scoped call/import/inheritance graph in the workspace database."""
-
-    PARSER_VERSION = "python-impact-v1"
 
     def __init__(self, root: Path, connection: sqlite3.Connection) -> None:
         self.root = root
@@ -97,52 +76,13 @@ class ImpactGraph:
         self._create_schema()
 
     def update(self, paths: Iterable[Path], *, remove_missing: bool = False) -> int:
-        candidates = list(paths)
-        live = {
-            path.relative_to(self.root).as_posix()
-            for path in candidates
-            if path.is_file() and path.is_relative_to(self.root)
-        }
-        changed = False
-        for path in candidates:
-            if not path.is_relative_to(self.root):
-                continue
-            relative = path.relative_to(self.root).as_posix()
-            if not path.is_file():
-                if self._tracked(relative):
-                    self._delete_file(relative)
-                    changed = True
-                continue
-            try:
-                source = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                continue
-            digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
-            row = self.connection.execute(
-                "SELECT content_hash, parser_version FROM impact_files WHERE path = ?",
-                (relative,),
-            ).fetchone()
-            if (
-                row
-                and row["content_hash"] == digest
-                and row["parser_version"] == self.PARSER_VERSION
-            ):
-                continue
-            try:
-                symbols, references = _parse_python(relative, source)
-            except SyntaxError:
-                symbols, references = [], []
-            self._replace_file(relative, digest, symbols, references)
-            changed = True
-        if remove_missing:
-            stored = {
-                str(row["path"]) for row in self.connection.execute("SELECT path FROM impact_files")
-            }
-            for stale in stored - live:
-                self._delete_file(stale)
-                changed = True
-        if changed:
-            self._rebuild_edges()
+        """Refresh derived impact edges from the shared semantic index.
+
+        ``files`` / ``symbols`` / ``refs`` are the single source of truth. The
+        impact graph only stores dependency edges derived from those tables, so
+        incremental and full updates both rebuild the edge projection.
+        """
+        self._rebuild_edges()
         return int(self.connection.execute("SELECT COUNT(*) FROM impact_edges").fetchone()[0])
 
     def analyze(
@@ -157,10 +97,11 @@ class ImpactGraph:
         for path in changed_files:
             symbol_rows.extend(
                 self.connection.execute(
-                    "SELECT path, name, kind FROM impact_symbols WHERE path = ?", (path,)
+                    "SELECT DISTINCT path, qualified_name AS name, kind FROM symbols WHERE path = ?",
+                    (path,),
                 ).fetchall()
             )
-        changed_symbols = tuple(sorted(f"{row['path']}:{row['name']}" for row in symbol_rows))
+        changed_symbols = tuple(sorted({f"{row['path']}:{row['name']}" for row in symbol_rows}))
         seeds = {(str(row["path"]), str(row["name"])) for row in symbol_rows}
         seeds.update((path, "<module>") for path in changed_files)
         queue = deque((path, symbol, 0) for path, symbol in sorted(seeds))
@@ -230,72 +171,39 @@ class ImpactGraph:
         )
 
     def _create_schema(self) -> None:
-        self.connection.executescript("""CREATE TABLE IF NOT EXISTS impact_files(
-                 path TEXT PRIMARY KEY, content_hash TEXT NOT NULL, parser_version TEXT NOT NULL);
-               CREATE TABLE IF NOT EXISTS impact_symbols(
-                 path TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
-                 PRIMARY KEY(path, name));
-               CREATE TABLE IF NOT EXISTS impact_refs(
-                 path TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL,
-                 target_hint TEXT NOT NULL, relation TEXT NOT NULL, line INTEGER NOT NULL);
-               CREATE INDEX IF NOT EXISTS impact_refs_name_idx ON impact_refs(name);
-               CREATE TABLE IF NOT EXISTS impact_edges(
+        self.connection.executescript("""CREATE TABLE IF NOT EXISTS impact_edges(
                  source_path TEXT NOT NULL, source_symbol TEXT NOT NULL,
                  target_path TEXT NOT NULL, target_symbol TEXT NOT NULL,
                  relation TEXT NOT NULL, line INTEGER NOT NULL, confidence REAL NOT NULL);
                CREATE INDEX IF NOT EXISTS impact_edges_target_idx
                  ON impact_edges(target_path, target_symbol);""")
 
-    def _replace_file(
-        self,
-        path: str,
-        digest: str,
-        symbols: list[_Symbol],
-        references: list[_Reference],
-    ) -> None:
-        self._delete_file(path)
-        self.connection.execute(
-            "INSERT INTO impact_files(path, content_hash, parser_version) VALUES (?, ?, ?)",
-            (path, digest, self.PARSER_VERSION),
-        )
-        self.connection.executemany(
-            "INSERT INTO impact_symbols(path, name, kind) VALUES (?, ?, ?)",
-            [(item.path, item.name, item.kind) for item in symbols],
-        )
-        self.connection.executemany(
-            """INSERT INTO impact_refs(path, owner, name, target_hint, relation, line)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [
-                (item.path, item.owner, item.name, item.target_hint, item.relation, item.line)
-                for item in references
-            ],
-        )
-
     def _delete_file(self, path: str) -> None:
         self.connection.execute("DELETE FROM impact_edges WHERE source_path = ?", (path,))
         self.connection.execute("DELETE FROM impact_edges WHERE target_path = ?", (path,))
-        self.connection.execute("DELETE FROM impact_refs WHERE path = ?", (path,))
-        self.connection.execute("DELETE FROM impact_symbols WHERE path = ?", (path,))
-        self.connection.execute("DELETE FROM impact_files WHERE path = ?", (path,))
 
     def _rebuild_edges(self) -> None:
         self.connection.execute("DELETE FROM impact_edges")
-        rows = self.connection.execute("SELECT path, name FROM impact_symbols").fetchall()
+        rows = self.connection.execute(
+            "SELECT path, qualified_name AS name FROM symbols"
+        ).fetchall()
         by_leaf: dict[str, list[tuple[str, str]]] = {}
         modules: dict[str, str] = {}
         for row in rows:
             path, name = str(row["path"]), str(row["name"])
             by_leaf.setdefault(name.rsplit(".", 1)[-1], []).append((path, name))
             modules[_module_name(Path(path))] = path
-        for row in self.connection.execute("SELECT path FROM impact_files"):
+        for row in self.connection.execute("SELECT path FROM files"):
             path = str(row["path"])
             modules[_module_name(Path(path))] = path
         edges = set()
-        for row in self.connection.execute("SELECT * FROM impact_refs"):
+        for row in self.connection.execute(
+            "SELECT path, name, line, owner, target_hint, relation FROM refs"
+        ):
             targets = _resolve_targets(
                 str(row["path"]),
                 str(row["name"]),
-                str(row["target_hint"]),
+                str(row["target_hint"] or row["name"]),
                 by_leaf,
                 modules,
             )
@@ -303,10 +211,15 @@ class ImpactGraph:
                 edges.add(
                     (
                         str(row["path"]),
-                        str(row["owner"]),
+                        str(
+                            row["owner"]
+                            or _owner_for_reference(
+                                self.connection, str(row["path"]), int(row["line"])
+                            )
+                        ),
                         target_path,
                         target_symbol,
-                        str(row["relation"]),
+                        str(row["relation"] or "references"),
                         int(row["line"]),
                         confidence,
                     )
@@ -318,16 +231,10 @@ class ImpactGraph:
             sorted(edges),
         )
 
-    def _tracked(self, path: str) -> bool:
-        return (
-            self.connection.execute("SELECT 1 FROM impact_files WHERE path = ?", (path,)).fetchone()
-            is not None
-        )
-
     def _test_companions(self, changed: Iterable[str]) -> set[str]:
         tests = [
             str(row["path"])
-            for row in self.connection.execute("SELECT path FROM impact_files")
+            for row in self.connection.execute("SELECT path FROM files")
             if _is_test(str(row["path"]))
         ]
         result: set[str] = set()
@@ -337,100 +244,14 @@ class ImpactGraph:
         return result
 
 
-class _Visitor(ast.NodeVisitor):
-    def __init__(self, path: str, module: str) -> None:
-        self.path = path
-        self.module = module
-        self.symbols: list[_Symbol] = []
-        self.references: list[_Reference] = []
-        self.aliases: dict[str, str] = {}
-        self.classes: list[str] = []
-        self.owners: list[str] = []
-
-    @property
-    def owner(self) -> str:
-        return self.owners[-1] if self.owners else "<module>"
-
-    def visit_Import(self, node: ast.Import) -> None:
-        for alias in node.names:
-            self.aliases[alias.asname or alias.name.split(".", 1)[0]] = alias.name
-            self._reference(alias.name.rsplit(".", 1)[-1], alias.name, "imports", node.lineno)
-
-    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        base = _resolve_import(self.module, node.level, node.module)
-        for alias in node.names:
-            if alias.name == "*":
-                continue
-            target = f"{base}.{alias.name}" if base else alias.name
-            self.aliases[alias.asname or alias.name] = target
-            self._reference(alias.name, target, "imports", node.lineno)
-
-    def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        name = ".".join([*self.classes, node.name])
-        self.symbols.append(_Symbol(self.path, name, "class"))
-        for base in node.bases:
-            dotted = _dotted(base)
-            if dotted:
-                self._reference(
-                    dotted.rsplit(".", 1)[-1], self._expand(dotted), "inherits", node.lineno, name
-                )
-        self.classes.append(node.name)
-        self.owners.append(name)
-        for child in node.body:
-            self.visit(child)
-        self.owners.pop()
-        self.classes.pop()
-
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        self._function(node)
-
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        self._function(node)
-
-    def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        name = ".".join([*self.classes, node.name])
-        self.symbols.append(_Symbol(self.path, name, "method" if self.classes else "function"))
-        self.owners.append(name)
-        for child in node.body:
-            self.visit(child)
-        self.owners.pop()
-
-    def visit_Call(self, node: ast.Call) -> None:
-        dotted = _dotted(node.func)
-        if dotted:
-            expanded = self._expand(dotted)
-            self._reference(expanded.rsplit(".", 1)[-1], expanded, "calls", node.lineno)
-        self.generic_visit(node)
-
-    def _expand(self, dotted: str) -> str:
-        head, separator, tail = dotted.partition(".")
-        target = self.aliases.get(head, head)
-        return f"{target}.{tail}" if separator else target
-
-    def _reference(
-        self,
-        name: str,
-        target: str,
-        relation: str,
-        line: int,
-        owner: str | None = None,
-    ) -> None:
-        self.references.append(
-            _Reference(self.path, owner or self.owner, name, target, relation, line)
-        )
-
-
-def _parse_python(path: str, source: str) -> tuple[list[_Symbol], list[_Reference]]:
-    visitor = _Visitor(path, _module_name(Path(path)))
-    visitor.visit(ast.parse(source, filename=path))
-    # A logical symbol may have multiple AST definitions in real projects, for
-    # example a property getter/setter pair or overload declarations.  The graph
-    # schema identifies symbols by (path, name), so retain the first definition
-    # in source order while keeping every reference for impact propagation.
-    symbols_by_name: dict[str, _Symbol] = {}
-    for symbol in visitor.symbols:
-        symbols_by_name.setdefault(symbol.name, symbol)
-    return list(symbols_by_name.values()), visitor.references
+def _owner_for_reference(connection: sqlite3.Connection, path: str, line: int) -> str:
+    row = connection.execute(
+        """SELECT qualified_name FROM symbols
+           WHERE path = ? AND line_start <= ? AND line_end >= ?
+           ORDER BY line_start DESC, line_end ASC LIMIT 1""",
+        (path, line, line),
+    ).fetchone()
+    return str(row["qualified_name"]) if row is not None else "<module>"
 
 
 def _resolve_targets(
@@ -463,25 +284,6 @@ def _module_path(module: str, modules: dict[str, str]) -> str | None:
             return modules[module]
         module = module.rpartition(".")[0]
     return None
-
-
-def _resolve_import(current: str, level: int, module: str | None) -> str:
-    if level <= 0:
-        return module or ""
-    package = current.split(".")[:-1]
-    base = package[: max(0, len(package) - level + 1)]
-    if module:
-        base.extend(module.split("."))
-    return ".".join(part for part in base if part)
-
-
-def _dotted(node: ast.AST) -> str:
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        owner = _dotted(node.value)
-        return f"{owner}.{node.attr}" if owner else node.attr
-    return ""
 
 
 def _module_name(path: Path) -> str:

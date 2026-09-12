@@ -433,6 +433,7 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
         timeout=30,
         trace_dir=None,
         keep_workspace=True,
+        enable_semantic_workspace=True,
         enable_repo_map=True,
         enable_verified_edits=True,
     )

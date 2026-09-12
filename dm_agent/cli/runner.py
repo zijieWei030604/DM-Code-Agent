@@ -25,6 +25,7 @@ from dm_agent.extensions.capabilities import (
 from dm_agent.mcp import MCPManager, load_mcp_config
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.skills import SkillManager
+from dm_agent.tools import bind_semantic_workspace_tools
 from dm_agent.tracing import SessionWriter, TraceWriter
 from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
@@ -107,9 +108,10 @@ def create_agent(
     advanced = resolve_advanced_features(config)
     capabilities: list[AgentCapability] = []
     workspace_engine = None
-    if config.enable_repo_map or config.enable_verified_edits:
+    if config.enable_semantic_workspace or config.enable_repo_map or config.enable_verified_edits:
         workspace_engine = SemanticWorkspaceEngine(Path.cwd())
-    if config.enable_repo_map and workspace_engine is not None:
+        bind_semantic_workspace_tools(tools, workspace_engine)
+    if config.enable_semantic_workspace and workspace_engine is not None:
         capabilities.append(SemanticWorkspaceCapability(workspace_engine))
     if config.enable_verified_edits:
         capabilities.append(
@@ -128,6 +130,7 @@ def create_agent(
         max_observation_chars=config.max_observation_chars,
         context_token_budget=config.context_token_budget,
         enable_edit_guard=config.enable_edit_guard,
+        enable_semantic_workspace=config.enable_semantic_workspace,
         enable_repo_map=config.enable_repo_map,
         repository_map=(
             RepositoryMap(engine=workspace_engine)
@@ -215,9 +218,8 @@ def _assemble_agent(
                 "skill_count": skill_count,
                 "trace_llm_io": trace_llm_io,
                 "adaptive_replanning_enabled": advanced["adaptive_replanning"],
-                "semantic_workspace_enabled": config.enable_repo_map
-                or config.enable_verified_edits,
-                "semantic_impact_enabled": config.enable_repo_map or config.enable_verified_edits,
+                "semantic_workspace_enabled": config.enable_semantic_workspace,
+                "semantic_impact_enabled": config.enable_semantic_workspace,
                 "verified_edits_enabled": advanced["verified_edits"],
                 "evidence_graph_enabled": advanced["evidence_graph"],
                 "max_replans": config.max_replans,

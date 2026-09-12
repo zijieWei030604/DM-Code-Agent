@@ -46,6 +46,7 @@ class SpecError(ValueError):
 # 请求里多出来的字段一律忽略，不存在「传个奇怪的键就能注入参数」这条路。
 BOOL_FLAGS: dict[str, str] = {
     "enable_adaptive_replanning": "--enable-adaptive-replanning",
+    "enable_semantic_workspace": "--enable-semantic-workspace",
     "enable_repo_map": "--enable-repo-map",
     "enable_verified_edits": "--enable-verified-edits",
     "enable_evidence_graph": "--enable-evidence-graph",

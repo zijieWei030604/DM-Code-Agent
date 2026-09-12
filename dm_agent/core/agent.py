@@ -93,6 +93,7 @@ class ReactAgent:
         max_observation_chars: int = 8000,
         context_token_budget: int = 24000,
         enable_edit_guard: bool = True,
+        enable_semantic_workspace: bool = False,
         enable_repo_map: bool = False,
         repository_map: RepositoryMap | None = None,
         event_bus: EventBus | None = None,
@@ -180,6 +181,7 @@ class ReactAgent:
         # read-before-edit 守卫：首次编辑前必须读过目标文件；依赖行号的连续编辑
         # 在写后需重读，内容锚定编辑由唯一精确匹配保证当前性。
         self.enable_edit_guard = enable_edit_guard
+        self.enable_semantic_workspace = enable_semantic_workspace
         self._edit_guard = ReadBeforeEditGuard(
             enabled=enable_edit_guard, trace_writer=self.trace_writer
         )
@@ -930,6 +932,7 @@ class ReactAgent:
             enable_compression=self.enable_compression,
             enable_edit_guard=self.enable_edit_guard,
             enable_repo_map=self.enable_repo_map,
+            enable_semantic_workspace=self.enable_semantic_workspace,
             max_observation_chars=self.max_observation_chars,
             context_token_budget=self.context_token_budget,
             max_steps=max_steps,

@@ -49,6 +49,28 @@ def test_semantic_workspace_persists_symbols_references_and_affected_tests(tmp_p
     reopened.close()
 
 
+def test_impact_graph_uses_semantic_index_as_single_source_of_truth(tmp_path):
+    (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+
+    engine.update()
+    tables = {
+        str(row["name"])
+        for row in engine._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table', 'index')"
+        )
+    }
+    report = engine.analyze_impact(["service.py"])
+
+    assert {"files", "symbols", "refs", "impact_edges"}.issubset(tables)
+    assert not {"impact_files", "impact_symbols", "impact_refs"} & tables
+    assert "consumer.py" in report.affected_files
+    engine.close()
+
+
 def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
     (tmp_path / "service.py").write_text(
         "def calculate_total(items):\n    return sum(items)\n", encoding="utf-8"
@@ -521,7 +543,7 @@ def test_verified_edit_uses_posix_paths_for_container_validation(tmp_path):
     assert ["-m", "py_compile", "package/module.py"] in calls
 
 
-def test_semantic_capability_records_impact_without_rewriting_context(tmp_path):
+def test_semantic_capability_injects_bounded_impact_once_after_change(tmp_path):
     (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     (tmp_path / "consumer.py").write_text(
         "from service import value\n\ndef consume():\n    return value()\n", encoding="utf-8"
@@ -543,6 +565,15 @@ def test_semantic_capability_records_impact_without_rewriting_context(tmp_path):
     bus.emit_before_llm_request(BeforeLLMRequestEvent(messages, 2, "run", "agent", metadata))
 
     assert messages[0]["content"] == "continue\n\n<repository_map></repository_map>"
+    assert len(messages) == 2
+    assert "<change_impact>" in messages[1]["content"]
+    assert "service.py" in messages[1]["content"]
+    assert "consumer.py" in messages[1]["content"]
+    assert metadata["semantic_impact_injection_count"] == 1
+
+    next_messages = [{"role": "user", "content": "continue again"}]
+    bus.emit_before_llm_request(BeforeLLMRequestEvent(next_messages, 3, "run", "agent", metadata))
+    assert next_messages == [{"role": "user", "content": "continue again"}]
     assert metadata["semantic_impact_files"] == 1
     engine.close()
 

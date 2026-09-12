@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from .base import Tool, ToolResult
@@ -16,8 +17,6 @@ from .code_analysis_tools import (
     parse_ast_result,
 )
 from .code_index_tools import (
-    build_code_index,
-    build_code_index_result,
     dependency_graph,
     dependency_graph_result,
     search_symbol,
@@ -38,10 +37,14 @@ from .file_tools import (
     create_file_result,
     edit_file,
     edit_file_result,
+    find_files,
+    find_files_result,
     list_directory,
     list_directory_result,
     read_file,
     read_file_result,
+    search_code,
+    search_code_result,
     search_in_file,
     search_in_file_result,
 )
@@ -54,6 +57,7 @@ from .structured_edit_tools import (
 
 if TYPE_CHECKING:
     from dm_agent.extensions import ExtensionAPI, ExtensionRegistry
+    from dm_agent.workspace import SemanticWorkspaceEngine
 
 
 def _object_schema(
@@ -93,6 +97,20 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "search_in_file": _object_schema(
         {"path": _STR, "pattern": _STR, "context_lines": _INT}, ("path", "pattern")
     ),
+    "find_files": _object_schema(
+        {"pattern": _STR, "root": _STR, "max_results": _INT}, ("pattern",)
+    ),
+    "search_code": _object_schema(
+        {
+            "query": _STR,
+            "root": _STR,
+            "glob": _STR,
+            "regex": _BOOL,
+            "case_sensitive": _BOOL,
+            "max_results": _INT,
+        },
+        ("query",),
+    ),
     "run_python": _object_schema(
         {
             "code": _STR,
@@ -124,7 +142,6 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "find_dependencies": _object_schema({"path": _STR}, ("path",)),
     "get_code_metrics": _object_schema({"path": _STR}, ("path",)),
-    "build_code_index": _object_schema({"root": _STR, "max_files": _INT, "include_tests": _BOOL}),
     "search_symbol": _object_schema(
         {
             "name": _STR,
@@ -132,6 +149,7 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "kind": {"type": "string", "enum": ["class", "function", "method"]},
             "exact": _BOOL,
             "max_files": _INT,
+            "max_results": _INT,
         },
         ("name",),
     ),
@@ -254,6 +272,26 @@ def _builtin_tools() -> list[Tool]:
             result_runner=search_in_file_result,
         ),
         Tool(
+            name="find_files",
+            description=(
+                'Recursively find files by path or glob. Arguments: {"pattern": string, '
+                '"root": optional string (default "."), "max_results": optional int (default 50)}.'
+            ),
+            runner=find_files,
+            result_runner=find_files_result,
+        ),
+        Tool(
+            name="search_code",
+            description=(
+                'Search text across repository files. Arguments: {"query": string, '
+                '"root": optional string, "glob": optional string, "regex": optional bool, '
+                '"case_sensitive": optional bool, "max_results": optional int}. '
+                "Search results are candidates only; read a file before editing it."
+            ),
+            runner=search_code,
+            result_runner=search_code_result,
+        ),
+        Tool(
             name="run_python",
             description=(
                 'Execute Python code using the local interpreter. Arguments: either {"code": string} or {"path": string, "args": optional string or list}.'
@@ -318,15 +356,6 @@ def _builtin_tools() -> list[Tool]:
             result_runner=get_code_metrics_result,
         ),
         Tool(
-            name="build_code_index",
-            description=(
-                'Build a repository-level Python symbol index. Arguments: {"root": optional string (default "."), '
-                '"max_files": optional int (default 200), "include_tests": optional bool (default true)}.'
-            ),
-            runner=build_code_index,
-            result_runner=build_code_index_result,
-        ),
-        Tool(
             name="search_symbol",
             description=(
                 'Search classes, functions, and methods by name. Arguments: {"name": string, '
@@ -378,6 +407,21 @@ def _builtin_tools() -> list[Tool]:
     return tools
 
 
+def bind_semantic_workspace_tools(tools: list[Tool], engine: SemanticWorkspaceEngine) -> None:
+    """Bind built-in semantic queries to the run's shared workspace engine."""
+    for index, tool in enumerate(tools):
+        if tool.name == "search_symbol" and tool.runner is search_symbol:
+            tools[index] = Tool(
+                name=tool.name,
+                description=tool.description,
+                runner=partial(search_symbol, engine=engine),
+                result_runner=partial(search_symbol_result, engine=engine),
+                read_only=tool.read_only,
+                input_schema=tool.input_schema,
+            )
+            return
+
+
 def register_builtin_tools(api: ExtensionAPI) -> None:
     """通过 ExtensionAPI 注册全部内置工具。"""
     for tool in _builtin_tools():
@@ -405,6 +449,7 @@ def default_tools(
 
 __all__ = [
     "Tool",
+    "bind_semantic_workspace_tools",
     "default_tools",
     "register_builtin_tools",
     "task_complete",
