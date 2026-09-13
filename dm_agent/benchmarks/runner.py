@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Iterable, Sequence
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stdout, suppress
 from io import StringIO
 from pathlib import Path
 from typing import Any, cast
@@ -19,9 +19,11 @@ from typing import Any, cast
 from dm_agent.clients.llm_factory import PROVIDER_DEFAULTS, create_llm_client
 from dm_agent.core import ReactAgent
 from dm_agent.evals.real_runner import PROVIDER_API_KEY_ENV, UsageTrackingClient
+from dm_agent.extensions.capabilities import EvidenceGraphCapability, SemanticWorkspaceCapability
 from dm_agent.skills import SkillManager
 from dm_agent.tools import default_tools
 from dm_agent.tracing import TraceWriter, analyze_events, load_trace_events
+from dm_agent.workspace import SemanticWorkspaceEngine
 
 from .models import (
     BenchmarkRunConfig,
@@ -99,7 +101,8 @@ def run_benchmark_suite(
 
     provider = config.provider.lower()
     defaults = PROVIDER_DEFAULTS.get(provider, {})
-    return {
+    summary = summarize_benchmark_results(results, tasks=selected_tasks)
+    report = {
         "mode": f"{suite}_benchmark",
         "suite": suite,
         "provider": provider,
@@ -109,6 +112,11 @@ def run_benchmark_suite(
         "adaptive_replanning": {
             "enabled": config.enable_adaptive_replanning,
             "max_replans": config.max_replans,
+        },
+        "runtime_capabilities": {
+            "semantic_workspace": config.enable_semantic_workspace,
+            "evidence_graph": config.enable_evidence_graph,
+            "repo_map": False,
         },
         # 报告要能自证是哪一组：约束声明只影响传给 agent 的 prompt，不进 manifest，
         # 所以两组报告的 suite_signature 相同、可直接 score-diff——但必须看得出区别。
@@ -120,8 +128,9 @@ def run_benchmark_suite(
         },
         "context_policy": {
             "context_token_budget": config.context_token_budget,
+            "min_compression_triggered_tasks": config.min_compression_triggered_tasks,
         },
-        "summary": summarize_benchmark_results(results, tasks=selected_tasks),
+        "summary": summary,
         "manifest": build_benchmark_manifest(
             suite=suite,
             tasks=selected_tasks,
@@ -131,6 +140,8 @@ def run_benchmark_suite(
         "tasks": [task.to_public_dict() for task in selected_tasks],
         "variants": [variant.__dict__ for variant in selected_variants],
     }
+    report["compression_coverage"] = _compression_coverage_gate(summary, config, selected_variants)
+    return report
 
 
 def run_benchmark_task(
@@ -410,7 +421,73 @@ def summarize_benchmark_results(
         for entry in by_tag.values():
             entry["success_rate"] = entry["successes"] / entry["runs"] if entry["runs"] else 0.0
         summary["by_tag"] = dict(sorted(by_tag.items()))
+    summary["compression"] = _summarize_accepted_compactions(results)
     return summary
+
+
+def _summarize_accepted_compactions(
+    results: Sequence[CodingBenchResult],
+) -> dict[str, dict[str, Any]]:
+    """Aggregate only compactions accepted by the runtime's positive-savings guard."""
+    by_variant: dict[str, list[CodingBenchResult]] = {}
+    for result in results:
+        by_variant.setdefault(result.variant, []).append(result)
+
+    summary: dict[str, dict[str, Any]] = {}
+    for variant, group in by_variant.items():
+        measurements_by_result = [
+            (
+                result,
+                result.metadata.get("accepted_compaction"),
+            )
+            for result in group
+            if isinstance(result.metadata.get("accepted_compaction"), dict)
+        ]
+        measurements = [measurement for _, measurement in measurements_by_result]
+        triggered = [
+            result
+            for result, measurement in measurements_by_result
+            if int(measurement.get("accepted_events", 0)) > 0
+        ]
+        before = sum(
+            int(measurement.get("estimated_tokens_before", 0)) for measurement in measurements
+        )
+        after = sum(
+            int(measurement.get("estimated_tokens_after", 0)) for measurement in measurements
+        )
+        summary[variant] = {
+            "runs": len(group),
+            "triggered_runs": len(triggered),
+            "triggered_unique_tasks": len({result.task_id for result in triggered}),
+            "accepted_events": sum(int(item.get("accepted_events", 0)) for item in measurements),
+            "estimated_tokens_before": before,
+            "estimated_tokens_after": after,
+            "saved_tokens": before - after,
+            "direct_reduction_rate": ((before - after) / before if before else 0.0),
+        }
+    return summary
+
+
+def _compression_coverage_gate(
+    summary: dict[str, Any],
+    config: BenchmarkRunConfig,
+    variants: Sequence[BenchmarkVariant],
+) -> dict[str, Any]:
+    """Evaluate the optional pressure-suite threshold from recorded trace facts."""
+    minimum = config.min_compression_triggered_tasks
+    enabled_variants = [variant.name for variant in variants if variant.enable_compression]
+    if not minimum or not enabled_variants:
+        return {"enabled": False, "passed": True, "minimum_triggered_tasks": minimum}
+    variant = enabled_variants[0]
+    metrics = summary.get("compression", {}).get(variant, {})
+    triggered = int(metrics.get("triggered_unique_tasks", 0))
+    return {
+        "enabled": True,
+        "variant": variant,
+        "minimum_triggered_tasks": minimum,
+        "triggered_tasks": triggered,
+        "passed": triggered >= minimum,
+    }
 
 
 def build_benchmark_manifest(
@@ -614,6 +691,30 @@ def load_trace_analysis_for_report(trace_path: Path) -> tuple[dict[str, Any], st
     }, ""
 
 
+def load_accepted_compaction_for_report(trace_path: Path) -> tuple[dict[str, int], str]:
+    """Return direct savings from accepted, rather than merely attempted, compactions."""
+    try:
+        events = load_trace_events(trace_path)
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, str(exc)
+
+    accepted = [
+        event.get("payload", {})
+        for event in events
+        if event.get("event") == "compaction"
+        and isinstance(event.get("payload"), dict)
+        and event["payload"].get("phase") == "accepted"
+    ]
+    before = sum(int(item.get("estimated_tokens_before", 0)) for item in accepted)
+    after = sum(int(item.get("estimated_tokens_after", 0)) for item in accepted)
+    return {
+        "accepted_events": len(accepted),
+        "estimated_tokens_before": before,
+        "estimated_tokens_after": after,
+        "saved_tokens": before - after,
+    }, ""
+
+
 def _run_benchmark_task_in_workspace(
     task: BenchmarkTask,
     variant: BenchmarkVariant,
@@ -629,6 +730,7 @@ def _run_benchmark_task_in_workspace(
     client = _build_tracking_client(config)
     trace_path: Path | None = None
     trace_writer: TraceWriter | None = None
+    workspace_index_path: Path | None = None
 
     if config.trace_dir:
         trace_root = Path(config.trace_dir)
@@ -647,6 +749,9 @@ def _run_benchmark_task_in_workspace(
                 "base_url": client.base_url,
                 "repeat_index": repeat_index,
                 "context_token_budget": config.context_token_budget,
+                "semantic_workspace_enabled": config.enable_semantic_workspace,
+                "evidence_graph_enabled": config.enable_evidence_graph,
+                "repo_map_enabled": False,
             },
         )
 
@@ -654,6 +759,19 @@ def _run_benchmark_task_in_workspace(
     if variant.enable_skills:
         skill_manager = SkillManager()
         skill_manager.load_all()
+
+    capabilities = []
+    owned_resources = []
+    if config.enable_semantic_workspace:
+        workspace_index_path = _benchmark_workspace_index_path(workspace)
+        workspace_engine = SemanticWorkspaceEngine(
+            workspace,
+            database_path=workspace_index_path,
+        )
+        capabilities.append(SemanticWorkspaceCapability(workspace_engine))
+        owned_resources.append(workspace_engine)
+    if config.enable_evidence_graph:
+        capabilities.append(EvidenceGraphCapability())
 
     agent = ReactAgent(
         client,
@@ -665,8 +783,12 @@ def _run_benchmark_task_in_workspace(
         context_token_budget=config.context_token_budget,
         skill_manager=skill_manager,
         trace_writer=trace_writer,
+        capabilities=capabilities,
         enable_adaptive_replanning=config.enable_adaptive_replanning,
+        enable_semantic_workspace=config.enable_semantic_workspace,
+        enable_repo_map=False,
         max_replans=config.max_replans,
+        owned_resources=owned_resources,
     )
 
     with chdir(workspace):
@@ -698,6 +820,7 @@ def _run_benchmark_task_in_workspace(
                 close_agent()
             if trace_writer:
                 trace_writer.close()
+            _remove_benchmark_workspace_index(workspace_index_path)
 
     after_snapshot = _snapshot_workspace(workspace)
     changed_files = _diff_workspace(before_snapshot, after_snapshot)
@@ -726,6 +849,9 @@ def _run_benchmark_task_in_workspace(
             "patch_fingerprint": patch_fingerprint,
             "trace_path": str(trace_path) if trace_path else "",
             "adaptive_replanning_enabled": config.enable_adaptive_replanning,
+            "semantic_workspace_enabled": config.enable_semantic_workspace,
+            "evidence_graph_enabled": config.enable_evidence_graph,
+            "repo_map_enabled": False,
             "max_replans": config.max_replans,
             "context_token_budget": config.context_token_budget,
             "declare_allowed_files": config.declare_allowed_files,
@@ -740,6 +866,11 @@ def _run_benchmark_task_in_workspace(
             metadata["trace_analysis"] = trace_analysis
         if trace_analysis_error:
             metadata["trace_analysis_error"] = trace_analysis_error
+        compaction, compaction_error = load_accepted_compaction_for_report(trace_path)
+        if compaction:
+            metadata["accepted_compaction"] = compaction
+        if compaction_error:
+            metadata["accepted_compaction_error"] = compaction_error
 
     success, failure_reason = _score_run(task, raw_result, hidden_result, changed_files)
     steps = raw_result.get("steps", [])
@@ -824,6 +955,20 @@ def _write_files(workspace: Path, files: dict[str, str]) -> None:
         path = workspace / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+
+
+def _benchmark_workspace_index_path(workspace: Path) -> Path:
+    """Keep benchmark-only SQLite state outside the scored workspace."""
+    return workspace.parent / f".{workspace.name}.semantic-workspace.db"
+
+
+def _remove_benchmark_workspace_index(path: Path | None) -> None:
+    """Best-effort cleanup for SQLite's database and sidecar files."""
+    if path is None:
+        return
+    for candidate in (path, Path(f"{path}-journal"), Path(f"{path}-shm"), Path(f"{path}-wal")):
+        with suppress(OSError):
+            candidate.unlink(missing_ok=True)
 
 
 def _snapshot_workspace(workspace: Path) -> dict[str, bytes]:

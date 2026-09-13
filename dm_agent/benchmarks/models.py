@@ -94,12 +94,17 @@ class BenchmarkRunConfig:
     max_steps: int | None = None
     # Keep the runtime budget explicit so compression A/B reports are reproducible.
     context_token_budget: int = 24000
+    # Advisory coverage gate for context-pressure experiments. Zero disables it.
+    min_compression_triggered_tasks: int = 0
     test_timeout: int = 30
     keep_workspaces: bool = False
     workspace_root: str | None = None
     trace_dir: str | None = None
     quiet: bool = True
     enable_adaptive_replanning: bool = False
+    # Optional runtime capabilities stay opt-in so historical baselines remain comparable.
+    enable_semantic_workspace: bool = False
+    enable_evidence_graph: bool = False
     max_replans: int = -1
     cost_per_1k_tokens: float = 0.0
     # 把每题的 allowed_changed_files 声明进 prompt。默认关闭：既有 baseline 是在

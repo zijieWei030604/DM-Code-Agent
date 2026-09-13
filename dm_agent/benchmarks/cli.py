@@ -57,9 +57,28 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
         help="Estimated context-token budget; 0 disables budget-triggered compression.",
     )
     parser.add_argument(
+        "--min-compression-triggered-tasks",
+        type=int,
+        default=0,
+        help=(
+            "Require this many distinct tasks to emit an accepted compression event in a "
+            "compression-enabled variant; 0 disables the context-pressure gate."
+        ),
+    )
+    parser.add_argument(
         "--enable-adaptive-replanning",
         action="store_true",
         help="Enable deterministic error-signal-aware replanning. Default is off.",
+    )
+    parser.add_argument(
+        "--enable-semantic-workspace",
+        action="store_true",
+        help="Enable the per-workspace semantic index and change-impact feedback.",
+    )
+    parser.add_argument(
+        "--enable-evidence-graph",
+        action="store_true",
+        help="Enable per-run decision evidence capture and audit events.",
     )
     parser.add_argument(
         "--max-replans",
@@ -122,6 +141,9 @@ def main(argv: Any = None) -> int:
     if args.context_token_budget < 0:
         print("--context-token-budget must be 0 or greater.", file=sys.stderr)
         return 2
+    if args.min_compression_triggered_tasks < 0:
+        print("--min-compression-triggered-tasks must be 0 or greater.", file=sys.stderr)
+        return 2
     validation_error = _validate_feature_args(args)
     if validation_error:
         print(validation_error, file=sys.stderr)
@@ -177,12 +199,15 @@ def main(argv: Any = None) -> int:
                 repeat=args.repeat,
                 max_steps=args.max_steps,
                 context_token_budget=args.context_token_budget,
+                min_compression_triggered_tasks=args.min_compression_triggered_tasks,
                 test_timeout=args.test_timeout,
                 keep_workspaces=args.keep_workspaces,
                 workspace_root=args.workspace_root,
                 trace_dir=args.trace_dir,
                 quiet=not args.show_agent_output,
                 enable_adaptive_replanning=args.enable_adaptive_replanning,
+                enable_semantic_workspace=args.enable_semantic_workspace,
+                enable_evidence_graph=args.enable_evidence_graph,
                 max_replans=args.max_replans,
                 cost_per_1k_tokens=args.cost_per_1k_tokens,
                 declare_allowed_files=args.declare_allowed_files,
@@ -199,6 +224,15 @@ def main(argv: Any = None) -> int:
         write_markdown_report(report, args.markdown)
 
     print(json.dumps(report["summary"], indent=2, ensure_ascii=False))
+    coverage = report.get("compression_coverage") or {}
+    if not coverage.get("passed", True):
+        print(
+            "Compression coverage gate failed: "
+            f"expected at least {coverage['minimum_triggered_tasks']} distinct tasks, "
+            f"observed {coverage['triggered_tasks']}",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

@@ -343,6 +343,8 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
     metadata = {
         "status": "max_steps",
         "replan_count": 2,
+        "replan_decision_count": 3,
+        "replan_strategy": "simplify_plan_skip_failed_tool",
         "parse_error_count": 3,
         "parse_repair_count": 4,
         "parse_error_context_omitted_count": 5,
@@ -374,11 +376,17 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
         timeout=30,
         trace_dir=None,
         keep_workspace=True,
+        enable_adaptive_replanning=True,
+        max_replans=2,
     )
 
     assert record["dm_diagnostics_version"] == 1
     assert record["dm_steps"] == 2
     assert record["dm_replans"] == 2
+    assert record["dm_replan_decisions"] == 3
+    assert record["dm_replan_strategy"] == "simplify_plan_skip_failed_tool"
+    assert record["dm_adaptive_replanning_enabled"] is True
+    assert record["dm_max_replans"] == 2
     assert record["dm_parse_errors"] == 3
     assert record["dm_parse_repairs"] == 4
     assert record["dm_parse_error_context_omitted_count"] == 5
@@ -436,6 +444,8 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
         enable_semantic_workspace=True,
         enable_repo_map=True,
         enable_verified_edits=True,
+        enable_adaptive_replanning=True,
+        max_replans=2,
     )
 
     capabilities = _FakeAgent.last_kwargs["capabilities"]
@@ -450,6 +460,8 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
     assert verified.policy.check_types is False
     assert verified.policy.finalize_on_run_end is True
     assert _FakeAgent.last_kwargs["enable_repo_map"] is True
+    assert _FakeAgent.last_kwargs["enable_adaptive_replanning"] is True
+    assert _FakeAgent.last_kwargs["max_replans"] == 2
     repository_map = _FakeAgent.last_kwargs["repository_map"]
     assert repository_map.engine is verified.engine
     assert verified.engine is not None

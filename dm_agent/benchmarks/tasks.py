@@ -2186,6 +2186,239 @@ CONTEXT_STRESS_TASKS: list[BenchmarkTask] = [
         tags=["context", "cross-file", "authorization"],
         allowed_changed_files=["permissions.py"],
     ),
+    BenchmarkTask(
+        task_id="context_feature_flags",
+        name="Layered feature flag evaluation",
+        prompt=(
+            "Implement flags.is_enabled by reading docs/flags_contract.md, defaults.py, and "
+            "rollout.py. An explicit user override wins over the default. Unknown flags are "
+            "disabled. A rollout percentage is deterministic from user id and flag name; 0 "
+            "never enables and 100 always enables. Invalid percentages raise ValueError."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "flags.py": (
+                "from defaults import default_for\nfrom rollout import in_rollout\n\n\n"
+                "def is_enabled(name, user, overrides=None):\n    return True\n"
+            ),
+            "defaults.py": "FLAGS = {'search_v2': False, 'compact_ui': True}\n\n\ndef default_for(name):\n    return FLAGS.get(name)\n",
+            "rollout.py": (
+                "import hashlib\n\n\ndef in_rollout(name, user_id, percent):\n"
+                "    return int(hashlib.sha256(f'{name}:{user_id}'.encode()).hexdigest()[:8], 16) % 100 < percent\n"
+            ),
+            "docs/flags_contract.md": (
+                "# Flags\n\nKnown flags have a boolean default. `overrides` maps flag names to booleans "
+                "and has highest precedence. Without an override, a false default remains false; "
+                "a true default is gated by `user['rollout']` when it is present. Missing rollout "
+                "means use the default. Rollout must be an integer from 0 through 100.\n"
+            ),
+            "tests/test_public_flags.py": (
+                "from flags import is_enabled\n\n\ndef test_override_wins():\n"
+                "    assert is_enabled('search_v2', {'id': 'u', 'rollout': 100}, {'search_v2': True}) is True\n\n"
+                "def test_default_true_without_rollout():\n    assert is_enabled('compact_ui', {'id': 'u'}) is True\n"
+            ),
+        },
+        hidden_files={
+            "tests/test_hidden_flags.py": (
+                "import pytest\nfrom flags import is_enabled\n\n\ndef test_unknown_and_boundaries():\n"
+                "    assert is_enabled('missing', {'id': 'u'}) is False\n"
+                "    assert is_enabled('compact_ui', {'id': 'u', 'rollout': 0}) is False\n"
+                "    assert is_enabled('compact_ui', {'id': 'u', 'rollout': 100}) is True\n\n"
+                "def test_invalid_rollout():\n    with pytest.raises(ValueError): is_enabled('compact_ui', {'id': 'u', 'rollout': 101})\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "configuration"],
+        allowed_changed_files=["flags.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_template_render",
+        name="Safe template rendering pipeline",
+        prompt=(
+            "Implement renderer.render using docs/template_contract.md, escaping.py, and "
+            "filters.py. Replace only {{name}} placeholders, HTML-escape ordinary values, "
+            "support the `upper` filter, and reject unknown placeholders or malformed tokens."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "renderer.py": "from escaping import html_escape\nfrom filters import apply_filter\n\n\ndef render(template, values):\n    return template\n",
+            "escaping.py": "def html_escape(value):\n    return str(value).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace(chr(34), '&quot;')\n",
+            "filters.py": "def apply_filter(value, name):\n    if name == 'upper': return str(value).upper()\n    raise ValueError('filter')\n",
+            "docs/template_contract.md": (
+                "# Template contract\n\nA placeholder is exactly `{{name}}` or `{{name|upper}}`; "
+                "names contain letters, digits, and underscores. Values are escaped after filters "
+                "are applied. Missing values, unknown filters, unmatched braces, and nested braces raise ValueError.\n"
+            ),
+            "tests/test_public_renderer.py": "from renderer import render\n\n\ndef test_escapes_and_replaces():\n    assert render('Hi {{name}}', {'name': '<Ada>'}) == 'Hi &lt;Ada&gt;'\n",
+        },
+        hidden_files={
+            "tests/test_hidden_renderer.py": (
+                "import pytest\nfrom renderer import render\n\n\ndef test_filter_and_multiple_values():\n"
+                "    assert render('{{name|upper}}: {{count}}', {'name': 'ada', 'count': 2}) == 'ADA: 2'\n\n"
+                "@pytest.mark.parametrize('template', ['{{missing}}', '{{name|lower}}', '{{name}', '{{{name}}}'])\n"
+                "def test_bad_templates_fail(template):\n    with pytest.raises(ValueError): render(template, {'name': 'Ada'})\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "parsing"],
+        allowed_changed_files=["renderer.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_rate_limit",
+        name="Token bucket rate limiting",
+        prompt=(
+            "Fix limiter.RateLimiter using docs/limiter_contract.md and clock.py. Each key has an "
+            "independent token bucket, time replenishes fractional tokens up to capacity, and a "
+            "request consumes one token only when allowed. Invalid capacity or rate raises ValueError."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "limiter.py": "class RateLimiter:\n    def __init__(self, capacity, rate, clock):\n        self.capacity, self.rate, self.clock, self.buckets = capacity, rate, clock, {}\n\n    def allow(self, key):\n        return True\n",
+            "clock.py": "class FakeClock:\n    def __init__(self): self.now = 0.0\n    def __call__(self): return self.now\n",
+            "docs/limiter_contract.md": (
+                "# Limiter\n\nA new key starts full. Before each request replenish by elapsed seconds times "
+                "rate, capped at capacity; backwards time does not add tokens. Permit only when at "
+                "least one token is available, then subtract exactly one. Capacity and rate must be positive.\n"
+            ),
+            "tests/test_public_limiter.py": "from clock import FakeClock\nfrom limiter import RateLimiter\n\n\ndef test_capacity_is_consumed():\n    c = FakeClock(); limit = RateLimiter(2, 1, c)\n    assert [limit.allow('a') for _ in range(3)] == [True, True, False]\n",
+        },
+        hidden_files={
+            "tests/test_hidden_limiter.py": (
+                "import pytest\nfrom clock import FakeClock\nfrom limiter import RateLimiter\n\n\ndef test_replenishes_per_key():\n"
+                "    c = FakeClock(); limit = RateLimiter(1, 0.5, c)\n    assert limit.allow('a') and not limit.allow('a')\n"
+                "    assert limit.allow('b')\n    c.now = 2\n    assert limit.allow('a')\n\n"
+                "def test_invalid_configuration():\n    with pytest.raises(ValueError): RateLimiter(0, 1, lambda: 0)\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "stateful"],
+        allowed_changed_files=["limiter.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_csv_import",
+        name="Validated CSV import pipeline",
+        prompt=(
+            "Implement importer.import_rows according to docs/import_contract.md, schema.py, and "
+            "normalizers.py. Validate required columns, normalize each row, collect row-specific "
+            "errors without aborting valid rows, and deduplicate valid records by normalized email."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "importer.py": "from normalizers import normalize_row\nfrom schema import REQUIRED\n\n\ndef import_rows(rows):\n    return {'records': rows, 'errors': []}\n",
+            "schema.py": "REQUIRED = ('email', 'name')\n",
+            "normalizers.py": "def normalize_row(row):\n    return {'email': row['email'].strip().lower(), 'name': row['name'].strip()}\n",
+            "docs/import_contract.md": (
+                "# Import\n\nRows are mappings. Missing required columns produces one error with its one-based "
+                "row number. A valid email contains one `@`; a name must be nonempty after trim. "
+                "Keep the first valid normalized email and report later duplicates as errors.\n"
+            ),
+            "tests/test_public_importer.py": "from importer import import_rows\n\n\ndef test_normalizes_valid_rows():\n    assert import_rows([{'email': ' Ada@X.com ', 'name': ' Ada '}])['records'] == [{'email': 'ada@x.com', 'name': 'Ada'}]\n",
+        },
+        hidden_files={
+            "tests/test_hidden_importer.py": (
+                "from importer import import_rows\n\n\ndef test_collects_errors_and_deduplicates():\n"
+                "    result = import_rows([{'email': 'bad', 'name': 'A'}, {'email': 'a@x.com', 'name': ' A '}, {'email': 'A@X.COM', 'name': 'Again'}, {'email': 'b@x.com'}])\n"
+                "    assert result['records'] == [{'email': 'a@x.com', 'name': 'A'}]\n    assert len(result['errors']) == 3\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "validation"],
+        allowed_changed_files=["importer.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_notification_router",
+        name="Preference aware notification routing",
+        prompt=(
+            "Implement notify.route using docs/notification_contract.md, channels.py, and "
+            "preferences.py. Normalize requested channels, apply user opt-outs, use the fallback "
+            "channel only when no requested channel remains, and return delivery targets in priority order."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "notify.py": "from channels import PRIORITY\nfrom preferences import opted_out\n\n\ndef route(user, requested, fallback='email'):\n    return []\n",
+            "channels.py": "PRIORITY = ('push', 'sms', 'email')\nVALID = set(PRIORITY)\n",
+            "preferences.py": "def opted_out(user):\n    return {str(value).strip().lower() for value in user.get('opt_out', [])}\n",
+            "docs/notification_contract.md": (
+                "# Notifications\n\nRequested channels are case-insensitive and duplicates collapse. Ignore invalid "
+                "channels. Remove opted-out channels. Sort remaining channels by PRIORITY. If none "
+                "remain, return the fallback unless it is invalid or opted out; otherwise return an empty list.\n"
+            ),
+            "tests/test_public_notify.py": "from notify import route\n\n\ndef test_sorts_requested_channels():\n    assert route({}, ['email', 'PUSH']) == ['push', 'email']\n",
+        },
+        hidden_files={
+            "tests/test_hidden_notify.py": "from notify import route\n\n\ndef test_opt_out_and_fallback():\n    assert route({'opt_out': ['sms']}, ['SMS', 'bad']) == ['email']\n    assert route({'opt_out': ['email']}, ['bad']) == []\n",
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "routing"],
+        allowed_changed_files=["notify.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_cache_invalidation",
+        name="Dependency aware cache invalidation",
+        prompt=(
+            "Implement cache_store.CacheStore.invalidate using docs/cache_contract.md and graph.py. "
+            "Invalidating a key must remove that key and every transitively dependent key, tolerate "
+            "cycles, and return removed keys in sorted order without touching unrelated entries."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "cache_store.py": "from graph import dependents_of\n\n\nclass CacheStore:\n    def __init__(self, data, dependencies): self.data, self.dependencies = data, dependencies\n    def invalidate(self, key): return []\n",
+            "graph.py": "def dependents_of(dependencies, key):\n    return dependencies.get(key, [])\n",
+            "docs/cache_contract.md": "# Cache invalidation\n\n`dependencies[parent]` lists direct dependents. Traverse transitively, including the requested key even when absent from data. Delete only keys present in data. Cycles must terminate.\n",
+            "tests/test_public_cache_store.py": "from cache_store import CacheStore\n\n\ndef test_removes_direct_dependents():\n    cache = CacheStore({'a': 1, 'b': 2}, {'a': ['b']})\n    assert cache.invalidate('a') == ['a', 'b']\n    assert cache.data == {}\n",
+        },
+        hidden_files={
+            "tests/test_hidden_cache_store.py": "from cache_store import CacheStore\n\n\ndef test_transitive_cycle_and_unrelated_data():\n    cache = CacheStore({'a': 1, 'b': 2, 'c': 3, 'x': 4}, {'a': ['b'], 'b': ['c'], 'c': ['a']})\n    assert cache.invalidate('a') == ['a', 'b', 'c']\n    assert cache.data == {'x': 4}\n",
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "graph"],
+        allowed_changed_files=["cache_store.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_api_pagination",
+        name="Cursor pagination contract",
+        prompt=(
+            "Fix pagination.paginate using docs/pagination_contract.md and cursor.py. Sort records "
+            "by id, validate positive limits up to 100, decode an optional cursor, return at most "
+            "limit records after that id, and emit the next cursor only when more records remain."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "pagination.py": "from cursor import decode, encode\n\n\ndef paginate(records, limit=20, cursor=None):\n    return {'items': records, 'next_cursor': None}\n",
+            "cursor.py": "def encode(value): return str(value)\n\ndef decode(value): return int(value)\n",
+            "docs/pagination_contract.md": "# Pagination\n\nIDs are unique integers. A cursor identifies the last returned id, not an array offset. Bad cursors and limits outside 1..100 raise ValueError. The result shape is `{items: list, next_cursor: str | None}`.\n",
+            "tests/test_public_pagination.py": "from pagination import paginate\n\n\ndef test_returns_sorted_first_page():\n    page = paginate([{'id': 3}, {'id': 1}, {'id': 2}], limit=2)\n    assert page == {'items': [{'id': 1}, {'id': 2}], 'next_cursor': '2'}\n",
+        },
+        hidden_files={
+            "tests/test_hidden_pagination.py": "import pytest\nfrom pagination import paginate\n\n\ndef test_cursor_and_last_page():\n    assert paginate([{'id': 1}, {'id': 2}, {'id': 3}], 2, '2') == {'items': [{'id': 3}], 'next_cursor': None}\n\ndef test_invalid_inputs():\n    with pytest.raises(ValueError): paginate([], 0)\n    with pytest.raises(ValueError): paginate([], 1, 'bad')\n",
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "api"],
+        allowed_changed_files=["pagination.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_report_pipeline",
+        name="Normalized report aggregation",
+        prompt=(
+            "Implement reports.build_report using docs/report_contract.md, grouping.py, and "
+            "formatting.py. Normalize categories, ignore invalid amounts, aggregate totals and "
+            "counts, and return categories sorted by descending total then name with formatted totals."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "reports.py": "from formatting import money\nfrom grouping import normalized_category\n\n\ndef build_report(rows):\n    return []\n",
+            "grouping.py": "def normalized_category(value):\n    return str(value or '').strip().lower()\n",
+            "formatting.py": "def money(value):\n    return f'${value:.2f}'\n",
+            "docs/report_contract.md": "# Report\n\nA usable row has a nonempty normalized category and a numeric non-boolean amount. Aggregate `count` and raw numeric `total`; expose `formatted_total` via money. Do not mutate rows.\n",
+            "tests/test_public_reports.py": "from reports import build_report\n\n\ndef test_aggregates_categories():\n    assert build_report([{'category': 'Books', 'amount': 2}, {'category': ' books ', 'amount': 3}]) == [{'category': 'books', 'count': 2, 'total': 5, 'formatted_total': '$5.00'}]\n",
+        },
+        hidden_files={
+            "tests/test_hidden_reports.py": "from reports import build_report\n\n\ndef test_sorting_and_invalid_rows():\n    rows = [{'category': 'B', 'amount': 2}, {'category': 'a', 'amount': 2}, {'category': '', 'amount': 4}, {'category': 'a', 'amount': True}]\n    assert build_report(rows) == [{'category': 'a', 'count': 1, 'total': 2, 'formatted_total': '$2.00'}, {'category': 'b', 'count': 1, 'total': 2, 'formatted_total': '$2.00'}]\n",
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "aggregation"],
+        allowed_changed_files=["reports.py"],
+    ),
 ]
 
 BUILTIN_CONTEXT_TASKS = [

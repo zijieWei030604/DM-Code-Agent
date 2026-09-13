@@ -116,6 +116,17 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Record and summarize decision evidence for each prediction.",
     )
+    parser.add_argument(
+        "--enable-adaptive-replanning",
+        action="store_true",
+        help="Enable deterministic error-signal-aware replanning for each prediction.",
+    )
+    parser.add_argument(
+        "--max-replans",
+        type=int,
+        default=-1,
+        help="Maximum adaptive replans; -1 means unlimited.",
+    )
     parser.add_argument("--cache", type=Path, default=DEFAULT_CACHE)
     parser.add_argument(
         "--selection-manifest",
@@ -143,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.limit < 0:
         parser.error("--limit must be non-negative")
+    if args.max_replans < -1:
+        parser.error("--max-replans must be -1 or greater")
 
     manifest_path = args.selection_manifest or _default_manifest_path(args.output)
     candidates = fetch_instances(cache_path=args.cache)
@@ -249,6 +262,8 @@ def main(argv: list[str] | None = None) -> int:
                     enable_repo_map=args.enable_repo_map,
                     enable_verified_edits=args.enable_verified_edits,
                     enable_evidence_graph=args.enable_evidence_graph,
+                    enable_adaptive_replanning=args.enable_adaptive_replanning,
+                    max_replans=args.max_replans,
                 )
             except Exception as exc:  # 拉镜像/磁盘等环境问题：记下来继续下一题
                 record = {

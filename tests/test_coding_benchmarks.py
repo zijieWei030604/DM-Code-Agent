@@ -85,17 +85,33 @@ def test_maintenance_benchmark_manifest_is_realistic_and_keyless():
     assert bench_main(["--suite", "maintenance", "--list"]) == 0
 
 
-def test_context_suite_is_separate_from_the_30_task_scoreboard_and_has_twelve_tasks():
+def test_context_suite_is_separate_from_the_30_task_scoreboard_and_has_twenty_tasks():
     context_tasks = get_context_tasks()
     all_tasks = get_benchmark_tasks("all")
 
     assert len(all_tasks) == 30
-    assert len(context_tasks) == 12
-    assert len({task.task_id for task in context_tasks}) == 12
-    assert {"ttl_cache_lru", "log_redaction", "context_config_resolution"}.issubset(
-        {task.task_id for task in context_tasks}
-    )
+    assert len(context_tasks) == 20
+    assert len({task.task_id for task in context_tasks}) == 20
+    assert {
+        "ttl_cache_lru",
+        "log_redaction",
+        "context_config_resolution",
+        "context_report_pipeline",
+    }.issubset({task.task_id for task in context_tasks})
     assert all(task.max_steps >= 30 for task in context_tasks if "context" in task.tags)
+
+
+def test_context_tasks_fail_hidden_tests_initially_and_protect_hidden_files(tmp_path):
+    """The dedicated context suite remains a real, isolated benchmark."""
+    offenders = []
+    for index, task in enumerate(get_context_tasks()):
+        workspace = tmp_path / f"context{index}"
+        workspace.mkdir()
+        prepare_workspace(task, workspace, include_hidden=True)
+        if run_hidden_tests(task, workspace).returncode == 0:
+            offenders.append(task.task_id)
+        assert not (set(task.allowed_changed_files) & set(task.hidden_files))
+    assert offenders == []
 
 
 def test_benchmark_context_budget_is_passed_to_agent_and_reported(monkeypatch: pytest.MonkeyPatch):
@@ -109,18 +125,41 @@ def test_benchmark_context_budget_is_passed_to_agent_and_reported(monkeypatch: p
         def run(self, prompt):
             return {"final_answer": "ok", "steps": [], "metadata": {"status": "success"}}
 
+    class FakeWorkspaceEngine:
+        def __init__(self, root, *, database_path):
+            seen["workspace_root"] = root
+            seen["workspace_database_path"] = database_path
+
+        def close(self):
+            seen["workspace_closed"] = True
+
     monkeypatch.setattr(runner_module, "ReactAgent", FakeAgent)
+    monkeypatch.setattr(runner_module, "SemanticWorkspaceEngine", FakeWorkspaceEngine)
     monkeypatch.setattr(
         runner_module, "run_hidden_tests", lambda *args, **kwargs: CommandResult([], 0, "", "", 0.0)
     )
     result = runner_module.run_benchmark_task(
         task,
         DEFAULT_BENCH_VARIANTS[0],
-        BenchmarkRunConfig(context_token_budget=8000),
+        BenchmarkRunConfig(
+            context_token_budget=8000,
+            enable_semantic_workspace=True,
+            enable_evidence_graph=True,
+        ),
         suite="context",
     )
 
     assert seen["context_token_budget"] == 8000
+    assert seen["enable_semantic_workspace"] is True
+    assert seen["enable_repo_map"] is False
+    assert {type(capability).__name__ for capability in seen["capabilities"]} == {
+        "EvidenceGraphCapability",
+        "SemanticWorkspaceCapability",
+    }
+    assert seen["workspace_database_path"].parent != seen["workspace_root"]
+    assert result.metadata["semantic_workspace_enabled"] is True
+    assert result.metadata["evidence_graph_enabled"] is True
+    assert result.metadata["repo_map_enabled"] is False
     assert result.metadata["context_token_budget"] == 8000
 
 
@@ -176,11 +215,18 @@ def test_benchmark_report_includes_default_off_feature_flags(monkeypatch: pytest
         tasks=[task],
         config=BenchmarkRunConfig(
             enable_adaptive_replanning=True,
+            enable_semantic_workspace=True,
+            enable_evidence_graph=True,
         ),
     )
 
     assert report["manifest"]["task_fingerprints"][task.task_id]
     assert report["manifest"]["suite_signature"]
+    assert report["runtime_capabilities"] == {
+        "semantic_workspace": True,
+        "evidence_graph": True,
+        "repo_map": False,
+    }
 
 
 def test_benchmark_task_fingerprint_detects_hidden_contract_drift():
@@ -337,6 +383,44 @@ def test_benchmark_summary_includes_wilson_confidence_intervals():
     assert 0.0 <= interval["low"] < summary["overall_pass_rate"] < interval["high"] <= 1.0
     variant_interval = summary["variants"]["full"]["pass_rate_ci_95"]
     assert variant_interval == interval
+
+
+def test_benchmark_summary_reports_accepted_compaction_only():
+    accepted = _bench_result_with_metadata(
+        "compressed",
+        success=True,
+        final_answer="ok",
+        tokens=100,
+        metadata={
+            "accepted_compaction": {
+                "accepted_events": 2,
+                "estimated_tokens_before": 1000,
+                "estimated_tokens_after": 800,
+                "saved_tokens": 200,
+            }
+        },
+    )
+    attempted_only = _bench_result_with_metadata(
+        "rejected",
+        success=True,
+        final_answer="ok",
+        tokens=100,
+        metadata={
+            "accepted_compaction": {
+                "accepted_events": 0,
+                "estimated_tokens_before": 0,
+                "estimated_tokens_after": 0,
+                "saved_tokens": 0,
+            }
+        },
+    )
+
+    compression = summarize_benchmark_results([accepted, attempted_only])["compression"]["full"]
+
+    assert compression["triggered_unique_tasks"] == 1
+    assert compression["accepted_events"] == 2
+    assert compression["saved_tokens"] == 200
+    assert compression["direct_reduction_rate"] == pytest.approx(0.2)
 
 
 def test_hidden_tests_fail_on_initial_slugify_workspace(tmp_path):

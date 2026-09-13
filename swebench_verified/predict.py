@@ -430,6 +430,8 @@ def predict_one(
     enable_repo_map: bool = False,
     enable_verified_edits: bool = False,
     enable_evidence_graph: bool = False,
+    enable_adaptive_replanning: bool = False,
+    max_replans: int = -1,
 ) -> dict[str, Any]:
     """跑完一道题，返回一条预测记录（含足够的诊断字段）。"""
     instance_id = instance["instance_id"]
@@ -463,6 +465,8 @@ def predict_one(
                     "semantic_impact_enabled": enable_semantic_workspace,
                     "verified_edits_enabled": enable_verified_edits,
                     "evidence_graph_enabled": enable_evidence_graph,
+                    "adaptive_replanning_enabled": enable_adaptive_replanning,
+                    "max_replans": max_replans,
                 },
             )
 
@@ -499,6 +503,8 @@ def predict_one(
                 else None
             ),
             capabilities=capabilities,
+            enable_adaptive_replanning=enable_adaptive_replanning,
+            max_replans=max_replans,
         )
         prompt = PROMPT_TEMPLATE.format(
             repo=instance["repo"],
@@ -546,6 +552,8 @@ def predict_one(
             "dm_container_image": container_image,
             "dm_container_exec_count": execution_backend.stats.calls,
             "dm_container_exec_failures": execution_backend.stats.failures,
+            "dm_adaptive_replanning_enabled": enable_adaptive_replanning,
+            "dm_max_replans": max_replans,
         }
         if diagnostics_measured:
             # 下面是诊断字段，官方 harness 会忽略，但我们自己要看。Agent 异常时
@@ -555,6 +563,8 @@ def predict_one(
                     "dm_diagnostics_version": 1,
                     "dm_steps": step_count,
                     "dm_replans": metadata.get("replan_count", 0),
+                    "dm_replan_decisions": metadata.get("replan_decision_count", 0),
+                    "dm_replan_strategy": metadata.get("replan_strategy", ""),
                     "dm_parse_errors": metadata.get("parse_error_count", 0),
                     "dm_parse_repairs": metadata.get("parse_repair_count", 0),
                     "dm_parse_error_context_omitted_count": metadata.get(
