@@ -118,6 +118,9 @@ def run_benchmark_suite(
         "token_economics": {
             "cost_per_1k_tokens": config.cost_per_1k_tokens,
         },
+        "context_policy": {
+            "context_token_budget": config.context_token_budget,
+        },
         "summary": summarize_benchmark_results(results, tasks=selected_tasks),
         "manifest": build_benchmark_manifest(
             suite=suite,
@@ -643,6 +646,7 @@ def _run_benchmark_task_in_workspace(
                 "model": client.model,
                 "base_url": client.base_url,
                 "repeat_index": repeat_index,
+                "context_token_budget": config.context_token_budget,
             },
         )
 
@@ -658,6 +662,7 @@ def _run_benchmark_task_in_workspace(
         temperature=config.temperature,
         enable_planning=variant.enable_planning,
         enable_compression=variant.enable_compression,
+        context_token_budget=config.context_token_budget,
         skill_manager=skill_manager,
         trace_writer=trace_writer,
         enable_adaptive_replanning=config.enable_adaptive_replanning,
@@ -722,6 +727,7 @@ def _run_benchmark_task_in_workspace(
             "trace_path": str(trace_path) if trace_path else "",
             "adaptive_replanning_enabled": config.enable_adaptive_replanning,
             "max_replans": config.max_replans,
+            "context_token_budget": config.context_token_budget,
             "declare_allowed_files": config.declare_allowed_files,
             "cost_per_1k_tokens": config.cost_per_1k_tokens,
         }

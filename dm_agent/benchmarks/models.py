@@ -92,6 +92,8 @@ class BenchmarkRunConfig:
     temperature: float = 0.0
     repeat: int = 1
     max_steps: int | None = None
+    # Keep the runtime budget explicit so compression A/B reports are reproducible.
+    context_token_budget: int = 24000
     test_timeout: int = 30
     keep_workspaces: bool = False
     workspace_root: str | None = None

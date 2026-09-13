@@ -33,7 +33,12 @@ from dm_agent.benchmarks.runner import (
     summarize_benchmark_results,
     write_markdown_report,
 )
-from dm_agent.benchmarks.tasks import get_benchmark_tasks, get_coding_tasks, get_maintenance_tasks
+from dm_agent.benchmarks.tasks import (
+    get_benchmark_tasks,
+    get_coding_tasks,
+    get_context_tasks,
+    get_maintenance_tasks,
+)
 from dm_agent.tracing import TraceWriter
 
 
@@ -78,6 +83,45 @@ def test_maintenance_benchmark_manifest_is_realistic_and_keyless():
     assert all("Hidden tests will be added" in task.prompt for task in tasks)
     assert any(task.required_changed_files for task in tasks)
     assert bench_main(["--suite", "maintenance", "--list"]) == 0
+
+
+def test_context_suite_is_separate_from_the_30_task_scoreboard_and_has_twelve_tasks():
+    context_tasks = get_context_tasks()
+    all_tasks = get_benchmark_tasks("all")
+
+    assert len(all_tasks) == 30
+    assert len(context_tasks) == 12
+    assert len({task.task_id for task in context_tasks}) == 12
+    assert {"ttl_cache_lru", "log_redaction", "context_config_resolution"}.issubset(
+        {task.task_id for task in context_tasks}
+    )
+    assert all(task.max_steps >= 30 for task in context_tasks if "context" in task.tags)
+
+
+def test_benchmark_context_budget_is_passed_to_agent_and_reported(monkeypatch: pytest.MonkeyPatch):
+    task = get_context_tasks(["context_config_resolution"])[0]
+    seen = {}
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            seen.update(kwargs)
+
+        def run(self, prompt):
+            return {"final_answer": "ok", "steps": [], "metadata": {"status": "success"}}
+
+    monkeypatch.setattr(runner_module, "ReactAgent", FakeAgent)
+    monkeypatch.setattr(
+        runner_module, "run_hidden_tests", lambda *args, **kwargs: CommandResult([], 0, "", "", 0.0)
+    )
+    result = runner_module.run_benchmark_task(
+        task,
+        DEFAULT_BENCH_VARIANTS[0],
+        BenchmarkRunConfig(context_token_budget=8000),
+        suite="context",
+    )
+
+    assert seen["context_token_budget"] == 8000
+    assert result.metadata["context_token_budget"] == 8000
 
 
 def test_benchmark_suite_selector_filters_tasks():

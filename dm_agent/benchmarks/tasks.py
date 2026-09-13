@@ -1872,12 +1872,335 @@ BUILTIN_MAINTENANCE_TASKS: list[BenchmarkTask] = [
     ),
 ]
 
+# This suite is intentionally separate from the 30-task scoreboard.  The first
+# seven tasks are historical long trajectories; the remaining five distribute
+# the contract over multiple source files and documentation so that a fixed
+# context budget can exercise compaction in a repeatable way.
+CONTEXT_NATURAL_TASK_IDS = frozenset(
+    {
+        "ttl_cache_lru",
+        "safe_int_parse",
+        "packaging_ci_contract",
+        "sql_where_builder",
+        "filename_sanitizer",
+        "error_propagation_contract",
+        "log_redaction",
+    }
+)
+
+CONTEXT_STRESS_TASKS: list[BenchmarkTask] = [
+    BenchmarkTask(
+        task_id="context_config_resolution",
+        name="Layered configuration resolution",
+        prompt=(
+            "Implement config.resolve_settings. Read docs/config_contract.md and the helper "
+            "modules before editing. Merge defaults, environment values, and CLI values in that "
+            "order of precedence. Empty strings mean unset. PORT must be an integer from 1 to "
+            "65535, DEBUG accepts true/false/1/0 case-insensitively, and invalid values raise "
+            "ValueError naming the invalid key." + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "config.py": (
+                "from env_values import read_env\nfrom normalize import as_bool, as_port\n\n\n"
+                "DEFAULTS = {'host': '127.0.0.1', 'port': 8000, 'debug': False}\n\n\n"
+                "def resolve_settings(environ, cli):\n"
+                "    return dict(DEFAULTS)\n"
+            ),
+            "env_values.py": (
+                "def read_env(environ):\n"
+                "    return {key.lower()[4:]: value for key, value in environ.items() "
+                "if key.startswith('APP_')}\n"
+            ),
+            "normalize.py": (
+                "def as_port(value):\n"
+                "    return int(value)\n\n\n"
+                "def as_bool(value):\n"
+                "    return bool(value)\n"
+            ),
+            "docs/config_contract.md": (
+                "# Configuration contract\n\n"
+                "Only `host`, `port`, and `debug` are supported. Values from `cli` override "
+                "APP_* environment values, which override defaults. Ignore missing keys and "
+                "empty-string values. Preserve the canonical Python types: host=str, port=int, "
+                "debug=bool. Error messages must mention `port` or `debug` respectively.\n"
+            ),
+            "tests/test_public_config.py": (
+                "from config import resolve_settings\n\n\n"
+                "def test_environment_overrides_defaults():\n"
+                "    assert resolve_settings({'APP_HOST': '0.0.0.0', 'APP_PORT': '9000'}, {}) == "
+                "{'host': '0.0.0.0', 'port': 9000, 'debug': False}\n\n\n"
+                "def test_cli_has_highest_precedence():\n"
+                "    result = resolve_settings({'APP_PORT': '9000'}, {'port': '9100', 'debug': 'true'})\n"
+                "    assert result['port'] == 9100\n"
+                "    assert result['debug'] is True\n"
+            ),
+        },
+        hidden_files={
+            "tests/test_hidden_config.py": (
+                "import pytest\nfrom config import resolve_settings\n\n\n"
+                "def test_empty_values_are_unset_and_boolean_is_normalized():\n"
+                "    result = resolve_settings({'APP_HOST': '', 'APP_DEBUG': '0'}, {})\n"
+                "    assert result == {'host': '127.0.0.1', 'port': 8000, 'debug': False}\n\n\n"
+                "@pytest.mark.parametrize('key,value', [('port', '0'), ('port', 'bad'), ('debug', 'maybe')])\n"
+                "def test_invalid_values_name_the_key(key, value):\n"
+                "    with pytest.raises(ValueError, match=key):\n"
+                "        resolve_settings({}, {key: value})\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "configuration"],
+        allowed_changed_files=["config.py", "normalize.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_event_dispatch",
+        name="Filtered event dispatch with audit records",
+        prompt=(
+            "Implement EventDispatcher.publish according to docs/event_contract.md. Inspect the "
+            "event, filter, and audit modules first. A handler receives an isolated shallow copy of the "
+            "event only when all declared filters match. Handlers run in registration order. "
+            "Record one audit entry per handler attempt, including skipped handlers; a handler "
+            "exception is recorded and does not stop later handlers." + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "events.py": (
+                "from audit import AuditLog\nfrom filters import matches\n\n\n"
+                "class EventDispatcher:\n"
+                "    def __init__(self, audit=None):\n"
+                "        self.handlers = []\n"
+                "        self.audit = audit or AuditLog()\n\n"
+                "    def register(self, name, callback, filters=None):\n"
+                "        self.handlers.append((name, callback, filters or {}))\n\n"
+                "    def publish(self, event):\n"
+                "        return []\n"
+            ),
+            "filters.py": (
+                "def matches(event, filters):\n"
+                "    return all(event.get(key) == value for key, value in filters.items())\n"
+            ),
+            "audit.py": (
+                "class AuditLog:\n"
+                "    def __init__(self):\n"
+                "        self.entries = []\n\n"
+                "    def record(self, name, status, detail=''):\n"
+                "        self.entries.append({'name': name, 'status': status, 'detail': detail})\n"
+            ),
+            "docs/event_contract.md": (
+                "# Event dispatch contract\n\nEach handler entry contains a name, callback, and "
+                "exact-match filters. A non-matching handler produces `skipped`; a successful "
+                "callback produces `delivered`; an exception produces `failed` with the exception "
+                "text. Callbacks must receive a shallow copy so their mutation cannot change the "
+                "caller event or the next callback's event. Return delivered handler names only.\n"
+            ),
+            "tests/test_public_events.py": (
+                "from events import EventDispatcher\n\n\n"
+                "def test_matching_handlers_run_in_order():\n"
+                "    seen = []\n    bus = EventDispatcher()\n"
+                "    bus.register('first', lambda event: seen.append(event['id']))\n"
+                "    bus.register('second', lambda event: seen.append(event['id']), {'kind': 'created'})\n"
+                "    assert bus.publish({'id': 3, 'kind': 'created'}) == ['first', 'second']\n"
+                "    assert seen == [3, 3]\n"
+            ),
+        },
+        hidden_files={
+            "tests/test_hidden_events.py": (
+                "from events import EventDispatcher\n\n\n"
+                "def test_skips_failures_and_mutation_are_isolated():\n"
+                "    bus = EventDispatcher()\n"
+                "    bus.register('skip', lambda event: None, {'kind': 'other'})\n"
+                "    bus.register('mutate', lambda event: event.update({'id': 99}))\n"
+                "    bus.register('broken', lambda event: (_ for _ in ()).throw(RuntimeError('boom')))\n"
+                "    received = []\n    bus.register('last', lambda event: received.append(event['id']))\n"
+                "    event = {'id': 1, 'kind': 'created'}\n"
+                "    assert bus.publish(event) == ['mutate', 'last']\n"
+                "    assert event['id'] == 1 and received == [1]\n"
+                "    assert [item['status'] for item in bus.audit.entries] == ['skipped', 'delivered', 'failed', 'delivered']\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "events"],
+        allowed_changed_files=["events.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_retry_pipeline",
+        name="Retry pipeline with backoff policy",
+        prompt=(
+            "Fix retry.run_with_retry using docs/retry_contract.md, policy.py, and metrics.py. "
+            "Retry only RetryableError, call the supplied sleep function between retries, and "
+            "use exponential delays capped by the policy. Record every attempt and return the "
+            "successful value. Non-retryable exceptions must be raised immediately."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "retry.py": (
+                "from metrics import AttemptLog\nfrom policy import RetryableError\n\n\n"
+                "def run_with_retry(operation, policy, sleep, log=None):\n"
+                "    return operation()\n"
+            ),
+            "policy.py": (
+                "class RetryableError(Exception):\n    pass\n\n\n"
+                "class RetryPolicy:\n"
+                "    def __init__(self, attempts=3, initial_delay=1, max_delay=8):\n"
+                "        self.attempts = attempts\n        self.initial_delay = initial_delay\n        self.max_delay = max_delay\n\n"
+                "    def delay_for(self, retry_index):\n"
+                "        return min(self.initial_delay * (2 ** retry_index), self.max_delay)\n"
+            ),
+            "metrics.py": (
+                "class AttemptLog:\n"
+                "    def __init__(self):\n        self.events = []\n\n"
+                "    def record(self, attempt, status):\n        self.events.append((attempt, status))\n"
+            ),
+            "docs/retry_contract.md": (
+                "# Retry contract\n\nAttempts are numbered from one. Record `success`, `retry`, or "
+                "`failed` for every attempted operation. `attempts` is the total operation limit, "
+                "not the retry count. Sleep only before a future retry; the first delay is "
+                "delay_for(0). On the final RetryableError, record failed and re-raise it.\n"
+            ),
+            "tests/test_public_retry.py": (
+                "from policy import RetryPolicy, RetryableError\nfrom retry import run_with_retry\n\n\n"
+                "def test_retries_then_returns_value():\n"
+                "    calls, delays = [], []\n"
+                "    def operation():\n        calls.append(1)\n        if len(calls) < 3: raise RetryableError('later')\n        return 'ok'\n"
+                "    assert run_with_retry(operation, RetryPolicy(), delays.append) == 'ok'\n"
+                "    assert delays == [1, 2]\n"
+            ),
+        },
+        hidden_files={
+            "tests/test_hidden_retry.py": (
+                "import pytest\nfrom metrics import AttemptLog\nfrom policy import RetryPolicy, RetryableError\nfrom retry import run_with_retry\n\n\n"
+                "def test_final_retryable_error_is_recorded_and_reraised():\n"
+                "    log = AttemptLog()\n"
+                "    with pytest.raises(RetryableError):\n"
+                "        run_with_retry(lambda: (_ for _ in ()).throw(RetryableError('x')), RetryPolicy(attempts=2), lambda _: None, log)\n"
+                "    assert log.events == [(1, 'retry'), (2, 'failed')]\n\n\n"
+                "def test_non_retryable_error_does_not_sleep():\n"
+                "    with pytest.raises(ValueError):\n"
+                "        run_with_retry(lambda: (_ for _ in ()).throw(ValueError('bad')), RetryPolicy(), lambda _: (_ for _ in ()).throw(AssertionError()))\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "retry"],
+        allowed_changed_files=["retry.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_schema_migration",
+        name="Versioned record migration",
+        prompt=(
+            "Implement migration.migrate_record by reading docs/schema_contract.md, validators.py, "
+            "and storage.py. Convert version 1 records to version 2, preserve unknown fields, "
+            "normalize email, and validate the final record. Version 2 input must be copied and "
+            "validated without mutation; unsupported versions raise ValueError."
+            + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "migration.py": (
+                "from validators import validate_v2\n\n\n"
+                "def migrate_record(record):\n"
+                "    return record\n"
+            ),
+            "validators.py": (
+                "def validate_v2(record):\n"
+                "    if record.get('version') != 2: raise ValueError('version')\n"
+                "    if not isinstance(record.get('email'), str) or '@' not in record['email']: raise ValueError('email')\n"
+                "    if not isinstance(record.get('name'), str) or not record['name'].strip(): raise ValueError('name')\n"
+                "    return record\n"
+            ),
+            "storage.py": ("def copy_record(record):\n" "    return dict(record)\n"),
+            "docs/schema_contract.md": (
+                "# Record schema\n\nV1 uses `user_email` and `display_name`; V2 uses `email`, "
+                "`name`, and integer `version=2`. Trim name and lowercase/trim email during V1 "
+                "migration. Do not drop unknown keys such as `source`. All returned records must "
+                "be detached copies, including already-V2 input.\n"
+            ),
+            "tests/test_public_migration.py": (
+                "from migration import migrate_record\n\n\n"
+                "def test_migrates_v1_fields():\n"
+                "    assert migrate_record({'version': 1, 'user_email': ' Ada@EXAMPLE.com ', 'display_name': ' Ada '}) == {'version': 2, 'email': 'ada@example.com', 'name': 'Ada'}\n"
+            ),
+        },
+        hidden_files={
+            "tests/test_hidden_migration.py": (
+                "import pytest\nfrom migration import migrate_record\n\n\n"
+                "def test_preserves_unknown_fields_and_does_not_mutate_v2():\n"
+                "    v1 = {'version': 1, 'user_email': 'x@y.com', 'display_name': 'X', 'source': 'old'}\n"
+                "    assert migrate_record(v1)['source'] == 'old'\n"
+                "    v2 = {'version': 2, 'email': 'x@y.com', 'name': 'X'}\n    result = migrate_record(v2)\n"
+                "    assert result == v2 and result is not v2\n\n\n"
+                "def test_invalid_and_unknown_versions_fail():\n"
+                "    with pytest.raises(ValueError): migrate_record({'version': 3, 'email': 'x@y.com', 'name': 'X'})\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "migration"],
+        allowed_changed_files=["migration.py"],
+    ),
+    BenchmarkTask(
+        task_id="context_permission_pipeline",
+        name="Role and resource permission pipeline",
+        prompt=(
+            "Fix permissions.authorize using docs/permission_contract.md, roles.py, and resource.py. "
+            "Normalize action names, resolve role permissions, enforce owner-only write access, and "
+            "return a reason code instead of raising. Read all modules before editing because the "
+            "contract intentionally splits policy and data normalization." + COMMON_PROMPT_SUFFIX
+        ),
+        setup_files={
+            "permissions.py": (
+                "from resource import normalized_owner\nfrom roles import permissions_for\n\n\n"
+                "def authorize(user, resource, action):\n"
+                "    return {'allowed': True, 'reason': 'allowed'}\n"
+            ),
+            "roles.py": (
+                "ROLE_PERMISSIONS = {'viewer': {'read'}, 'editor': {'read', 'write'}, 'admin': {'read', 'write', 'delete'}}\n"
+                "def permissions_for(role):\n    return ROLE_PERMISSIONS.get(role, set())\n"
+            ),
+            "resource.py": (
+                "def normalized_owner(resource):\n    return str(resource.get('owner_id', '')).strip()\n"
+            ),
+            "docs/permission_contract.md": (
+                "# Permission contract\n\nActions are normalized by trim + lowercase. Unknown user roles "
+                "have no permissions. Admins may perform every listed action. Editors may write "
+                "only resources whose normalized owner_id equals the user's id; viewers may only "
+                "read. Return `{allowed: bool, reason: str}` where reason is one of `allowed`, "
+                "`unknown_action`, `role_denied`, or `owner_required`.\n"
+            ),
+            "tests/test_public_permissions.py": (
+                "from permissions import authorize\n\n\n"
+                "def test_viewer_and_admin_permissions():\n"
+                "    resource = {'owner_id': '7'}\n"
+                "    assert authorize({'id': '7', 'role': 'viewer'}, resource, 'read')['allowed']\n"
+                "    assert authorize({'id': '8', 'role': 'admin'}, resource, ' DELETE ')['allowed']\n"
+            ),
+        },
+        hidden_files={
+            "tests/test_hidden_permissions.py": (
+                "from permissions import authorize\n\n\n"
+                "def test_editor_requires_owner_for_write_and_unknown_actions_are_denied():\n"
+                "    resource = {'owner_id': ' 7 '}\n"
+                "    assert authorize({'id': '7', 'role': 'editor'}, resource, 'WRITE')['reason'] == 'allowed'\n"
+                "    assert authorize({'id': '8', 'role': 'editor'}, resource, 'write')['reason'] == 'owner_required'\n"
+                "    assert authorize({'id': '7', 'role': 'admin'}, resource, 'publish')['reason'] == 'unknown_action'\n\n\n"
+                "def test_unknown_role_is_denied():\n"
+                "    assert authorize({'id': '7', 'role': 'guest'}, {'owner_id': '7'}, 'read')['reason'] == 'role_denied'\n"
+            )
+        },
+        max_steps=30,
+        tags=["context", "cross-file", "authorization"],
+        allowed_changed_files=["permissions.py"],
+    ),
+]
+
+BUILTIN_CONTEXT_TASKS = [
+    task
+    for task in [*BUILTIN_CODING_TASKS, *BUILTIN_MAINTENANCE_TASKS]
+    if task.task_id in CONTEXT_NATURAL_TASK_IDS
+] + CONTEXT_STRESS_TASKS
+
 BENCHMARK_SUITES = {
     "coding": BUILTIN_CODING_TASKS,
     "maintenance": BUILTIN_MAINTENANCE_TASKS,
     # 记分牌：两个套件合起来跑一次，出一个 overall_pass_rate。
     # 想对照「改了策略有没有变好」就用这个，别分两次跑再心算。
     "all": BUILTIN_CODING_TASKS + BUILTIN_MAINTENANCE_TASKS,
+    "context": BUILTIN_CONTEXT_TASKS,
 }
 
 
@@ -1887,6 +2210,10 @@ def get_coding_tasks(task_ids: Iterable[str] | None = None) -> list[BenchmarkTas
 
 def get_maintenance_tasks(task_ids: Iterable[str] | None = None) -> list[BenchmarkTask]:
     return get_benchmark_tasks("maintenance", task_ids)
+
+
+def get_context_tasks(task_ids: Iterable[str] | None = None) -> list[BenchmarkTask]:
+    return get_benchmark_tasks("context", task_ids)
 
 
 def get_benchmark_tasks(

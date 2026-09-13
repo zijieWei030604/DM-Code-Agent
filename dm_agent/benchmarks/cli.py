@@ -51,6 +51,12 @@ def parse_args(argv: Any = None) -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1, help="Repeat count per task/variant.")
     parser.add_argument("--max-steps", type=int, help="Override task max steps.")
     parser.add_argument(
+        "--context-token-budget",
+        type=int,
+        default=24000,
+        help="Estimated context-token budget; 0 disables budget-triggered compression.",
+    )
+    parser.add_argument(
         "--enable-adaptive-replanning",
         action="store_true",
         help="Enable deterministic error-signal-aware replanning. Default is off.",
@@ -113,6 +119,9 @@ def main(argv: Any = None) -> int:
     if args.max_replans < -1:
         print("--max-replans must be -1 or greater.", file=sys.stderr)
         return 2
+    if args.context_token_budget < 0:
+        print("--context-token-budget must be 0 or greater.", file=sys.stderr)
+        return 2
     validation_error = _validate_feature_args(args)
     if validation_error:
         print(validation_error, file=sys.stderr)
@@ -167,6 +176,7 @@ def main(argv: Any = None) -> int:
                 temperature=args.temperature,
                 repeat=args.repeat,
                 max_steps=args.max_steps,
+                context_token_budget=args.context_token_budget,
                 test_timeout=args.test_timeout,
                 keep_workspaces=args.keep_workspaces,
                 workspace_root=args.workspace_root,
