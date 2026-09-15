@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from dm_agent.core.capabilities import CapabilityContext
@@ -116,6 +117,10 @@ class SemanticWorkspaceCapability:
                 "step_number": event.step_number,
                 "revision": self._impact_revision,
                 "chars": len(summary),
+                # Persist exactly the bounded text sent to the model so offline
+                # analysis can audit candidate paths rather than just counts.
+                "content": summary,
+                "sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest(),
             },
         )
 

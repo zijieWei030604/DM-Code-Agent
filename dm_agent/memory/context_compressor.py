@@ -17,9 +17,9 @@ from typing import Any
 from dm_agent.clients.base_client import BaseLLMClient
 
 from .context_budget import estimate_messages_tokens
+from .retrieval import MemoryTokenCache, MemoryTokenizer, bm25_scores
 
 MEMORY_TYPES = {"episodic", "semantic", "procedural"}
-_TOKEN_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+|[\u4e00-\u9fff]+")
 _FILE_PATTERN = re.compile(
     r"(?<![\w./\\-])([\w./\\-]+\.(?:py|md|toml|json|yaml|yml|txt|ini|cfg|js|ts|tsx|jsx|css|html))"
 )
@@ -87,6 +87,8 @@ class Mem0StyleMemory:
         self.max_items = max_items
         self.superseded_count = 0
         self._items: dict[str, MemoryItem] = {}
+        self._tokenizer = MemoryTokenizer()
+        self._token_cache = MemoryTokenCache(self._tokenizer)
 
     def __len__(self) -> int:
         return len(self._items)
@@ -97,6 +99,7 @@ class Mem0StyleMemory:
 
     def clear(self) -> None:
         self._items.clear()
+        self._token_cache.clear()
         self.superseded_count = 0
 
     def capture_rollback_state(self) -> Any:
@@ -149,6 +152,7 @@ class Mem0StyleMemory:
         existing = self._items.get(memory_id)
         if existing:
             existing.metadata = _merge_metadata(existing.metadata, metadata)
+            self._token_cache.discard(memory_id)
             existing.reinforce(turn=turn)
             return memory_id
 
@@ -272,7 +276,8 @@ class Mem0StyleMemory:
     ) -> list[MemoryHit]:
         if limit < 1:
             return []
-        query_tokens = set(_tokenize(query))
+        query_tokens = self._tokenizer.tokenize(query)
+        query_token_set = set(query_tokens)
         query_files = set(_FILE_PATTERN.findall(query))
         scoped_items = [
             item for item in self._items.values() if _scope_matches(item.scope, scope or {})
@@ -282,19 +287,23 @@ class Mem0StyleMemory:
             if turn is not None
             else max((item.last_accessed_turn for item in scoped_items), default=0)
         )
+        documents = [
+            self._token_cache.get(item.id, _memory_search_text(item)) for item in scoped_items
+        ]
+        bm25 = bm25_scores(query_tokens, documents)
         scored: list[tuple[MemoryItem, float]] = []
-        for item in scoped_items:
-            item_tokens = set(_tokenize(_memory_search_text(item)))
-            lexical = len(query_tokens & item_tokens) / max(len(query_tokens), 1)
+        for item, item_tokens, lexical in zip(scoped_items, documents, bm25, strict=True):
+            token_overlap = bool(query_token_set & set(item_tokens))
             file_bonus = _file_overlap_bonus(query_files, item)
             has_query_signal = bool(query_tokens or query_files)
             relevance = lexical + file_bonus
-            if has_query_signal and relevance <= 0:
+            if has_query_signal and not (lexical > 0 or token_overlap or file_bonus > 0):
                 continue
             recency = 1.0 / (1.0 + max(current_turn - item.last_accessed_turn, 0))
             score = (
                 relevance
                 + item.importance * 0.15
+                + item.confidence * 0.10
                 + min(item.access_count, 5) * 0.02
                 + recency * 0.05
             )
@@ -462,6 +471,7 @@ class Mem0StyleMemory:
             reverse=True,
         )
         self._items = {item.id: item for item in ranked[: self.max_items]}
+        self._token_cache.retain(set(self._items))
 
     @staticmethod
     def _fingerprint(
@@ -510,6 +520,7 @@ class Mem0StyleMemory:
         self.max_items = int(data.get("max_items", 80))
         self.superseded_count = int(data.get("superseded_count", 0))
         self._items.clear()
+        self._token_cache.clear()
         for raw in data.get("items", []):
             item = MemoryItem(
                 id=str(raw.get("id", "")),
@@ -850,22 +861,6 @@ def _compact(text: str, *, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(limit - 3, 0)].rstrip() + "..."
-
-
-def _tokenize(text: str) -> list[str]:
-    tokens: list[str] = []
-    for match in _TOKEN_PATTERN.findall(text):
-        parts = re.split(r"_+", match)
-        for part in parts:
-            tokens.extend(_split_camel_case(part))
-    return [token.lower() for token in tokens if token]
-
-
-def _split_camel_case(token: str) -> list[str]:
-    parts = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", token).split()
-    if len(parts) == 1:
-        return parts
-    return [*parts, token]
 
 
 def _scope_matches(item_scope: dict[str, str], requested: dict[str, str]) -> bool:

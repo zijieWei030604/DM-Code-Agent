@@ -637,8 +637,14 @@ def test_semantic_capability_injects_bounded_impact_once_after_change(tmp_path):
     )
     engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
     bus = EventBus()
+    recorded: list[tuple[str, dict[str, object]]] = []
+
+    class TraceWriter:
+        def record(self, event: str, payload: dict[str, object]) -> None:
+            recorded.append((event, payload))
+
     capability = SemanticWorkspaceCapability(engine)
-    capability.install(CapabilityContext(bus, lambda phase: None))
+    capability.install(CapabilityContext(bus, lambda phase: None, TraceWriter()))
     metadata: dict[str, object] = {}
     bus.emit_run_start(RunStartEvent("change value", 1, "run", metadata=metadata))
 
@@ -657,6 +663,10 @@ def test_semantic_capability_injects_bounded_impact_once_after_change(tmp_path):
     assert "service.py" in messages[1]["content"]
     assert "consumer.py" in messages[1]["content"]
     assert metadata["semantic_impact_injection_count"] == 1
+    injected = next(payload for event, payload in recorded if event == "semantic_impact_injected")
+    assert injected["content"] == messages[1]["content"]
+    assert injected["chars"] == len(messages[1]["content"])
+    assert len(str(injected["sha256"])) == 64
 
     next_messages = [{"role": "user", "content": "continue again"}]
     bus.emit_before_llm_request(BeforeLLMRequestEvent(next_messages, 3, "run", "agent", metadata))

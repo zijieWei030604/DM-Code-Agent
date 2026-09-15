@@ -92,6 +92,52 @@ def test_mem0_style_memory_does_not_return_unrelated_memories():
     assert memory.search("document README.md release notes", scope={"agent_id": "dm"}) == []
 
 
+def test_memory_search_uses_chinese_segments_without_breaking_code_terms():
+    memory = Mem0StyleMemory()
+    memory.add(
+        "已验证工具调用会使用 Function Calling 参数，并读取 agent.py。",
+        metadata={"files": ["dm_agent/core/agent.py"], "tool": "read_file"},
+        importance=0.8,
+    )
+    memory.add("项目发布说明在 README.md。", metadata={"files": ["README.md"]})
+
+    hits = memory.search("读取 agent.py 的调用参数", limit=1)
+
+    assert hits[0].item.metadata["files"] == ["dm_agent/core/agent.py"]
+
+
+def test_memory_search_prefers_rare_bm25_terms_and_valid_evidence():
+    memory = Mem0StyleMemory()
+    memory.add("run_tests completed for common.py", importance=1.0)
+    evidence_id = memory.add_evidence(
+        "run_tests verified the flaky WebSocket regression in retry.py",
+        metadata={"files": ["retry.py"], "tool": "run_tests"},
+        confidence=0.95,
+    )
+    memory.add(
+        "Observed failure: retry.py old failure",
+        metadata={"files": ["retry.py"]},
+        importance=0.8,
+    )
+    memory.supersede_failures({"retry.py"}, turn=1)
+
+    hits = memory.search("flaky WebSocket retry.py run_tests", limit=2)
+
+    assert hits[0].item.id == evidence_id
+    assert all(hit.item.status == "active" for hit in hits[:1])
+
+
+def test_memory_token_cache_is_derived_and_rebuilt_after_restore():
+    memory = Mem0StyleMemory()
+    memory.add("读取 users.py 后运行 pytest", metadata={"files": ["users.py"]})
+
+    first = memory.search("users.py pytest", limit=1)
+    restored = Mem0StyleMemory.from_dict(memory.to_dict())
+    second = restored.search("users.py pytest", limit=1)
+
+    assert first[0].item.id == second[0].item.id
+
+
 def test_context_compressor_uses_agent_memory_instead_of_flat_summary():
     history = [
         {"role": "user", "content": "任务：Fix retry.should_retry in retry.py"},
