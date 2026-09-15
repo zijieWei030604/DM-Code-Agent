@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from dm_agent.clients.base_client import BaseLLMClient
@@ -36,6 +36,7 @@ _ERROR_MARKERS = (
     "异常",
 )
 _SUCCESS_MARKERS = ("success", "succeeded", "completed", "done", "完成", "成功")
+MEMORY_RENDER_REFRESH_INTERVAL = 4
 
 
 @dataclass
@@ -86,6 +87,9 @@ class Mem0StyleMemory:
             raise ValueError("max_items must be at least 1")
         self.max_items = max_items
         self.superseded_count = 0
+        # Retrieval-relevant mutations advance this counter. Search reinforcement
+        # intentionally does not, otherwise rendering would refresh itself.
+        self._revision = 0
         self._items: dict[str, MemoryItem] = {}
         self._tokenizer = MemoryTokenizer()
         self._token_cache = MemoryTokenCache(self._tokenizer)
@@ -97,10 +101,16 @@ class Mem0StyleMemory:
     def items(self) -> list[MemoryItem]:
         return list(self._items.values())
 
+    @property
+    def revision(self) -> int:
+        """Monotonic revision for retrieval-relevant memory mutations."""
+        return self._revision
+
     def clear(self) -> None:
         self._items.clear()
         self._token_cache.clear()
         self.superseded_count = 0
+        self._revision += 1
 
     def capture_rollback_state(self) -> Any:
         """捕获候选折叠回滚所需的纯内存状态。
@@ -151,7 +161,10 @@ class Mem0StyleMemory:
 
         existing = self._items.get(memory_id)
         if existing:
-            existing.metadata = _merge_metadata(existing.metadata, metadata)
+            merged_metadata = _merge_metadata(existing.metadata, metadata)
+            if merged_metadata != existing.metadata:
+                existing.metadata = merged_metadata
+                self._revision += 1
             self._token_cache.discard(memory_id)
             existing.reinforce(turn=turn)
             return memory_id
@@ -172,6 +185,7 @@ class Mem0StyleMemory:
             check_scope=tuple(str(value) for value in check_scope if value),
         )
         self._enforce_limit()
+        self._revision += 1
         return memory_id
 
     def add_evidence(
@@ -214,6 +228,8 @@ class Mem0StyleMemory:
                 if workspace_version:
                     item.metadata["invalidated_by_workspace_version"] = workspace_version
                 invalidated += 1
+        if invalidated:
+            self._revision += 1
         return invalidated
 
     def add_messages(
@@ -264,7 +280,13 @@ class Mem0StyleMemory:
                 item.importance = max(0.0, item.importance * 0.3)
                 superseded += 1
         self.superseded_count += superseded
+        if superseded:
+            self._revision += 1
         return superseded
+
+    def query_terms(self, query: str) -> frozenset[str]:
+        """Expose the same deterministic tokenizer used by BM25 retrieval."""
+        return frozenset(self._tokenizer.tokenize(query))
 
     def search(
         self,
@@ -493,6 +515,7 @@ class Mem0StyleMemory:
         return {
             "max_items": self.max_items,
             "superseded_count": self.superseded_count,
+            "revision": self._revision,
             "items": [
                 {
                     "id": item.id,
@@ -519,6 +542,7 @@ class Mem0StyleMemory:
         """在当前实例上恢复内容，保留调用方注入的子类与对象身份。"""
         self.max_items = int(data.get("max_items", 80))
         self.superseded_count = int(data.get("superseded_count", 0))
+        self._revision = int(data.get("revision", 0))
         self._items.clear()
         self._token_cache.clear()
         for raw in data.get("items", []):
@@ -541,6 +565,8 @@ class Mem0StyleMemory:
             )
             if item.id:
                 self._items[item.id] = item
+        if "revision" not in data:
+            self._revision = len(self._items)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Mem0StyleMemory:
@@ -568,6 +594,16 @@ class Compaction:
 
 
 @dataclass(frozen=True)
+class MemoryRender:
+    """Query-specific memory text paired with a reusable fold boundary."""
+
+    summary: str
+    query_terms: tuple[str, ...]
+    memory_revision: int
+    rendered_at_step: int
+
+
+@dataclass(frozen=True)
 class _CompressorRuntimeState:
     """压缩器的进程内快照；用于候选事务与 run 重试，不写入 checkpoint。"""
 
@@ -576,6 +612,7 @@ class _CompressorRuntimeState:
     compression_count: int
     last_compressed_turn_count: int
     last_beneficial_compaction: Compaction | None
+    last_memory_render: MemoryRender | None
     last_trigger: str
     last_estimated_tokens: int
 
@@ -609,6 +646,34 @@ def _compaction_from_dict(raw: Any) -> Compaction | None:
             trigger=str(raw.get("trigger", "")),
             estimated_tokens=max(0, int(raw.get("estimated_tokens", 0))),
             memory_items=max(0, int(raw.get("memory_items", 0))),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _memory_render_to_dict(render: MemoryRender | None) -> dict[str, Any] | None:
+    if render is None:
+        return None
+    return {
+        "summary": render.summary,
+        "query_terms": list(render.query_terms),
+        "memory_revision": render.memory_revision,
+        "rendered_at_step": render.rendered_at_step,
+    }
+
+
+def _memory_render_from_dict(raw: Any) -> MemoryRender | None:
+    if not isinstance(raw, Mapping):
+        return None
+    terms = raw.get("query_terms")
+    if not isinstance(terms, (list, tuple)):
+        terms = ()
+    try:
+        return MemoryRender(
+            summary=str(raw.get("summary", "")),
+            query_terms=tuple(sorted({str(term) for term in terms if term})),
+            memory_revision=max(0, int(raw.get("memory_revision", 0))),
+            rendered_at_step=max(0, int(raw.get("rendered_at_step", 0))),
         )
     except (TypeError, ValueError):
         return None
@@ -674,6 +739,7 @@ class ContextCompressor:
         # 只保存已经证明 token 净收益为正的折叠。这里存逻辑历史下标，不存任何
         # 会话文件的 entry id，因此同一状态可以安全扇出到多个 session sink。
         self.last_beneficial_compaction: Compaction | None = None
+        self.last_memory_render: MemoryRender | None = None
 
     @property
     def memory_count(self) -> int:
@@ -687,6 +753,7 @@ class ContextCompressor:
         self.last_trigger = ""
         self.last_estimated_tokens = 0
         self.last_beneficial_compaction = None
+        self.last_memory_render = None
 
     def set_scope(self, **scope: str) -> None:
         """Select the project/session scope used for subsequent memory retrieval."""
@@ -713,9 +780,24 @@ class ContextCompressor:
             confidence=confidence,
         )
 
-    def accept_beneficial_compaction(self, compaction: Compaction) -> None:
+    def accept_beneficial_compaction(
+        self, compaction: Compaction, *, step_number: int | None = None
+    ) -> None:
         """记住一次已通过 token 净收益检查的折叠，供后续请求粘性复用。"""
         self.last_beneficial_compaction = compaction
+        if self.last_memory_render is None:
+            # Compatibility for callers that construct Compaction directly.
+            self.last_memory_render = MemoryRender(
+                summary=compaction.summary,
+                query_terms=(),
+                memory_revision=self.memory.revision,
+                rendered_at_step=0,
+            )
+        elif step_number is not None:
+            self.last_memory_render = replace(
+                self.last_memory_render,
+                rendered_at_step=step_number,
+            )
 
     def snapshot_runtime_state(self) -> _CompressorRuntimeState:
         """保存全部运行时状态，同时保留调用方注入的 memory 实例身份。"""
@@ -725,6 +807,7 @@ class ContextCompressor:
             compression_count=self._compression_count,
             last_compressed_turn_count=self._last_compressed_turn_count,
             last_beneficial_compaction=self.last_beneficial_compaction,
+            last_memory_render=self.last_memory_render,
             last_trigger=self.last_trigger,
             last_estimated_tokens=self.last_estimated_tokens,
         )
@@ -736,6 +819,7 @@ class ContextCompressor:
         self._compression_count = state.compression_count
         self._last_compressed_turn_count = state.last_compressed_turn_count
         self.last_beneficial_compaction = state.last_beneficial_compaction
+        self.last_memory_render = state.last_memory_render
         self.last_trigger = state.last_trigger
         self.last_estimated_tokens = state.last_estimated_tokens
 
@@ -769,7 +853,9 @@ class ContextCompressor:
             return True
         return False
 
-    def plan_compaction(self, history: list[dict[str, str]]) -> Compaction:
+    def plan_compaction(
+        self, history: list[dict[str, str]], *, step_number: int | None = None
+    ) -> Compaction:
         """决定这一轮折叠哪些消息、从哪条起保留、摘要是什么。
 
         折叠决策与既有 ``compress`` 完全同构（旧消息进本地记忆、保留最近
@@ -803,12 +889,18 @@ class ContextCompressor:
                 turn=self._compression_count,
             )
 
-        query = "\n".join(message.get("content", "") for message in recent_messages[-4:])
+        query = self._memory_query(recent_messages)
         memory_block = self.memory.render(
             query,
             scope=self.scope,
             limit=self.memory_limit,
-            turn=self._compression_count,
+            turn=step_number if step_number is not None else self._compression_count,
+        )
+        self.last_memory_render = MemoryRender(
+            summary=memory_block,
+            query_terms=tuple(sorted(self.memory.query_terms(query))),
+            memory_revision=self.memory.revision,
+            rendered_at_step=step_number if step_number is not None else self._compression_count,
         )
         return Compaction(
             first_kept_index=kept_indexes[0] if kept_indexes else len(history),
@@ -822,6 +914,63 @@ class ContextCompressor:
     def compress(self, history: list[dict[str, str]]) -> list[dict[str, str]]:
         """旧 API：等价于「先规划折叠、再按折叠重建消息」，输出逐字节不变。"""
         return apply_compaction(history, self.plan_compaction(history))
+
+    def refresh_memory_render(
+        self, history: list[dict[str, str]], *, step_number: int
+    ) -> tuple[str, str | None]:
+        """Refresh only memory retrieval when its source or focus changed."""
+        query = self._memory_query(history)
+        query_terms = tuple(sorted(self.memory.query_terms(query)))
+        previous = self.last_memory_render
+        reason = self._memory_render_refresh_reason(
+            previous,
+            query_terms=query_terms,
+            step_number=step_number,
+        )
+        if reason is None:
+            return (previous.summary if previous else ""), None
+
+        summary = self.memory.render(
+            query,
+            scope=self.scope,
+            limit=self.memory_limit,
+            turn=step_number,
+        )
+        self.last_memory_render = MemoryRender(
+            summary=summary,
+            query_terms=query_terms,
+            memory_revision=self.memory.revision,
+            rendered_at_step=step_number,
+        )
+        return summary, reason
+
+    def accept_refreshed_compaction(self, compaction: Compaction) -> None:
+        """Persist a positive-savings memory refresh without advancing cadence."""
+        self.last_beneficial_compaction = compaction
+
+    def _memory_render_refresh_reason(
+        self,
+        previous: MemoryRender | None,
+        *,
+        query_terms: tuple[str, ...],
+        step_number: int,
+    ) -> str | None:
+        if previous is None:
+            return "missing_render"
+        if previous.memory_revision != self.memory.revision:
+            return "memory_revision_changed"
+        if previous.query_terms and _jaccard_similarity(
+            set(previous.query_terms), set(query_terms)
+        ) < 0.45:
+            return "query_focus_changed"
+        if step_number - previous.rendered_at_step >= MEMORY_RENDER_REFRESH_INTERVAL:
+            return "interval"
+        return None
+
+    @staticmethod
+    def _memory_query(messages: Sequence[dict[str, str]]) -> str:
+        recent = [message for message in messages if message.get("role") != "system"]
+        return "\n".join(str(message.get("content", "")) for message in recent[-4:])
 
     def get_compression_stats(
         self, original: list[dict[str, str]], compressed: list[dict[str, str]]
@@ -842,6 +991,7 @@ class ContextCompressor:
             "compression_count": self._compression_count,
             "last_compressed_turn_count": self._last_compressed_turn_count,
             "last_beneficial_compaction": _compaction_to_dict(self.last_beneficial_compaction),
+            "last_memory_render": _memory_render_to_dict(self.last_memory_render),
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
@@ -852,6 +1002,14 @@ class ContextCompressor:
         self.last_beneficial_compaction = _compaction_from_dict(
             state.get("last_beneficial_compaction")
         )
+        self.last_memory_render = _memory_render_from_dict(state.get("last_memory_render"))
+        if self.last_memory_render is None and self.last_beneficial_compaction is not None:
+            self.last_memory_render = MemoryRender(
+                summary=self.last_beneficial_compaction.summary,
+                query_terms=(),
+                memory_revision=self.memory.revision,
+                rendered_at_step=0,
+            )
         self.last_trigger = ""
         self.last_estimated_tokens = 0
 
@@ -861,6 +1019,11 @@ def _compact(text: str, *, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return compact[: max(limit - 3, 0)].rstrip() + "..."
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    union = left | right
+    return len(left & right) / len(union) if union else 1.0
 
 
 def _scope_matches(item_scope: dict[str, str], requested: dict[str, str]) -> bool:

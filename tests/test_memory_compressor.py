@@ -461,6 +461,141 @@ def test_sticky_reuse_syncs_memory_gauges_without_counting_a_new_compression():
     assert metadata["memory_compression_count"] == 0
 
 
+def _refresh_history(topic: str) -> list[dict[str, str]]:
+    detail_token = topic.replace(".", "_").replace("/", "_")
+    detail = f" {detail_token}_context" * 28
+    return [
+        {
+            "role": "user" if index % 2 == 0 else "assistant",
+            "content": f"{topic} repository investigation step {index}{detail}",
+        }
+        for index in range(9)
+    ]
+
+
+def _accepted_refresh_compaction(
+    compressor: ContextCompressor, history: list[dict[str, str]]
+) -> Compaction:
+    compaction = compressor.plan_compaction(history, step_number=1)
+    assert estimate_messages_tokens(apply_compaction(history, compaction)) < estimate_messages_tokens(
+        history
+    )
+    compressor.accept_beneficial_compaction(compaction)
+    return compaction
+
+
+def test_memory_revision_refreshes_sticky_render_when_new_evidence_arrives():
+    compressor = ContextCompressor(compress_every=100, keep_recent=1, token_budget=0)
+    history = _refresh_history("config.py")
+    _accepted_refresh_compaction(compressor, history)
+    revision_before = compressor.memory.revision
+    compressor.memory.add_evidence(
+        "run_tests found a failure in tests/test_refresh.py",
+        metadata={"files": ["tests/test_refresh.py"]},
+    )
+    assert compressor.memory.revision == revision_before + 1
+
+    history.extend(
+        [
+            {"role": "assistant", "content": "Tool run_tests tests/test_refresh.py"},
+            {
+                "role": "user",
+                "content": "Observation: pytest failed in tests/test_refresh.py",
+            },
+        ]
+    )
+    recorder = _CompactionRecorder()
+    sent = ContextWindow(compressor=compressor, enabled=True, trace_writer=recorder).build_messages(
+        "system", history, context=RunContext(step_number=2, metadata=_window_metadata())
+    )
+
+    assert "tests/test_refresh.py" in sent[1]["content"]
+    assert compressor.last_beneficial_compaction is not None
+    assert "tests/test_refresh.py" in compressor.last_beneficial_compaction.summary
+    assert recorder.events[-1]["event"] == "memory_render_refreshed"
+    assert recorder.events[-1]["payload"]["reason"] == "memory_revision_changed"
+
+
+def test_sticky_render_refreshes_when_query_focus_changes_without_memory_mutation():
+    compressor = ContextCompressor(compress_every=100, keep_recent=1, token_budget=0)
+    compressor.memory.add("config.py stores the connection timeout", metadata={"files": ["config.py"]})
+    compressor.memory.add(
+        "tests/test_refresh.py covers the refresh regression",
+        metadata={"files": ["tests/test_refresh.py"]},
+    )
+    history = _refresh_history("config.py")
+    _accepted_refresh_compaction(compressor, history)
+    revision_before = compressor.memory.revision
+
+    history.extend(
+        [
+            {"role": "assistant", "content": "Tool run_tests tests/test_refresh.py"},
+            {"role": "user", "content": "pytest failure in tests/test_refresh.py"},
+            {"role": "assistant", "content": "Inspect the test_refresh regression"},
+            {"role": "user", "content": "Fix the failing refresh test assertion"},
+        ]
+    )
+    previous = compressor.last_memory_render
+    assert previous is not None
+    summary, reason = compressor.refresh_memory_render(history, step_number=2)
+
+    assert compressor.memory.revision == revision_before
+    assert "tests/test_refresh.py" in summary
+    assert reason == "query_focus_changed"
+
+
+def test_sticky_render_reuses_matching_query_before_refresh_interval():
+    class TrackingMemory(Mem0StyleMemory):
+        def __init__(self):
+            super().__init__()
+            self.render_count = 0
+
+        def render(self, query, **kwargs):
+            self.render_count += 1
+            return super().render(query, **kwargs)
+
+    memory = TrackingMemory()
+    compressor = ContextCompressor(
+        compress_every=100, keep_recent=1, token_budget=0, memory=memory
+    )
+    history = _refresh_history("app.py")
+    _accepted_refresh_compaction(compressor, history)
+    initial_render_count = memory.render_count
+
+    ContextWindow(compressor=compressor, enabled=True).build_messages(
+        "system", history, context=RunContext(step_number=2, metadata=_window_metadata())
+    )
+
+    assert memory.render_count == initial_render_count
+
+
+def test_sticky_render_refreshes_at_interval_when_focus_is_unchanged():
+    class TrackingMemory(Mem0StyleMemory):
+        def __init__(self):
+            super().__init__()
+            self.render_count = 0
+
+        def render(self, query, **kwargs):
+            self.render_count += 1
+            return super().render(query, **kwargs)
+
+    memory = TrackingMemory()
+    compressor = ContextCompressor(
+        compress_every=100, keep_recent=1, token_budget=0, memory=memory
+    )
+    history = _refresh_history("app.py")
+    _accepted_refresh_compaction(compressor, history)
+    initial_render_count = memory.render_count
+
+    recorder = _CompactionRecorder()
+    ContextWindow(compressor=compressor, enabled=True, trace_writer=recorder).build_messages(
+        "system", history, context=RunContext(step_number=5, metadata=_window_metadata())
+    )
+
+    assert memory.render_count == initial_render_count + 1
+    assert recorder.events[-1]["payload"]["reason"] == "interval"
+
+
 def test_context_window_rolls_back_candidate_state_when_planning_raises(monkeypatch):
     compressor = ContextCompressor(compress_every=1, keep_recent=1, token_budget=0)
     history = _growing_history(5, payload_chars=20)

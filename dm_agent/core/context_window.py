@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 from dm_agent.memory.context_budget import (
@@ -128,7 +129,9 @@ class ContextWindow:
                 compressor.restore_candidate_state(state_before_candidate)
                 raise
             if candidate_is_beneficial:
-                compressor.accept_beneficial_compaction(candidate)
+                compressor.accept_beneficial_compaction(
+                    candidate, step_number=context.step_number
+                )
                 self._record_compaction_entry(
                     candidate,
                     history=history,
@@ -159,6 +162,51 @@ class ContextWindow:
                 )
             return messages
         sticky_history = apply_compaction(history, sticky)
+        refresh_state = compressor.snapshot_candidate_state()
+        try:
+            summary, refresh_reason = compressor.refresh_memory_render(
+                history, step_number=context.step_number
+            )
+            if refresh_reason is not None:
+                refreshed = replace(
+                    sticky,
+                    summary=summary,
+                    memory_items=compressor.memory_count,
+                )
+                refreshed_history = apply_compaction(history, refreshed)
+                if estimate_messages_tokens(refreshed_history) < estimate_messages_tokens(history):
+                    compressor.accept_refreshed_compaction(refreshed)
+                    sticky = refreshed
+                    sticky_history = refreshed_history
+                    self._record_compaction_entry(
+                        refreshed,
+                        history=history,
+                        compressed_history=refreshed_history,
+                        context=context,
+                        phase="memory_refresh",
+                    )
+                    if self.trace_writer:
+                        self.trace_writer.record(
+                            "memory_render_refreshed",
+                            {
+                                "step_number": context.step_number,
+                                "reason": refresh_reason,
+                                "memory_revision": compressor.memory.revision,
+                                "query_term_count": len(
+                                    compressor.last_memory_render.query_terms
+                                    if compressor.last_memory_render
+                                    else ()
+                                ),
+                            },
+                        )
+                else:
+                    compressor.restore_candidate_state(refresh_state)
+                    sticky = compressor.last_beneficial_compaction
+                    assert sticky is not None
+                    sticky_history = apply_compaction(history, sticky)
+        except Exception:
+            compressor.restore_candidate_state(refresh_state)
+            raise
         if sticky != self._last_recorded_compaction:
             self._record_compaction_entry(
                 sticky,
