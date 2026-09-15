@@ -130,13 +130,33 @@ class SemanticWorkspaceCapability:
 
 
 def _render_impact_summary(impact: ImpactReport, *, max_chars: int) -> str:
+    confirmed_files = tuple(
+        sorted(
+            {
+                item.path
+                for item in impact.confirmed_symbols
+                if item.path not in impact.changed_files
+            }
+        )
+    )
+    ambiguous_files = tuple(
+        sorted(
+            {
+                item.path
+                for item in impact.ambiguous_symbols
+                if item.path not in impact.changed_files
+            }
+        )
+    )
     lines = [
         "<change_impact>",
         "Heuristic candidates only; inspect files before editing and validate with tests.",
         f"risk: {impact.risk_level} ({impact.risk_score:.2f})",
         f"changed: {', '.join(impact.changed_files[:5]) or 'none'}",
-        f"possibly_affected: {', '.join(impact.affected_files[:5]) or 'none'}",
-        f"related_tests: {', '.join(impact.related_tests[:5]) or 'none'}",
+        f"likely_affected: {', '.join(confirmed_files[:5]) or 'none'}",
+        f"ambiguous_candidates: {', '.join(ambiguous_files[:5]) or 'none'}",
+        f"related_tests: {', '.join(impact.graph_tests[:5]) or 'none'}",
+        f"fallback_tests: {', '.join(impact.fallback_tests[:5]) or 'none'}",
     ]
     lines.extend(f"reason: {reason}" for reason in impact.reasons[:3])
     lines.append("</change_impact>")

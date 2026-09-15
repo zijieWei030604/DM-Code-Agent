@@ -9,6 +9,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+HIGH_CONFIDENCE = 0.9
+AMBIGUOUS_CONFIDENCE = 0.55
+
 
 @dataclass(frozen=True)
 class ImpactNode:
@@ -38,6 +41,20 @@ class ImpactReport:
     risk_score: float
     risk_level: str
     reasons: tuple[str, ...]
+    fallback_tests: tuple[str, ...] = ()
+
+    @property
+    def confirmed_symbols(self) -> tuple[ImpactNode, ...]:
+        return tuple(item for item in self.affected_symbols if item.confidence >= HIGH_CONFIDENCE)
+
+    @property
+    def ambiguous_symbols(self) -> tuple[ImpactNode, ...]:
+        return tuple(item for item in self.affected_symbols if item.confidence < HIGH_CONFIDENCE)
+
+    @property
+    def graph_tests(self) -> tuple[str, ...]:
+        fallback = set(self.fallback_tests)
+        return tuple(path for path in self.related_tests if path not in fallback)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -52,16 +69,27 @@ class ImpactReport:
         ]
         if self.changed_symbols:
             lines.append(f"changed_symbols: {', '.join(self.changed_symbols[:12])}")
-        if self.affected_symbols:
+        if self.confirmed_symbols:
             lines.append("affected:")
-            for item in self.affected_symbols[:max_nodes]:
+            for item in self.confirmed_symbols[:max_nodes]:
                 lines.append(
                     f"  - {item.path}:{item.symbol} <-{item.relation}- "
                     f"{item.via_path}:{item.via_symbol} "
                     f"(depth={item.distance}, confidence={item.confidence:.2f})"
                 )
-        if self.related_tests:
-            lines.append(f"related_tests: {', '.join(self.related_tests[:12])}")
+        remaining = max(0, max_nodes - len(self.confirmed_symbols[:max_nodes]))
+        if self.ambiguous_symbols and remaining:
+            lines.append("ambiguous_candidates:")
+            for item in self.ambiguous_symbols[:remaining]:
+                lines.append(
+                    f"  - {item.path}:{item.symbol} <-{item.relation}- "
+                    f"{item.via_path}:{item.via_symbol} "
+                    f"(depth={item.distance}, confidence={item.confidence:.2f})"
+                )
+        if self.graph_tests:
+            lines.append(f"related_tests: {', '.join(self.graph_tests[:12])}")
+        if self.fallback_tests:
+            lines.append(f"fallback_tests: {', '.join(self.fallback_tests[:12])}")
         lines.extend(f"reason: {reason}" for reason in self.reasons[:8])
         lines.append("</change_impact>")
         return "\n".join(lines)
@@ -115,10 +143,9 @@ class ImpactGraph:
         seeds = {(str(row["path"]), str(row["name"])) for row in symbol_rows}
         seeds.update((path, "<module>") for path in changed_files)
         queue = deque((path, symbol, 0) for path, symbol in sorted(seeds))
-        visited = set(seeds)
-        affected: list[ImpactNode] = []
-        reasons: list[str] = []
-        while queue and len(affected) < max_nodes:
+        propagated = set(seeds)
+        affected_by_source: dict[tuple[str, str], ImpactNode] = {}
+        while queue and len(affected_by_source) < max_nodes:
             target_path, target_symbol, distance = queue.popleft()
             if distance >= max(0, max_depth):
                 continue
@@ -140,9 +167,8 @@ class ImpactGraph:
                 ).fetchall()
             for row in rows:
                 source = (str(row["source_path"]), str(row["source_symbol"]))
-                if source in visited:
+                if source in propagated:
                     continue
-                visited.add(source)
                 item = ImpactNode(
                     source[0],
                     source[1],
@@ -152,21 +178,36 @@ class ImpactGraph:
                     target_path,
                     target_symbol,
                 )
-                affected.append(item)
-                queue.append((source[0], source[1], distance + 1))
-                if len(reasons) < 8:
-                    reasons.append(
-                        f"{source[0]}:{source[1]} {item.relation} " f"{target_path}:{target_symbol}"
-                    )
+                previous = affected_by_source.get(source)
+                if previous is not None and previous.confidence >= item.confidence:
+                    continue
+                affected_by_source[source] = item
+                # Ambiguous leaf-name matches are useful direct candidates, but
+                # propagating through them compounds one guess into many.
+                if item.confidence >= HIGH_CONFIDENCE:
+                    propagated.add(source)
+                    queue.append((source[0], source[1], distance + 1))
+        affected = list(affected_by_source.values())
+        reasons = [
+            f"{item.path}:{item.symbol} {item.relation} {item.via_path}:{item.via_symbol}"
+            for item in affected[:8]
+        ]
         affected_files = tuple(
             sorted({item.path for item in affected if item.path not in changed_files})
         )
-        tests = {item.path for item in affected if _is_test(item.path)}
-        tests.update(self._test_companions(changed_files))
+        graph_tests = {
+            item.path
+            for item in affected
+            if _is_test(item.path) and item.confidence >= HIGH_CONFIDENCE
+        }
+        fallback_tests = self._test_companions(changed_files) - graph_tests
+        tests = graph_tests | fallback_tests
         risk_score = _risk_score(symbol_rows, affected, changed_files)
         risk_level = "high" if risk_score >= 0.7 else "medium" if risk_score >= 0.35 else "low"
-        if tests:
-            reasons.append(f"selected {len(tests)} related test file(s)")
+        if graph_tests:
+            reasons.append(f"selected {len(graph_tests)} graph-related test file(s)")
+        if fallback_tests:
+            reasons.append(f"selected {len(fallback_tests)} filename fallback test file(s)")
         if not affected:
             reasons.append("no reverse dependency edges resolved")
         return ImpactReport(
@@ -178,6 +219,7 @@ class ImpactGraph:
             risk_score,
             risk_level,
             tuple(dict.fromkeys(reasons)),
+            tuple(sorted(fallback_tests)),
         )
 
     def _create_schema(self) -> None:
@@ -296,8 +338,8 @@ class ImpactGraph:
         ]
         result: set[str] = set()
         for path in changed:
-            stem = Path(path).stem.removeprefix("test_")
-            result.update(test for test in tests if stem and stem in Path(test).stem)
+            changed_tokens = _name_tokens(path)
+            result.update(test for test in tests if changed_tokens & _name_tokens(test))
         return result
 
 
@@ -332,7 +374,7 @@ def _resolve_targets(
         return [(path, symbol, 0.95) for path, symbol in same_file[:3]]
     if len(candidates) == 1:
         return [(candidates[0][0], candidates[0][1], 0.9)]
-    return [(path, symbol, 0.55) for path, symbol in candidates[:3]]
+    return [(path, symbol, AMBIGUOUS_CONFIDENCE) for path, symbol in candidates[:3]]
 
 
 def _module_path(module: str, modules: dict[str, str]) -> str | None:
@@ -365,18 +407,30 @@ def _is_test(path: str) -> bool:
     return bool(parts & {"test", "tests"}) or Path(path).name.startswith("test_")
 
 
+def _name_tokens(path: str) -> set[str]:
+    stem = Path(path).stem.casefold().removeprefix("test_")
+    return {part for part in stem.split("_") if len(part) >= 2}
+
+
 def _risk_score(rows: list[Any], nodes: list[ImpactNode], changed: tuple[str, ...]) -> float:
     public = sum(1 for row in rows if not str(row["name"]).rsplit(".", 1)[-1].startswith("_"))
-    production = {node.path for node in nodes if not _is_test(node.path)}
+    confirmed = [node for node in nodes if node.confidence >= HIGH_CONFIDENCE]
+    production = {node.path for node in confirmed if not _is_test(node.path)}
     score = 0.08 * min(len(changed), 3)
     score += 0.06 * min(public, 4)
     score += 0.08 * min(len(production), 4)
-    score += 0.05 * min(max((node.distance for node in nodes), default=0), 2)
-    if any(node.relation in {"inherits", "imports"} for node in nodes):
+    score += 0.05 * min(max((node.distance for node in confirmed), default=0), 2)
+    if any(node.relation in {"inherits", "imports"} for node in confirmed):
         score += 0.12
-    if len({node.path for node in nodes}) >= 6:
+    if len({node.path for node in confirmed}) >= 6:
         score += 0.1
     return round(min(1.0, score), 2)
 
 
-__all__ = ["ImpactGraph", "ImpactNode", "ImpactReport"]
+__all__ = [
+    "AMBIGUOUS_CONFIDENCE",
+    "HIGH_CONFIDENCE",
+    "ImpactGraph",
+    "ImpactNode",
+    "ImpactReport",
+]

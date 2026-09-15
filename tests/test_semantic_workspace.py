@@ -83,7 +83,7 @@ def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "test_api.py").write_text(
-        "from api import checkout\n\n" "def test_checkout():\n    assert checkout([1]) == 1\n",
+        "from api import checkout\n\ndef test_checkout():\n    assert checkout([1]) == 1\n",
         encoding="utf-8",
     )
     engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
@@ -100,6 +100,49 @@ def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
     )
     assert report.risk_level in {"medium", "high"}
     assert "api.py:checkout" in report.render()
+    engine.close()
+
+
+def test_ambiguous_edges_are_reported_but_do_not_propagate(tmp_path):
+    (tmp_path / "first.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "second.py").write_text("def run():\n    return 2\n", encoding="utf-8")
+    (tmp_path / "caller.py").write_text(
+        "def invoke():\n    return run()\n",
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_caller.py").write_text(
+        "from caller import invoke\n\ndef test_invoke():\n    assert invoke()\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+
+    engine.update()
+    report = engine.analyze_impact(["first.py"], max_depth=2)
+
+    assert any(item.path == "caller.py" for item in report.ambiguous_symbols)
+    assert "tests/test_caller.py" not in report.affected_files
+    assert "tests/test_caller.py" not in report.related_tests
+    engine.close()
+
+
+def test_test_companion_matching_uses_name_tokens_not_substrings(tmp_path):
+    (tmp_path / "user.py").write_text("def load_user():\n    return 1\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_user_cache.py").write_text("def test_cache():\n    pass\n", encoding="utf-8")
+    (tests / "test_superuser.py").write_text("def test_admin():\n    pass\n", encoding="utf-8")
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+
+    engine.update()
+    report = engine.analyze_impact(["user.py"])
+
+    assert report.fallback_tests == ("tests/test_user_cache.py",)
+    assert report.graph_tests == ()
+    assert report.related_tests == ("tests/test_user_cache.py",)
+    assert "related_tests:" not in report.render()
+    assert "fallback_tests: tests/test_user_cache.py" in report.render()
     engine.close()
 
 
@@ -662,6 +705,8 @@ def test_semantic_capability_injects_bounded_impact_once_after_change(tmp_path):
     assert "<change_impact>" in messages[1]["content"]
     assert "service.py" in messages[1]["content"]
     assert "consumer.py" in messages[1]["content"]
+    assert "likely_affected: consumer.py" in messages[1]["content"]
+    assert "ambiguous_candidates: none" in messages[1]["content"]
     assert metadata["semantic_impact_injection_count"] == 1
     injected = next(payload for event, payload in recorded if event == "semantic_impact_injected")
     assert injected["content"] == messages[1]["content"]
