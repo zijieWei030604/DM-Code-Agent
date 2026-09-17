@@ -405,6 +405,39 @@ def test_prefix_scopes_are_additive_and_report_order_is_set_based(tmp_path: Path
         )
 
 
+def test_evidence_completion_status_groups_official_outcomes(tmp_path: Path) -> None:
+    ids = IDS[:3]
+    predictions = _write_predictions(tmp_path / "predictions.jsonl", [_prediction(item) for item in ids])
+    report = _write_json(
+        tmp_path / "report.json",
+        _report(ids, resolved=[ids[0]], unresolved=[ids[1], ids[2]], empty=[], error=[]),
+    )
+    trace_dir = tmp_path / "traces"
+    trace_dir.mkdir()
+    _write_trace(
+        trace_dir / f"{ids[0]}.jsonl",
+        ids[0],
+        metadata={"evidence_completion_status": "verified"},
+    )
+    _write_trace(
+        trace_dir / f"{ids[1]}.jsonl",
+        ids[1],
+        metadata={"evidence_completion_status": "unverified"},
+    )
+    _write_trace(trace_dir / f"{ids[2]}.jsonl", ids[2], status="critic_rejected")
+
+    analysis = analyze_paths(predictions, report, trace_dirs=[trace_dir])
+    groups = analysis["summary"]["by_evidence_completion_status"]
+
+    assert groups["verified"]["official_outcomes"]["resolved"] == 1
+    assert groups["unverified"]["official_outcomes"]["unresolved"] == 1
+    assert groups["critic_rejected"]["official_outcomes"]["unresolved"] == 1
+    assert "unmeasured" not in groups
+    markdown = render_markdown(analysis)
+    assert "## 决策证据完成等级" in markdown
+    assert "| verified | 1 | 1 | 0 | 0 | 0 | 0 | 0 |" in markdown
+
+
 def test_missing_legacy_fields_are_null_not_zero(tmp_path: Path) -> None:
     predictions = _write_predictions(
         tmp_path / "predictions.jsonl", [_prediction("org__repo-1", patch=None, diagnostics=False)]

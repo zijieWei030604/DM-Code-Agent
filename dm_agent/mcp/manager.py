@@ -80,16 +80,16 @@ class MCPManager:
             True
         """
         if name in self.clients and self.clients[name].is_running():
-            print(f"⚠️ MCP 服务器 '{name}' 已在运行中")
+            print(f"[MCP] 服务器 '{name}' 已在运行中")
             return True
 
         server_config = self.config.servers.get(name)
         if not server_config:
-            print(f"❌ 未找到 MCP 服务器配置: {name}")
+            print(f"[MCP] 未找到服务器配置: {name}")
             return False
 
         if not server_config.enabled:
-            print(f"⚠️ MCP 服务器 '{name}' 已禁用")
+            print(f"[MCP] 服务器 '{name}' 已禁用")
             return False
 
         # 创建并启动客户端
@@ -251,7 +251,7 @@ class MCPManager:
         if not server_config or not server_config.enabled:
             return None
         self.reconnect_counts[server_name] = self.reconnect_counts.get(server_name, 0) + 1
-        print(f"🔁 尝试重连 MCP 服务器 '{server_name}'...")
+        print(f"[MCP] 尝试重连服务器 '{server_name}'...")
         self.stop_server(server_name)
         if self.start_server(server_name):
             return self.clients.get(server_name)

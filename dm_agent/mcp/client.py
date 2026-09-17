@@ -100,6 +100,8 @@ class MCPClient:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                     env=process_env,
                     shell=True,  # Windows 必需
@@ -112,6 +114,8 @@ class MCPClient:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     bufsize=1,
                     env=process_env,
                 )
@@ -126,11 +130,11 @@ class MCPClient:
                 self.stop()
                 return False
 
-            print(f"✅ MCP 服务器 '{self.name}' 启动成功，提供 {len(self.tools)} 个工具")
+            print(f"[MCP] 服务器 '{self.name}' 启动成功，提供 {len(self.tools)} 个工具")
             return True
 
         except Exception as e:
-            print(f"❌ 启动 MCP 服务器 '{self.name}' 失败: {e}")
+            print(f"[MCP] 启动服务器 '{self.name}' 失败: {e}")
             return False
 
     def stop(self) -> None:
@@ -151,7 +155,7 @@ class MCPClient:
             except subprocess.TimeoutExpired:
                 self.process.kill()
             self.process = None
-        print(f"🛑 MCP 服务器 '{self.name}' 已停止")
+        print(f"[MCP] 服务器 '{self.name}' 已停止")
 
     def _read_stdout(self) -> None:
         """
@@ -170,7 +174,7 @@ class MCPClient:
                     self._stdout_queue.put(line.strip())
             except Exception as e:
                 if self._running:
-                    print(f"⚠️ 读取 MCP 输出错误: {e}")
+                    print(f"[MCP] 读取服务器输出错误: {e}")
                 break
 
     def _send_message(
@@ -222,22 +226,25 @@ class MCPClient:
 
                         if response.get("id") == self._message_id:
                             if "error" in response:
-                                print(f"❌ MCP 错误: {response['error']}")
+                                print(f"[MCP] 服务器错误: {response['error']}")
                                 return None
                             return response.get("result")
 
-                        # Keep unrelated server notifications available for the next read.
-                        self._stdout_queue.put(response_line)
+                        # Requests are serialized by ``_lock``. An unmatched message is
+                        # therefore a server notification, not another request's response.
+                        # Re-queueing it would make this loop consume the same notification
+                        # forever and starve the matching tool response.
+                        continue
                     except Empty:
                         timeout_count += 1
                     except json.JSONDecodeError:
                         continue
 
-                print("⚠️ MCP 响应超时")
+                print("[MCP] 响应超时")
                 return None
 
             except Exception as e:
-                print(f"❌ 发送 MCP 消息失败: {e}")
+                print(f"[MCP] 发送请求失败: {e}")
                 return None
 
     def _initialize(self) -> bool:

@@ -174,6 +174,37 @@ def test_deepseek_uses_schema_and_only_first_tool_call():
     }
 
 
+def test_deepseek_malformed_native_tool_arguments_return_recoverable_text():
+    session = FakeSession(
+        [
+            FakeResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path":"users.py"} trailing',
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                },
+            )
+        ]
+    )
+    client = _client_with_session(session)
+
+    text = client.respond([{"role": "user", "content": "read users.py"}])
+
+    assert text.startswith("DeepSeek tool arguments are not valid JSON:")
+
+
 def test_deepseek_uses_responses_api_for_strict_json_schema():
     session = FakeSession(
         [

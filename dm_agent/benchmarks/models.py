@@ -80,6 +80,8 @@ class BenchmarkVariant:
     enable_planning: bool = True
     enable_skills: bool = True
     enable_compression: bool = True
+    # None inherits BenchmarkRunConfig; explicit values support capability A/B runs.
+    enable_evidence_graph: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -375,6 +375,65 @@ def _neutralize_windows_git_noise(workspace: Path) -> None:
         raise RuntimeError(f"git checkout 清理平台噪声失败：{checked_out.stderr.strip()[:300]}")
 
 
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+)
+
+
+def _is_windows_reserved_path(path: str) -> bool:
+    """Whether a POSIX worktree path contains a Windows device-name component."""
+    for component in PurePosixPath(path).parts:
+        # Windows ignores an extension and trailing dots/spaces when resolving device names.
+        basename = component.rstrip(". ").split(".", 1)[0].upper()
+        if basename in _WINDOWS_RESERVED_BASENAMES:
+            return True
+    return False
+
+
+def _discard_windows_reserved_untracked_files(container: str) -> tuple[str, ...]:
+    """Remove Linux-only scratch files that Windows Git cannot stage.
+
+    Commands run by the Agent execute inside a Linux container mounted at ``/testbed``.
+    A command such as ``... > nul`` can therefore create a real untracked ``nul`` file.
+    Windows Git treats that name as a device and fails before it can produce a patch.  Query
+    Git from the Linux side and remove only *untracked* reserved-name entries; tracked source
+    files and ordinary newly-created files are never changed.
+    """
+    listed = _run(
+        [
+            "docker",
+            "exec",
+            "--workdir",
+            "/testbed",
+            container,
+            "git",
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ]
+    )
+    if listed.returncode != 0:
+        raise RuntimeError(
+            "无法从运行容器列出未跟踪文件："
+            f"{listed.stderr.strip()[:300]}"
+        )
+
+    removed: list[str] = []
+    for path in (item for item in listed.stdout.split("\0") if item):
+        if not _is_windows_reserved_path(path):
+            continue
+        deleted = _run(
+            ["docker", "exec", "--workdir", "/testbed", container, "rm", "-f", "--", path]
+        )
+        if deleted.returncode != 0:
+            raise RuntimeError(
+                f"无法清理 Windows 保留名临时文件 {path!r}：{deleted.stderr.strip()[:300]}"
+            )
+        removed.append(path)
+    return tuple(removed)
+
+
 def extract_patch(workspace: Path) -> str:
     """工作区相对 base_commit 的改动。
 
@@ -538,6 +597,11 @@ def predict_one(
             workspace_engine.close()
         workspace_engine = None
         shutil.rmtree(semantic_index_dir, ignore_errors=True)
+        windows_reserved_files_removed: tuple[str, ...] = ()
+        if os.name == "nt":
+            windows_reserved_files_removed = _discard_windows_reserved_untracked_files(
+                container_name
+            )
         patch = extract_patch(workspace)
         record: dict[str, Any] = {
             "instance_id": instance_id,
@@ -554,6 +618,7 @@ def predict_one(
             "dm_container_exec_failures": execution_backend.stats.failures,
             "dm_adaptive_replanning_enabled": enable_adaptive_replanning,
             "dm_max_replans": max_replans,
+            "dm_windows_reserved_untracked_removed": len(windows_reserved_files_removed),
         }
         if diagnostics_measured:
             # 下面是诊断字段，官方 harness 会忽略，但我们自己要看。Agent 异常时

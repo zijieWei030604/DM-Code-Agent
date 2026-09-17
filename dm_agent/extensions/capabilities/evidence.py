@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dm_agent.core.capabilities import CapabilityContext
 from dm_agent.core.events import (
@@ -17,35 +18,48 @@ from dm_agent.core.events import (
     RunStartEvent,
 )
 from dm_agent.core.evidence import EvidenceEdge, EvidenceGraph, EvidenceNode
-from dm_agent.core.guards import WRITE_ACTIONS
+from dm_agent.core.evidence_policy import EvidenceCompletionPolicy, EvidenceCompletionResult
+from dm_agent.core.guards import READ_ACTIONS, WRITE_ACTIONS
 from dm_agent.core.observation import is_failure_observation
 from dm_agent.core.workspace_version import workspace_version
 
-READ_ACTIONS = frozenset({"read_file", "search_in_file"})
 VERIFICATION_ACTIONS = frozenset({"run_python", "run_tests", "run_linter"})
+EvidenceEnforcement = Literal["observe", "warn", "strict"]
 
 
 class EvidenceGraphCapability:
-    """Collect provenance and provide bounded progress feedback to the model.
-
-    It never starts tools, replans, or blocks exploration. The only hard gate is
-    a single rejection when a known failing verification contradicts a success
-    claim; a later completion request is allowed and remains visibly marked as
-    contradicted in the audit report.
-    """
+    """Collect provenance and enforce evidence requirements at completion."""
 
     checkpoint_key = "evidence_graph"
 
-    def __init__(self, *, summary_chars: int = 800, inject_summaries: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        summary_chars: int = 800,
+        inject_summaries: bool = True,
+        enforcement: EvidenceEnforcement = "strict",
+        max_stalled_completion_attempts: int = 2,
+    ) -> None:
         if summary_chars < 200:
             raise ValueError("summary_chars must be at least 200.")
+        if enforcement not in {"observe", "warn", "strict"}:
+            raise ValueError("enforcement must be 'observe', 'warn', or 'strict'.")
+        if max_stalled_completion_attempts < 1:
+            raise ValueError("max_stalled_completion_attempts must be at least 1.")
         self.summary_chars = summary_chars
         self.inject_summaries = inject_summaries
+        self.enforcement = enforcement
+        self.max_stalled_completion_attempts = max_stalled_completion_attempts
         self.graph = EvidenceGraph()
+        self.completion_policy = EvidenceCompletionPolicy()
         self._trace_writer: Any | None = None
         self._get_run_state: Any = None
         self._workspace_root = Path.cwd()
         self._verification_versions: dict[int, str] = {}
+        self._write_versions: dict[int, str] = {}
+        self._write_basis_kinds: dict[int, str] = {}
+        self._recovery_signature = ""
+        self._stalled_completion_attempts = 0
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -63,18 +77,36 @@ class EvidenceGraphCapability:
         context.event_bus.on(
             "before_llm_request", self._before_llm_request, name="evidence.before_llm"
         )
-        context.event_bus.on("before_finish", self._before_finish, name="evidence.before_finish")
+        context.event_bus.on(
+            "before_finish",
+            self._before_finish,
+            name="evidence.before_finish",
+            kind="policy",
+        )
         context.event_bus.on("on_run_end", self._on_run_end, name="evidence.run_end")
 
     def export_state(self) -> dict[str, Any]:
-        return self.graph.to_dict()
+        return {
+            "graph": self.graph.to_dict(),
+            "recovery_signature": self._recovery_signature,
+            "stalled_completion_attempts": self._stalled_completion_attempts,
+        }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
-        self.graph = EvidenceGraph.from_dict(state)
+        graph_state = state.get("graph") if isinstance(state.get("graph"), Mapping) else state
+        self.graph = EvidenceGraph.from_dict(graph_state)
+        self._recovery_signature = str(state.get("recovery_signature", ""))
+        self._stalled_completion_attempts = int(state.get("stalled_completion_attempts", 0))
 
     def _on_run_start(self, event: RunStartEvent) -> None:
         nodes, edges = self.graph.start(event.task)
         self._workspace_root = Path.cwd()
+        self.graph.workspace_version = workspace_version(self._workspace_root)
+        self._verification_versions.clear()
+        self._write_versions.clear()
+        self._write_basis_kinds.clear()
+        self._recovery_signature = ""
+        self._stalled_completion_attempts = 0
         self._record(nodes, edges)
         event.metadata.update(
             {
@@ -82,17 +114,24 @@ class EvidenceGraphCapability:
                 "evidence_summary_injection_enabled": self.inject_summaries,
                 "evidence_summary_injection_count": 0,
                 "evidence_contradiction_block_count": 0,
+                "evidence_completion_block_count": 0,
+                "evidence_recovery_prompt_count": 0,
+                "evidence_stalled_completion_count": 0,
+                "evidence_terminal_rejection_count": 0,
+                "evidence_enforcement": self.enforcement,
             }
         )
 
     def _before_tool_call(self, event: BeforeToolCallEvent) -> None:
         if event.tool_name in VERIFICATION_ACTIONS:
             self._verification_versions[event.step_number] = workspace_version(self._workspace_root)
+        if event.tool_name in WRITE_ACTIONS:
+            self._write_versions[event.step_number] = workspace_version(self._workspace_root)
+            self._write_basis_kinds[event.step_number] = _write_basis_kind(event)
 
     def _after_tool_result(self, event: AfterToolResultEvent) -> None:
         self._sync_plan()
-        path_value = event.arguments.get("path")
-        path = path_value if isinstance(path_value, str) else ""
+        path = self._normalize_path(event.arguments.get("path"))
         nodes: list[EvidenceNode] = []
         edges: list[EvidenceEdge] = []
         if event.tool_name in READ_ACTIONS:
@@ -102,14 +141,35 @@ class EvidenceGraphCapability:
                     path=path,
                     step_number=event.step_number,
                     succeeded=True,
+                    workspace_version=workspace_version(self._workspace_root),
                 )
         elif event.tool_name in WRITE_ACTIONS:
             if event.has_effect and not event.no_change:
-                nodes, edges = self.graph.add_change(
-                    tool=event.tool_name,
-                    path=path,
-                    step_number=event.step_number,
-                )
+                before_version = self._write_versions.pop(event.step_number, "")
+                basis_kind = self._write_basis_kinds.pop(event.step_number, "read")
+                after_version = workspace_version(self._workspace_root)
+                changed_paths = {
+                    self._normalize_path(item)
+                    for item in (event.result.changed_files if event.result else ())
+                    if item
+                }
+                if path:
+                    changed_paths.add(path)
+                for changed_path in sorted(item for item in changed_paths if item):
+                    added_nodes, added_edges = self.graph.add_change(
+                        tool=event.tool_name,
+                        path=changed_path,
+                        step_number=event.step_number,
+                        before_version=before_version,
+                        after_version=after_version,
+                        requires_read_basis=basis_kind == "read",
+                        basis_kind=basis_kind,
+                    )
+                    nodes.extend(added_nodes)
+                    edges.extend(added_edges)
+            else:
+                self._write_versions.pop(event.step_number, None)
+                self._write_basis_kinds.pop(event.step_number, None)
         elif event.tool_name in VERIFICATION_ACTIONS:
             if event.result is not None and event.result.status in {
                 "unavailable",
@@ -145,6 +205,7 @@ class EvidenceGraphCapability:
                 check=json.dumps(
                     {"tool": event.tool_name, "arguments": event.arguments}, sort_keys=True
                 ),
+                details=event.observation,
                 scope=(
                     event.result.check_scope
                     if event.result
@@ -156,6 +217,10 @@ class EvidenceGraphCapability:
                         ),
                     )
                 ),
+                # Generic tool results do not reliably identify which exact
+                # changes a test covers. Keep this transaction-level fact out
+                # of file-level verification edges.
+                direct=False,
             )
         if nodes or edges:
             self._record(nodes, edges)
@@ -166,7 +231,8 @@ class EvidenceGraphCapability:
         if not self.inject_summaries or event.phase != "agent" or not self.graph.summary_pending:
             return
         summary = self.graph.prompt_summary(max_chars=self.summary_chars)
-        if summary:
+        fingerprint = hashlib.sha256(summary.encode("utf-8")).hexdigest() if summary else ""
+        if summary and fingerprint != self.graph.last_summary_fingerprint:
             event.messages.append({"role": "system", "content": summary})
             event.metadata["evidence_summary_injection_count"] = (
                 int(event.metadata.get("evidence_summary_injection_count", 0)) + 1
@@ -177,39 +243,118 @@ class EvidenceGraphCapability:
                     "step_number": event.step_number,
                     "chars": len(summary),
                     "status": self.graph.status(),
+                    "fingerprint": fingerprint[:16],
                 },
             )
+            self.graph.last_summary_fingerprint = fingerprint
         self.graph.summary_pending = False
 
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
         self.graph.workspace_version = workspace_version(self._workspace_root)
         self._sync_plan()
+        decision = self.completion_policy.evaluate(
+            self.graph,
+            verified_transaction=str(
+                event.metadata.get("edit_transaction_status", "")
+            ).startswith("committed"),
+        )
+        issues = list(decision.issues)
+        warnings = list(decision.warnings)
+        should_block = self.enforcement == "strict" and decision.decision == "block"
+        if self.enforcement == "warn":
+            should_block = any(item["status"] == "contradicted" for item in issues)
         nodes, edges = self.graph.add_conclusion(
             text=event.completion_text,
             step_number=event.step_number,
+            accepted=not should_block,
         )
         self._record(nodes, edges)
-        self._update_metadata(event.metadata)
-        if self.graph.status() != "contradicted" or self.graph.contradiction_blocked_once:
+        self._update_metadata(event.metadata, decision=decision)
+        if not should_block:
+            if decision.decision == "warn":
+                event.metadata["evidence_completion_status"] = "unverified"
+            else:
+                event.metadata["evidence_completion_status"] = "verified"
             return None
-        self.graph.contradiction_blocked_once = True
-        event.metadata["evidence_contradiction_block_count"] = (
-            int(event.metadata.get("evidence_contradiction_block_count", 0)) + 1
+        event.metadata["evidence_completion_block_count"] = (
+            int(event.metadata.get("evidence_completion_block_count", 0)) + 1
         )
-        reason = (
-            "Completion evidence is contradicted by a failing verification. Address or explain "
-            "the failing check before claiming success. This evidence gate blocks only once."
-        )
+        if any(item["status"] == "contradicted" for item in issues):
+            event.metadata["evidence_contradiction_block_count"] = (
+                int(event.metadata.get("evidence_contradiction_block_count", 0)) + 1
+            )
+        signature = self._completion_signature(decision)
+        detailed = signature != self._recovery_signature
+        if detailed:
+            self._recovery_signature = signature
+            self._stalled_completion_attempts = 0
+            reason = _completion_recovery_reason(self.graph, issues)
+            event.metadata["evidence_recovery_prompt_count"] = (
+                int(event.metadata.get("evidence_recovery_prompt_count", 0)) + 1
+            )
+        else:
+            self._stalled_completion_attempts += 1
+            event.metadata["evidence_stalled_completion_count"] = (
+                int(event.metadata.get("evidence_stalled_completion_count", 0)) + 1
+            )
+            reason = (
+                "Completion blocked by evidence policy: verification state has not changed. "
+                "Make a new relevant edit or run a relevant test before trying to finish again."
+            )
+        terminal = self._stalled_completion_attempts >= self.max_stalled_completion_attempts
+        if terminal:
+            event.metadata["evidence_terminal_completion_rejection"] = True
+            event.metadata["evidence_terminal_rejection_count"] = (
+                int(event.metadata.get("evidence_terminal_rejection_count", 0)) + 1
+            )
+            reason = (
+                "Completion rejected by evidence policy after repeated attempts without new "
+                "verification evidence."
+            )
         self._record_event(
-            "evidence_completion_contradicted",
-            {"step_number": event.step_number, "reason": reason},
+            "evidence_completion_blocked",
+            {
+                "step_number": event.step_number,
+                "reason": reason,
+                "issues": issues,
+                "warnings": warnings,
+                "decision": decision.decision,
+                "detailed": detailed,
+                "terminal": terminal,
+                "signature": signature[:16],
+            },
         )
         return {"block": True, "reason": reason}
+
+    def _completion_signature(self, decision: EvidenceCompletionResult) -> str:
+        current_checks = [
+            {
+                "tool": str(node.metadata.get("tool", "")),
+                "passed": bool(node.metadata.get("passed")),
+                "check": str(node.metadata.get("check", "")),
+                "scope": list(node.metadata.get("scope") or ()),
+            }
+            for node in self.graph.current_verifications()
+        ]
+        payload = {
+            "workspace_version": self.graph.workspace_version,
+            "issues": sorted(decision.issues, key=lambda item: (item["path"], item["status"])),
+            "checks": current_checks,
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _on_run_end(self, event: RunEndEvent) -> None:
         self._sync_plan()
         audit = self.graph.audit()
         self._update_metadata(event.metadata)
+        event.metadata.update(
+            {
+                "evidence_completion_attempts": audit["completion_attempts"],
+                "evidence_rejected_completion_attempts": audit[
+                    "rejected_completion_attempts"
+                ],
+            }
+        )
         self._record_event("evidence_summary", audit)
 
     def _sync_plan(self) -> None:
@@ -225,16 +370,50 @@ class EvidenceGraphCapability:
         nodes, edges = self.graph.sync_plan(plan)
         self._record(nodes, edges)
 
-    def _update_metadata(self, metadata: dict[str, Any]) -> None:
+    def _update_metadata(
+        self,
+        metadata: dict[str, Any],
+        *,
+        decision: EvidenceCompletionResult | None = None,
+    ) -> None:
         audit = self.graph.audit()
+        completion_issues = (
+            list(decision.issues)
+            if decision is not None
+            else list(metadata.get("evidence_completion_issues", audit["completion_issues"]))
+        )
         metadata.update(
             {
                 "evidence_status": audit["status"],
                 "evidence_node_count": audit["node_count"],
                 "evidence_edge_count": audit["edge_count"],
                 "evidence_failed_verifications": audit["failed_verifications"],
+                "evidence_change_evidence_gaps": audit["completion_issues"],
+                "evidence_completion_issues": completion_issues,
+                "evidence_completion_status": metadata.get(
+                    "evidence_completion_status", "pending"
+                ),
             }
         )
+        if decision is not None:
+            metadata.update(
+                {
+                    "evidence_completion_decision": decision.decision,
+                    "evidence_policy_issues": list(decision.issues),
+                    "evidence_policy_warnings": list(decision.warnings),
+                }
+            )
+
+    def _normalize_path(self, value: Any) -> str:
+        if not isinstance(value, (str, Path)) or not str(value):
+            return ""
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = self._workspace_root / candidate
+        try:
+            return candidate.resolve().relative_to(self._workspace_root.resolve()).as_posix()
+        except ValueError:
+            return candidate.resolve().as_posix()
 
     def _record(self, nodes: list[EvidenceNode], edges: list[EvidenceEdge]) -> None:
         for node in nodes:
@@ -245,3 +424,57 @@ class EvidenceGraphCapability:
     def _record_event(self, event: str, payload: dict[str, Any]) -> None:
         if self._trace_writer:
             self._trace_writer.record(event, payload)
+
+
+def _completion_block_reason(issues: list[dict[str, str]]) -> str:
+    labels = {
+        "missing_read_basis": "missing a valid pre-edit read",
+        "unverified": "has not been verified",
+        "indirectly_checked": "has only indirect checks",
+        "contradicted": "has a failing verification",
+        "source_unverified": "has no successful test for the current change transaction",
+        "source_indirect_only": "has only indirect checks for the current change transaction",
+        "transaction_test_failed": "has a failing test for the current change transaction",
+    }
+    detail = "; ".join(
+        f"{item['path']}: {labels.get(item['status'], item['status'])}" for item in issues[:5]
+    )
+    suffix = f"; and {len(issues) - 5} more" if len(issues) > 5 else ""
+    return f"Completion blocked by evidence policy: {detail}{suffix}."
+
+
+def _completion_recovery_reason(graph: EvidenceGraph, issues: list[dict[str, str]]) -> str:
+    paths = list(dict.fromkeys(item["path"] for item in issues if item["path"]))
+    failed_tests = [
+        node
+        for node in graph.current_verifications()
+        if node.metadata.get("tool") == "run_tests" and not bool(node.metadata.get("passed"))
+    ]
+    lines = ["Completion blocked by evidence policy."]
+    if paths:
+        lines.append("Changed files requiring attention: " + ", ".join(paths[:5]) + ".")
+    if failed_tests:
+        latest = failed_tests[-1]
+        lines.append("Latest failed test: " + str(latest.metadata.get("check") or "run_tests") + ".")
+        details = str(latest.metadata.get("details") or "").strip()
+        if details:
+            lines.append("Failure excerpt: " + details[-600:])
+    else:
+        lines.append(_completion_block_reason(issues))
+    lines.append(
+        "Next: inspect the failure, make a relevant correction, and run a relevant test before finishing."
+    )
+    return "\n".join(lines)
+
+
+def _write_basis_kind(event: BeforeToolCallEvent) -> str:
+    """Classify write preconditions already enforced by the underlying tool."""
+    if event.tool_name == "create_file":
+        return "new_file"
+    old_string = event.arguments.get("old_string")
+    if event.content_anchor_safe and isinstance(old_string, str) and old_string:
+        return "content_anchor"
+    expected_hash = event.arguments.get("expected_hash")
+    if event.tool_name == "edit_python_symbol" and isinstance(expected_hash, str) and expected_hash:
+        return "expected_hash"
+    return "read"

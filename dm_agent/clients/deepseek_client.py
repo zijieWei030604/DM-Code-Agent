@@ -244,7 +244,10 @@ class DeepSeekClient(BaseLLMClient):
                 json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
             )
         except json.JSONDecodeError as exc:
-            raise DeepSeekError(f"DeepSeek 工具参数不是有效 JSON: {exc}") from exc
+            # Treat malformed provider output like any other response parse failure.
+            # Returning plain text routes it through ReactAgent's existing recovery
+            # loop instead of aborting the entire task as an agent exception.
+            return f"DeepSeek tool arguments are not valid JSON: {exc}"
         if not isinstance(arguments, dict):
             raise DeepSeekError("DeepSeek 工具参数必须是 JSON object。")
         return json.dumps(

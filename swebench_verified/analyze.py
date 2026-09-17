@@ -41,6 +41,7 @@ HARNESS_DETAIL_STATUSES = (
 )
 AGENT_OUTCOMES = ("success", "max_steps", "exception", "unknown")
 TRACE_STATUSES = ("measured", "missing", "unmeasured", "invalid")
+EVIDENCE_COMPLETION_STATUSES = ("verified", "unverified", "critic_rejected", "unmeasured")
 FAILURE_LABELS = (
     "empty_patch",
     "no_edit",
@@ -228,6 +229,9 @@ def analyze_paths(
     summary["by_difficulty"] = _facet_summaries(rows, "difficulty")
     summary["by_official_outcome"] = _facet_summaries(rows, "official", "outcome")
     summary["by_failure_label"] = _label_summaries(rows)
+    summary["by_evidence_completion_status"] = _facet_summaries(
+        rows, "evidence_completion", "status"
+    )
 
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -356,6 +360,33 @@ def render_markdown(analysis: dict[str, Any]) -> str:
     for label, bucket in (summary.get("by_failure_label", {}) or {}).items():
         lines.append(
             f"| {_md(label)} | {_value(bucket.get('count'))} | {_value(bucket.get('denominator'))} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 决策证据完成等级",
+            "",
+            "| 证据完成等级 | 分母 | resolved | unresolved | empty patch | harness error | incomplete | unknown |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for status in EVIDENCE_COMPLETION_STATUSES:
+        bucket = (summary.get("by_evidence_completion_status", {}) or {}).get(status)
+        if bucket is None:
+            continue
+        counts = bucket.get("official_outcomes", {})
+        lines.append(
+            "| {status} | {denom} | {resolved} | {unresolved} | {empty} | {error} | {incomplete} | {unknown} |".format(
+                status=_md(status),
+                denom=_value(bucket.get("denominator")),
+                resolved=_value(counts.get("resolved", 0)),
+                unresolved=_value(counts.get("unresolved", 0)),
+                empty=_value(counts.get("empty_patch", 0)),
+                error=_value(counts.get("harness_error", 0)),
+                incomplete=_value(counts.get("incomplete", 0)),
+                unknown=_value(counts.get("unknown", 0)),
+            )
         )
 
     lines.extend(
@@ -1078,9 +1109,24 @@ def _trace_record(
         "verification_actions": verification_actions,
         "verification_before_finish": before_finish if run_end is not None else None,
         "verification_gap": verification_gap,
+        "evidence_completion_status": _evidence_completion_status(metadata, status_raw),
         "event_count": len(events),
         "json_malformed": malformed,
     }
+
+
+def _evidence_completion_status(metadata: dict[str, Any], status_raw: Any) -> str:
+    """Return only completion states the trace can establish.
+
+    Old traces and runs without the evidence capability remain unmeasured;
+    they must not be folded into an evidence-policy denominator.
+    """
+    status = metadata.get("evidence_completion_status")
+    if status in {"verified", "unverified"}:
+        return str(status)
+    if status_raw == "critic_rejected":
+        return "critic_rejected"
+    return "unmeasured"
 
 
 def _counter_value(
@@ -1332,6 +1378,7 @@ def _merge_instance(
         "path": detail.get("path") if detail else None,
     }
     trace_output = _trace_output(trace, trace_status)
+    evidence_completion = _evidence_completion_output(trace, trace_status)
     if patch_empty is not None and trace_output.get("status") == "measured":
         trace_output["direct_write_with_empty_patch_advisory"] = bool(
             patch_empty and _positive(trace_output.get("direct_write_calls"))
@@ -1364,6 +1411,7 @@ def _merge_instance(
         "harness_detail": harness,
         "agent": agent,
         "trace": trace_output,
+        "evidence_completion": evidence_completion,
     }
     row["failure_labels"] = _failure_labels(row)
     return row
@@ -1502,6 +1550,15 @@ def _trace_output(trace: dict[str, Any] | None, status: str) -> dict[str, Any]:
         "duration_seconds": trace.get("duration_seconds"),
         "event_count": trace.get("event_count"),
         "counters": counters,
+    }
+
+
+def _evidence_completion_output(trace: dict[str, Any] | None, trace_status: str) -> dict[str, Any]:
+    if trace is None or trace_status != "measured":
+        return {"status": "unmeasured"}
+    status = trace.get("evidence_completion_status")
+    return {
+        "status": status if status in EVIDENCE_COMPLETION_STATUSES else "unmeasured",
     }
 
 

@@ -70,6 +70,9 @@ def _prepare_predict(monkeypatch, tmp_path: Path, result: dict[str, Any] | Excep
     monkeypatch.setattr(predict, "build_client", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(predict, "ReactAgent", _FakeAgent)
     monkeypatch.setattr(predict, "default_tools", lambda **_kwargs: [])
+    monkeypatch.setattr(
+        predict, "_discard_windows_reserved_untracked_files", lambda _container: ()
+    )
     monkeypatch.setattr(predict, "extract_patch", lambda _workspace: "diff --git a/a b/a\n")
     return workspace_root
 
@@ -141,6 +144,42 @@ def test_start_runtime_container_mounts_workspace_without_removing_image(monkeyp
     assert create[-4:] == ["--entrypoint", "sleep", "task-image:latest", "infinity"]
     assert commands[2] == ["docker", "start", container]
     assert not any(command[:3] == ["docker", "image", "rm"] for command in commands)
+
+
+def test_discard_windows_reserved_untracked_files_uses_linux_container(monkeypatch):
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if "ls-files" in command:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="nul\0notes.txt\0nested/COM1.log\0",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(predict, "_run", fake_run)
+
+    removed = predict._discard_windows_reserved_untracked_files("task-container")
+
+    assert removed == ("nul", "nested/COM1.log")
+    assert commands[0] == [
+        "docker",
+        "exec",
+        "--workdir",
+        "/testbed",
+        "task-container",
+        "git",
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]
+    assert commands[1][-3:] == ["rm", "-f", "--", "nul"][-3:]
+    assert commands[1][-1] == "nul"
+    assert commands[2][-1] == "nested/COM1.log"
 
 
 def test_predict_one_always_stops_runtime_container(monkeypatch, tmp_path):

@@ -39,6 +39,8 @@ BENCH_VARIANTS: list[BenchmarkVariant] = [
     BenchmarkVariant("no_planning", False, True, True),
     BenchmarkVariant("no_skills", True, False, True),
     BenchmarkVariant("no_compression", True, True, False),
+    BenchmarkVariant("no_evidence_gate", True, True, True, False),
+    BenchmarkVariant("evidence_gate", True, True, True, True),
 ]
 
 DEFAULT_BENCH_VARIANTS: list[BenchmarkVariant] = [BENCH_VARIANTS[0]]
@@ -115,7 +117,9 @@ def run_benchmark_suite(
         },
         "runtime_capabilities": {
             "semantic_workspace": config.enable_semantic_workspace,
-            "evidence_graph": config.enable_evidence_graph,
+            "evidence_graph": any(
+                _evidence_graph_enabled(variant, config) for variant in selected_variants
+            ),
             "repo_map": False,
         },
         # 报告要能自证是哪一组：约束声明只影响传给 agent 的 prompt，不进 manifest，
@@ -422,6 +426,42 @@ def summarize_benchmark_results(
             entry["success_rate"] = entry["successes"] / entry["runs"] if entry["runs"] else 0.0
         summary["by_tag"] = dict(sorted(by_tag.items()))
     summary["compression"] = _summarize_accepted_compactions(results)
+    summary["evidence_gate"] = _summarize_evidence_gate(results)
+    return summary
+
+
+def _summarize_evidence_gate(
+    results: Sequence[CodingBenchResult],
+) -> dict[str, dict[str, Any]]:
+    """Measure gate interventions and whether an intervened run later completed."""
+    by_variant: dict[str, list[CodingBenchResult]] = {}
+    for result in results:
+        by_variant.setdefault(result.variant, []).append(result)
+
+    summary: dict[str, dict[str, Any]] = {}
+    for variant, group in by_variant.items():
+        enabled = [result for result in group if result.metadata.get("evidence_graph_enabled")]
+        blocked = [
+            result
+            for result in enabled
+            if int(result.metadata.get("evidence_completion_block_count", 0) or 0) > 0
+        ]
+        recovered = [result for result in blocked if result.metadata.get("status") == "success"]
+        summary[variant] = {
+            "runs": len(group),
+            "enabled_runs": len(enabled),
+            "blocked_runs": len(blocked),
+            "completion_blocks": sum(
+                int(result.metadata.get("evidence_completion_block_count", 0) or 0)
+                for result in enabled
+            ),
+            "rejected_completion_attempts": sum(
+                int(result.metadata.get("evidence_rejected_completion_attempts", 0) or 0)
+                for result in enabled
+            ),
+            "recovered_after_block": len(recovered),
+            "recovery_after_block_rate": len(recovered) / len(blocked) if blocked else None,
+        }
     return summary
 
 
@@ -597,6 +637,31 @@ def write_markdown_report(report: dict[str, Any], path: Path) -> None:
             ]
         )
 
+    evidence = summary.get("evidence_gate") or {}
+    if any(int(data.get("enabled_runs", 0)) > 0 for data in evidence.values()):
+        lines.extend(
+            [
+                "",
+                "## Evidence Completion Gate",
+                "",
+                "| Variant | Enabled runs | Blocked runs | Completion blocks | Recovered after block | Recovery rate |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+        for name, data in evidence.items():
+            rate = data.get("recovery_after_block_rate")
+            lines.append(
+                "| {name} | {enabled_runs} | {blocked_runs} | {completion_blocks} | "
+                "{recovered_after_block} | {rate} |".format(
+                    name=name,
+                    enabled_runs=data["enabled_runs"],
+                    blocked_runs=data["blocked_runs"],
+                    completion_blocks=data["completion_blocks"],
+                    recovered_after_block=data["recovered_after_block"],
+                    rate=f"{rate:.1%}" if rate is not None else "-",
+                )
+            )
+
     by_tag = summary.get("by_tag") or {}
     if by_tag:
         lines.extend(
@@ -726,6 +791,7 @@ def _run_benchmark_task_in_workspace(
     suite: str,
 ) -> CodingBenchResult:
     prepare_workspace(task, workspace)
+    evidence_graph_enabled = _evidence_graph_enabled(variant, config)
     before_snapshot = _snapshot_workspace(workspace)
     client = _build_tracking_client(config)
     trace_path: Path | None = None
@@ -750,7 +816,7 @@ def _run_benchmark_task_in_workspace(
                 "repeat_index": repeat_index,
                 "context_token_budget": config.context_token_budget,
                 "semantic_workspace_enabled": config.enable_semantic_workspace,
-                "evidence_graph_enabled": config.enable_evidence_graph,
+                "evidence_graph_enabled": evidence_graph_enabled,
                 "repo_map_enabled": False,
             },
         )
@@ -770,7 +836,7 @@ def _run_benchmark_task_in_workspace(
         )
         capabilities.append(SemanticWorkspaceCapability(workspace_engine))
         owned_resources.append(workspace_engine)
-    if config.enable_evidence_graph:
+    if evidence_graph_enabled:
         capabilities.append(EvidenceGraphCapability())
 
     agent = ReactAgent(
@@ -850,7 +916,7 @@ def _run_benchmark_task_in_workspace(
             "trace_path": str(trace_path) if trace_path else "",
             "adaptive_replanning_enabled": config.enable_adaptive_replanning,
             "semantic_workspace_enabled": config.enable_semantic_workspace,
-            "evidence_graph_enabled": config.enable_evidence_graph,
+            "evidence_graph_enabled": evidence_graph_enabled,
             "repo_map_enabled": False,
             "max_replans": config.max_replans,
             "context_token_budget": config.context_token_budget,
@@ -897,6 +963,13 @@ def _run_benchmark_task_in_workspace(
         changed_files=changed_files,
         workspace_path=str(workspace) if not cleanup else "",
     )
+
+
+def _evidence_graph_enabled(variant: BenchmarkVariant, config: BenchmarkRunConfig) -> bool:
+    """Resolve an A/B override without changing the existing full baseline."""
+    if variant.enable_evidence_graph is not None:
+        return variant.enable_evidence_graph
+    return config.enable_evidence_graph
 
 
 def _score_run(

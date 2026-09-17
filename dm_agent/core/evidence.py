@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 EvidenceKind = Literal[
@@ -19,6 +20,13 @@ EvidenceStatus = Literal[
     "unaddressed",
     "implemented",
     "partially_verified",
+    "verified",
+    "contradicted",
+]
+ChangeEvidenceStatus = Literal[
+    "missing_read_basis",
+    "unverified",
+    "indirectly_checked",
     "verified",
     "contradicted",
 ]
@@ -89,6 +97,7 @@ class EvidenceGraph:
         self.current_plan_id = ""
         self.workspace_version = ""
         self.summary_pending = False
+        self.last_summary_fingerprint = ""
         self.contradiction_blocked_once = False
         if task:
             self.start(task)
@@ -101,7 +110,9 @@ class EvidenceGraph:
         self._edge_keys.clear()
         self._counters.clear()
         self.current_plan_id = ""
+        self.workspace_version = ""
         self.summary_pending = False
+        self.last_summary_fingerprint = ""
         self.contradiction_blocked_once = False
         node = EvidenceNode(
             self.ROOT_REQUIREMENT_ID,
@@ -151,27 +162,60 @@ class EvidenceGraph:
         return added_nodes, added_edges
 
     def add_observation(
-        self, *, tool: str, path: str, step_number: int, succeeded: bool
+        self,
+        *,
+        tool: str,
+        path: str,
+        step_number: int,
+        succeeded: bool,
+        workspace_version: str = "",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         node = self._new_node(
             "observation",
             _tool_title(tool, path, succeeded),
             step_number,
-            {"tool": tool, "path": path, "succeeded": succeeded},
+            {
+                "tool": tool,
+                "path": _normalize_path(path),
+                "succeeded": succeeded,
+                "workspace_version": workspace_version,
+            },
         )
         edges = self._link_current_plan(node.node_id, "supported_by")
         return [node], edges
 
     def add_change(
-        self, *, tool: str, path: str, step_number: int
+        self,
+        *,
+        tool: str,
+        path: str,
+        step_number: int,
+        before_version: str = "",
+        after_version: str = "",
+        requires_read_basis: bool | None = None,
+        basis_kind: str = "read",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
-        if self.workspace_version:
+        if after_version:
+            self.workspace_version = after_version
+        elif self.workspace_version:
             self.workspace_version = f"pending-change-{step_number}"
+        require_basis = (
+            bool(before_version or after_version)
+            if requires_read_basis is None
+            else requires_read_basis
+        )
         node = self._new_node(
             "change",
             f"Changed {path or '<workspace>'}",
             step_number,
-            {"tool": tool, "path": path},
+            {
+                "tool": tool,
+                "path": _normalize_path(path),
+                "before_version": before_version,
+                "after_version": after_version,
+                "requires_read_basis": require_basis,
+                "basis_kind": basis_kind,
+            },
         )
         edges = self._link_current_plan(node.node_id, "implements")
         edge = self._add_edge(
@@ -188,12 +232,13 @@ class EvidenceGraph:
             if item.kind == "observation"
             and item.step_number is not None
             and item.step_number < step_number
+            and bool(item.metadata.get("succeeded"))
+            and _normalize_path(str(item.metadata.get("path", ""))) == _normalize_path(path)
+            and str(item.metadata.get("workspace_version", "")) == before_version
         ]
-        for observation in sorted(
-            observations, key=lambda item: item.step_number or 0, reverse=True
-        )[:3]:
+        for observation in sorted(observations, key=lambda item: item.step_number or 0)[-1:]:
             edge = self._add_edge(
-                node.node_id, observation.node_id, "motivated_by", confidence="inferred"
+                node.node_id, observation.node_id, "motivated_by", confidence="direct"
             )
             if edge:
                 edges.append(edge)
@@ -209,8 +254,17 @@ class EvidenceGraph:
         workspace_version: str = "",
         check: str = "",
         scope: Sequence[str] = (),
+        target_change_ids: Sequence[str] = (),
+        direct: bool | None = None,
+        details: str = "",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
-        direct = tool == "run_tests"
+        is_direct = False if direct is None else direct
+        targets = tuple(
+            change_id
+            for change_id in dict.fromkeys(str(item) for item in target_change_ids)
+            if self.nodes.get(change_id) is not None
+            and self.nodes[change_id].kind == "change"
+        )
         node = self._new_node(
             "verification",
             f"{tool} {'passed' if passed else 'failed'}",
@@ -218,44 +272,29 @@ class EvidenceGraph:
             {
                 "tool": tool,
                 "passed": passed,
-                "direct": direct,
+                "direct": is_direct,
                 "workspace_version": workspace_version,
                 "check": check or tool,
+                "details": _shorten(details, 800),
                 "scope": list(scope),
+                "target_change_ids": list(targets),
             },
         )
         edges: list[EvidenceEdge] = []
-        changes = [
-            item
-            for item in self.nodes.values()
-            if item.kind == "change"
-            and item.step_number is not None
-            and item.step_number <= step_number
-        ]
-        latest_verification_step = max(
-            (
-                item.step_number or 0
-                for item in self.nodes.values()
-                if item.kind == "verification" and item.node_id != node.node_id
-            ),
-            default=0,
-        )
-        for change in changes:
-            if (change.step_number or 0) <= latest_verification_step:
-                continue
+        for change_id in targets:
             edge = self._add_edge(
                 node.node_id,
-                change.node_id,
+                change_id,
                 "verifies" if passed else "contradicts",
-                confidence="direct" if direct else "indirect",
+                confidence="direct" if is_direct else "indirect",
             )
             if edge:
                 edges.append(edge)
         edge = self._add_edge(
             node.node_id,
             self.ROOT_REQUIREMENT_ID,
-            "verifies" if passed and direct else ("supports" if passed else "contradicts"),
-            confidence="direct" if direct else "indirect",
+            "verifies" if passed and is_direct and targets else ("supports" if passed else "contradicts"),
+            confidence="direct" if is_direct else "indirect",
         )
         if edge:
             edges.append(edge)
@@ -263,13 +302,28 @@ class EvidenceGraph:
         return [node], edges
 
     def add_conclusion(
-        self, *, text: str, step_number: int
+        self,
+        *,
+        text: str,
+        step_number: int,
+        accepted: bool = True,
+        evidence_status: str = "",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
+        states = list(self.change_states().values())
+        conclusion_status = evidence_status or (
+            "verified"
+            if accepted and states and all(item == "verified" for item in states)
+            else self.status()
+        )
         node = self._new_node(
             "conclusion",
             _shorten(text.strip() or "Task completion requested", 240),
             step_number,
-            {"claimed_success": True},
+            {
+                "claimed_success": True,
+                "accepted": accepted,
+                "evidence_status": conclusion_status,
+            },
         )
         edges: list[EvidenceEdge] = []
         supporting = [
@@ -283,48 +337,127 @@ class EvidenceGraph:
             edge = self._add_edge(node.node_id, item.node_id, "supported_by")
             if edge:
                 edges.append(edge)
-        edge = self._add_edge(node.node_id, self.ROOT_REQUIREMENT_ID, "concludes")
+        edge = self._add_edge(
+            node.node_id,
+            self.ROOT_REQUIREMENT_ID,
+            "concludes" if accepted else "attempts_to_conclude",
+        )
         if edge:
             edges.append(edge)
-        return [node], edges
+        final_status = evidence_status or self.status()
+        self.nodes[node.node_id] = EvidenceNode(
+            node.node_id,
+            node.kind,
+            node.title,
+            node.step_number,
+            {**node.metadata, "evidence_status": final_status},
+        )
+        return [self.nodes[node.node_id]], edges
+
+    def change_states(self) -> dict[str, ChangeEvidenceStatus]:
+        """Return the current evidence state for every recorded change."""
+        result: dict[str, ChangeEvidenceStatus] = {}
+        for change in self._nodes_of_kind("change"):
+            checks = self._current_checks_for_change(change.node_id)
+            if any(not bool(node.metadata.get("passed")) for node in checks):
+                result[change.node_id] = "contradicted"
+                continue
+            legacy_change = "before_version" not in change.metadata
+            tool_validated_basis = str(change.metadata.get("basis_kind", "")) in {
+                "content_anchor",
+                "expected_hash",
+            }
+            has_read_basis = any(
+                edge.source_id == change.node_id
+                and edge.relation == "motivated_by"
+                and (edge.confidence == "direct" or legacy_change)
+                for edge in self.edges
+            )
+            if (
+                bool(change.metadata.get("requires_read_basis", True))
+                and not has_read_basis
+                and not tool_validated_basis
+            ):
+                result[change.node_id] = "missing_read_basis"
+                continue
+            if any(
+                bool(node.metadata.get("passed")) and bool(node.metadata.get("direct"))
+                for node in checks
+            ):
+                result[change.node_id] = "verified"
+            elif any(bool(node.metadata.get("passed")) for node in checks):
+                result[change.node_id] = "indirectly_checked"
+            else:
+                result[change.node_id] = "unverified"
+        return result
+
+    def completion_issues(self) -> list[dict[str, str]]:
+        """Describe per-change evidence gaps for audit, not policy enforcement."""
+        issues = []
+        for node_id, status in self.change_states().items():
+            if status == "verified":
+                continue
+            node = self.nodes[node_id]
+            issues.append(
+                {
+                    "node_id": node_id,
+                    "path": str(node.metadata.get("path") or "<workspace>"),
+                    "status": status,
+                }
+            )
+        return issues
+
+    def current_verifications(self) -> list[EvidenceNode]:
+        """Return verification facts that apply to the current workspace version."""
+        result = []
+        for node in self._nodes_of_kind("verification"):
+            version = str(node.metadata.get("workspace_version", ""))
+            if self.workspace_version and version != self.workspace_version:
+                continue
+            result.append(node)
+        return _latest_verifications(result)
 
     def status(self) -> EvidenceStatus:
-        changes = self._nodes_of_kind("change")
         observations = self._nodes_of_kind("observation")
-        conclusions = self._nodes_of_kind("conclusion")
-        verifications = self._nodes_of_kind("verification")
-        latest_change = max((node.step_number or 0 for node in changes), default=0)
-        relevant = [
+        conclusions = [
             node
-            for node in verifications
-            if (node.step_number or 0) >= latest_change
-            and latest_change > 0
-            and (
-                not self.workspace_version
-                or node.metadata.get("workspace_version") == self.workspace_version
-            )
+            for node in self._nodes_of_kind("conclusion")
+            if bool(node.metadata.get("accepted", True))
         ]
-        latest_checks: dict[tuple[str, str, tuple[str, ...]], EvidenceNode] = {}
-        for node in relevant:
-            key = (
-                str(node.metadata.get("workspace_version", "")),
-                str(node.metadata.get("check", node.metadata.get("tool", ""))),
-                tuple(node.metadata.get("scope", [])),
-            )
-            latest_checks[key] = node
-        relevant = list(latest_checks.values())
-        if any(not bool(node.metadata.get("passed")) for node in relevant):
+        states = list(self.change_states().values())
+        if "contradicted" in states:
             return "contradicted"
-        passed = [node for node in relevant if bool(node.metadata.get("passed"))]
-        if passed:
-            if conclusions and any(bool(node.metadata.get("direct")) for node in passed):
+        if states:
+            if conclusions and all(state == "verified" for state in states):
                 return "verified"
-            return "partially_verified"
-        if changes:
+            if any(state in {"verified", "indirectly_checked"} for state in states):
+                return "partially_verified"
             return "implemented"
-        if conclusions and observations:
+        checks = self.current_verifications()
+        if any(not bool(node.metadata.get("passed")) for node in checks):
+            return "contradicted"
+        if conclusions and any(
+            bool(node.metadata.get("passed")) and bool(node.metadata.get("direct"))
+            for node in checks
+        ):
+            return "verified"
+        if conclusions and (observations or any(bool(node.metadata.get("passed")) for node in checks)):
             return "partially_verified"
         return "unaddressed"
+
+    def _current_checks_for_change(self, change_id: str) -> list[EvidenceNode]:
+        checks: list[EvidenceNode] = []
+        for edge in self.edges:
+            if edge.target_id != change_id or edge.relation not in {"verifies", "contradicts"}:
+                continue
+            node = self.nodes.get(edge.source_id)
+            if node is None or node.kind != "verification":
+                continue
+            version = str(node.metadata.get("workspace_version", ""))
+            if self.workspace_version and version != self.workspace_version:
+                continue
+            checks.append(node)
+        return _latest_verifications(checks)
 
     def audit(self) -> dict[str, Any]:
         counts = {
@@ -343,13 +476,33 @@ class EvidenceGraph:
             for node in self._nodes_of_kind("verification")
             if not bool(node.metadata.get("passed"))
         )
+        change_states = self.change_states()
+        state_counts = {
+            status: sum(1 for value in change_states.values() if value == status)
+            for status in (
+                "missing_read_basis",
+                "unverified",
+                "indirectly_checked",
+                "verified",
+                "contradicted",
+            )
+        }
+        conclusions = self._nodes_of_kind("conclusion")
+        accepted_conclusions = [
+            node for node in conclusions if bool(node.metadata.get("accepted", True))
+        ]
         return {
             "status": self.status(),
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),
             "counts": counts,
             "failed_verifications": failed,
-            "has_conclusion": bool(counts["conclusion"]),
+            "has_conclusion": bool(accepted_conclusions),
+            "completion_attempts": len(conclusions),
+            "rejected_completion_attempts": len(conclusions) - len(accepted_conclusions),
+            "change_states": change_states,
+            "change_status_counts": state_counts,
+            "completion_issues": self.completion_issues(),
         }
 
     def prompt_summary(self, *, max_chars: int = 800) -> str:
@@ -373,8 +526,10 @@ class EvidenceGraph:
             )
         if failed:
             lines.append("Contradicting checks: " + ", ".join(node.title for node in failed[-3:]))
-        if changes and not verifications:
-            lines.append("Missing evidence: the current changes have not been checked yet.")
+        issues = self.completion_issues()
+        if issues:
+            detail = ", ".join(f"{item['path']} ({item['status']})" for item in issues[:4])
+            lines.append(f"Completion gaps: {detail}")
         if audit["status"] == "contradicted":
             lines.append(
                 "Do not claim success until the failing verification is addressed or explained."
@@ -390,6 +545,7 @@ class EvidenceGraph:
             "counters": dict(self._counters),
             "current_plan_id": self.current_plan_id,
             "summary_pending": self.summary_pending,
+            "last_summary_fingerprint": self.last_summary_fingerprint,
             "contradiction_blocked_once": self.contradiction_blocked_once,
         }
 
@@ -416,6 +572,7 @@ class EvidenceGraph:
         }
         graph.current_plan_id = str(data.get("current_plan_id", ""))
         graph.summary_pending = bool(data.get("summary_pending", False))
+        graph.last_summary_fingerprint = str(data.get("last_summary_fingerprint", ""))
         graph.contradiction_blocked_once = bool(data.get("contradiction_blocked_once", False))
         return graph
 
@@ -491,3 +648,21 @@ def _shorten(text: str, limit: int) -> str:
     if limit <= 3:
         return text[:limit]
     return text[: limit - 3] + "..."
+
+
+def _normalize_path(path: str) -> str:
+    normalized = PurePosixPath(str(path or "").replace("\\", "/")).as_posix()
+    return normalized[2:] if normalized.startswith("./") else normalized
+
+
+def _latest_verifications(nodes: Sequence[EvidenceNode]) -> list[EvidenceNode]:
+    latest: dict[tuple[str, tuple[str, ...]], EvidenceNode] = {}
+    for node in nodes:
+        key = (
+            str(node.metadata.get("check", node.metadata.get("tool", ""))),
+            tuple(str(item) for item in node.metadata.get("scope", [])),
+        )
+        current = latest.get(key)
+        if current is None or (node.step_number or 0) >= (current.step_number or 0):
+            latest[key] = node
+    return list(latest.values())

@@ -41,10 +41,22 @@ def test_verification_is_versioned_and_retries_supersede():
     graph.add_change(tool="edit_file", path="users.py", step_number=1)
     graph.workspace_version = "a"
     graph.add_verification(
-        tool="run_tests", step_number=2, passed=False, workspace_version="a", check="X"
+        tool="run_tests",
+        step_number=2,
+        passed=False,
+        workspace_version="a",
+        check="X",
+        target_change_ids=("change-1",),
+        direct=True,
     )
     graph.add_verification(
-        tool="run_tests", step_number=3, passed=True, workspace_version="a", check="X"
+        tool="run_tests",
+        step_number=3,
+        passed=True,
+        workspace_version="a",
+        check="X",
+        target_change_ids=("change-1",),
+        direct=True,
     )
     graph.add_conclusion(text="done", step_number=4)
     assert graph.status() == "verified"

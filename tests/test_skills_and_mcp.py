@@ -1,4 +1,5 @@
 import json
+from queue import Queue
 
 from dm_agent.mcp.config import MCPConfig, MCPServerConfig
 from dm_agent.skills import ConfigSkill, SkillManager
@@ -147,3 +148,55 @@ def test_mcp_tool_wrapper_reports_when_reconnect_fails():
 
     assert "未运行" in observation
     assert manager.reconnect_counts["srv"] == 1
+
+
+def test_mcp_client_ignores_notifications_while_waiting_for_response():
+    from dm_agent.mcp.client import MCPClient
+
+    class StubStdin:
+        def write(self, value):
+            return len(value)
+
+        def flush(self):
+            pass
+
+    client = MCPClient("srv", "echo", ["hi"])
+    client.process = type("Process", (), {"stdin": StubStdin()})()
+    client._stdout_queue = Queue()
+    client._stdout_queue.put(json.dumps({"jsonrpc": "2.0", "method": "notifications/log"}))
+    client._stdout_queue.put(json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}))
+
+    assert client._send_message("tools/list") == {"ok": True}
+
+
+def test_mcp_client_uses_utf8_for_windows_stdio(monkeypatch):
+    from dm_agent.mcp import client as mcp_client
+
+    calls = []
+
+    class StubProcess:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout):
+            return 0
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return StubProcess()
+
+    monkeypatch.setattr(mcp_client.sys, "platform", "win32")
+    monkeypatch.setattr(mcp_client.subprocess, "Popen", fake_popen)
+    client = mcp_client.MCPClient("srv", "npx", ["tool"])
+    monkeypatch.setattr(client, "_initialize", lambda: True)
+
+    assert client.start()
+    assert calls[0][1]["encoding"] == "utf-8"
+    assert calls[0][1]["errors"] == "replace"

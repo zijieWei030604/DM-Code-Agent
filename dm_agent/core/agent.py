@@ -745,6 +745,11 @@ class ReactAgent:
                 self._publish_step(step, step_num)
                 if accepted:
                     return finish_result(final)
+                if metadata.get("evidence_terminal_completion_rejection"):
+                    metadata["status"] = "critic_rejected"
+                    metadata["failure_reason"] = observation
+                    metadata["duration_seconds"] = time.perf_counter() - started_at
+                    return finish_result("")
                 if plan and self.planner:
                     plan = self._replan_after_failure(
                         task,
@@ -863,6 +868,12 @@ class ReactAgent:
 
             # 调用回调函数实时输出步骤
             self._publish_step(step, step_num)
+
+            if not accepted and metadata.get("evidence_terminal_completion_rejection"):
+                metadata["status"] = "critic_rejected"
+                metadata["failure_reason"] = observation
+                metadata["duration_seconds"] = time.perf_counter() - started_at
+                return finish_result("")
 
             if invocation_failed and plan and self.planner:
                 plan = self._replan_after_failure(

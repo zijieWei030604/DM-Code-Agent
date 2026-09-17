@@ -24,7 +24,18 @@ def rebuild_evidence_graph(events: Sequence[Mapping[str, Any]]) -> EvidenceGraph
             nodes.append(dict(payload))
         elif name == "evidence_edge":
             edges.append(dict(payload))
-    return EvidenceGraph.from_dict({"task": task, "nodes": nodes, "edges": edges})
+    graph = EvidenceGraph.from_dict({"task": task, "nodes": nodes, "edges": edges})
+    versioned = [
+        node
+        for node in graph.nodes.values()
+        if node.kind in {"change", "verification"} and node.step_number is not None
+    ]
+    if versioned:
+        latest = max(versioned, key=lambda node: node.step_number or 0)
+        graph.workspace_version = str(
+            latest.metadata.get("after_version") or latest.metadata.get("workspace_version") or ""
+        )
+    return graph
 
 
 def analyze_evidence_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -42,22 +53,14 @@ def analyze_evidence_events(events: Sequence[Mapping[str, Any]]) -> dict[str, An
             "unverified_changes": [],
         }
     audit = graph.audit()
-    verified_change_ids = {
-        edge.target_id
-        for edge in graph.edges
-        if edge.relation == "verifies"
-        and graph.nodes.get(edge.source_id) is not None
-        and graph.nodes[edge.source_id].kind == "verification"
-        and bool(graph.nodes[edge.source_id].metadata.get("passed"))
-    }
     unverified_changes = [
         {
-            "node_id": node.node_id,
-            "path": str(node.metadata.get("path") or ""),
-            "step_number": node.step_number,
+            "node_id": issue["node_id"],
+            "path": issue["path"],
+            "step_number": graph.nodes[issue["node_id"]].step_number,
+            "status": issue["status"],
         }
-        for node in graph.nodes.values()
-        if node.kind == "change" and node.node_id not in verified_change_ids
+        for issue in graph.completion_issues()
     ]
     return {
         "enabled": True,

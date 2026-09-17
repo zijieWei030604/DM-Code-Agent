@@ -79,7 +79,10 @@ def build_run_result(
 ) -> dict[str, Any]:
     """组装一次 run 的返回值；成功时顺带补一段完成摘要。"""
     if metadata.get("status") == "success":
-        metadata["completion_summary"] = build_completion_summary(final_answer, steps)
+        summary = build_completion_summary(final_answer, steps)
+        if metadata.get("evidence_completion_status") == "unverified":
+            summary += " 本轮未获得成功的本地验证记录。"
+        metadata["completion_summary"] = summary
     return {
         "final_answer": final_answer,
         "steps": [step.__dict__ for step in steps],

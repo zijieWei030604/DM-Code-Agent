@@ -23,6 +23,7 @@ from dm_agent.benchmarks.models import (
     CommandResult,
 )
 from dm_agent.benchmarks.runner import (
+    BENCH_VARIANTS,
     DEFAULT_BENCH_VARIANTS,
     benchmark_task_fingerprint,
     build_benchmark_manifest,
@@ -161,6 +162,42 @@ def test_benchmark_context_budget_is_passed_to_agent_and_reported(monkeypatch: p
     assert result.metadata["evidence_graph_enabled"] is True
     assert result.metadata["repo_map_enabled"] is False
     assert result.metadata["context_token_budget"] == 8000
+
+
+def test_evidence_gate_variants_override_the_default_capability_setting(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task = get_coding_tasks(["slugify_cleanup"])[0]
+    seen: list[set[str]] = []
+
+    class FakeAgent:
+        def __init__(self, *args, **kwargs):
+            seen.append({type(capability).__name__ for capability in kwargs["capabilities"]})
+
+        def run(self, prompt):
+            return {"final_answer": "ok", "steps": [], "metadata": {"status": "success"}}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(runner_module, "ReactAgent", FakeAgent)
+    monkeypatch.setattr(
+        runner_module, "run_hidden_tests", lambda *args, **kwargs: CommandResult([], 0, "", "", 0.0)
+    )
+    disabled = next(item for item in BENCH_VARIANTS if item.name == "no_evidence_gate")
+    enabled = next(item for item in BENCH_VARIANTS if item.name == "evidence_gate")
+
+    off = runner_module.run_benchmark_task(
+        task, disabled, BenchmarkRunConfig(enable_evidence_graph=True)
+    )
+    on = runner_module.run_benchmark_task(
+        task, enabled, BenchmarkRunConfig(enable_evidence_graph=False)
+    )
+
+    assert "EvidenceGraphCapability" not in seen[0]
+    assert "EvidenceGraphCapability" in seen[1]
+    assert off.metadata["evidence_graph_enabled"] is False
+    assert on.metadata["evidence_graph_enabled"] is True
 
 
 def test_benchmark_suite_selector_filters_tasks():
@@ -421,6 +458,40 @@ def test_benchmark_summary_reports_accepted_compaction_only():
     assert compression["accepted_events"] == 2
     assert compression["saved_tokens"] == 200
     assert compression["direct_reduction_rate"] == pytest.approx(0.2)
+
+
+def test_benchmark_summary_reports_evidence_gate_intervention_and_recovery():
+    blocked = _bench_result_with_metadata(
+        "blocked",
+        success=True,
+        final_answer="ok",
+        tokens=100,
+        metadata={
+            "evidence_graph_enabled": True,
+            "evidence_completion_block_count": 2,
+            "evidence_rejected_completion_attempts": 2,
+        },
+    )
+    blocked = replace(blocked, variant="evidence_gate")
+    clean = _bench_result_with_metadata(
+        "clean",
+        success=False,
+        final_answer="",
+        tokens=100,
+        metadata={"evidence_graph_enabled": True},
+    )
+    clean = replace(clean, variant="evidence_gate")
+    baseline = _bench_result("baseline", success=True, final_answer="ok", tokens=100)
+    baseline = replace(baseline, variant="no_evidence_gate")
+
+    gate = summarize_benchmark_results([blocked, clean, baseline])["evidence_gate"]
+
+    assert gate["evidence_gate"]["enabled_runs"] == 2
+    assert gate["evidence_gate"]["blocked_runs"] == 1
+    assert gate["evidence_gate"]["completion_blocks"] == 2
+    assert gate["evidence_gate"]["recovered_after_block"] == 1
+    assert gate["evidence_gate"]["recovery_after_block_rate"] == 1.0
+    assert gate["no_evidence_gate"]["enabled_runs"] == 0
 
 
 def test_hidden_tests_fail_on_initial_slugify_workspace(tmp_path):
