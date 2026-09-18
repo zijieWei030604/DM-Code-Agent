@@ -22,6 +22,7 @@ BUILTIN_TOOL_NAMES = [
     "get_code_metrics",
     "search_symbol",
     "dependency_graph",
+    "inspect_change_impact",
     "inspect_python_symbol",
     "edit_python_symbol",
     "task_complete",

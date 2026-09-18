@@ -30,6 +30,11 @@ class ImpactNode:
     via_path: str
     via_symbol: str
 
+    @property
+    def confidence_level(self) -> str:
+        """Expose a stable category without discarding the internal score."""
+        return "confirmed" if self.confidence >= HIGH_CONFIDENCE else "ambiguous"
+
 
 @dataclass(frozen=True)
 class ImpactReport:
@@ -58,7 +63,17 @@ class ImpactReport:
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
-        payload["affected_symbols"] = [asdict(item) for item in self.affected_symbols]
+        payload["affected_symbols"] = [
+            {**asdict(item), "confidence_level": item.confidence_level}
+            for item in self.affected_symbols
+        ]
+        payload["test_candidates"] = [
+            {
+                "path": path,
+                "confidence_level": "fallback" if path in self.fallback_tests else "confirmed",
+            }
+            for path in self.related_tests
+        ]
         return payload
 
     def render(self, *, max_nodes: int = 12) -> str:
@@ -75,7 +90,8 @@ class ImpactReport:
                 lines.append(
                     f"  - {item.path}:{item.symbol} <-{item.relation}- "
                     f"{item.via_path}:{item.via_symbol} "
-                    f"(depth={item.distance}, confidence={item.confidence:.2f})"
+                    f"(depth={item.distance}, level={item.confidence_level}, "
+                    f"confidence={item.confidence:.2f})"
                 )
         remaining = max(0, max_nodes - len(self.confirmed_symbols[:max_nodes]))
         if self.ambiguous_symbols and remaining:
@@ -84,7 +100,8 @@ class ImpactReport:
                 lines.append(
                     f"  - {item.path}:{item.symbol} <-{item.relation}- "
                     f"{item.via_path}:{item.via_symbol} "
-                    f"(depth={item.distance}, confidence={item.confidence:.2f})"
+                    f"(depth={item.distance}, level={item.confidence_level}, "
+                    f"confidence={item.confidence:.2f})"
                 )
         if self.graph_tests:
             lines.append(f"related_tests: {', '.join(self.graph_tests[:12])}")

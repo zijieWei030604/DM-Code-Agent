@@ -21,7 +21,7 @@ from dm_agent.core import ReactAgent
 from dm_agent.evals.real_runner import PROVIDER_API_KEY_ENV, UsageTrackingClient
 from dm_agent.extensions.capabilities import EvidenceGraphCapability, SemanticWorkspaceCapability
 from dm_agent.skills import SkillManager
-from dm_agent.tools import default_tools
+from dm_agent.tools import bind_semantic_workspace_tools, default_tools
 from dm_agent.tracing import TraceWriter, analyze_events, load_trace_events
 from dm_agent.workspace import SemanticWorkspaceEngine
 
@@ -828,6 +828,7 @@ def _run_benchmark_task_in_workspace(
 
     capabilities = []
     owned_resources = []
+    workspace_engine = None
     if config.enable_semantic_workspace:
         workspace_index_path = _benchmark_workspace_index_path(workspace)
         workspace_engine = SemanticWorkspaceEngine(
@@ -839,9 +840,12 @@ def _run_benchmark_task_in_workspace(
     if evidence_graph_enabled:
         capabilities.append(EvidenceGraphCapability())
 
+    agent_tools = default_tools(include_mcp=False)
+    if workspace_engine is not None:
+        bind_semantic_workspace_tools(agent_tools, workspace_engine)
     agent = ReactAgent(
         client,
-        default_tools(include_mcp=False),
+        agent_tools,
         max_steps=config.max_steps or task.max_steps,
         temperature=config.temperature,
         enable_planning=variant.enable_planning,

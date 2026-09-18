@@ -19,6 +19,8 @@ from .code_analysis_tools import (
 from .code_index_tools import (
     dependency_graph,
     dependency_graph_result,
+    inspect_change_impact,
+    inspect_change_impact_result,
     search_symbol,
     search_symbol_result,
 )
@@ -155,6 +157,16 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "dependency_graph": _object_schema(
         {"root": _STR, "max_files": _INT, "include_external": _BOOL}
+    ),
+    "inspect_change_impact": _object_schema(
+        {
+            "paths": {"type": "array", "items": _STR, "minItems": 1},
+            "root": _STR,
+            "max_depth": _INT,
+            "max_nodes": _INT,
+            "max_tests": _INT,
+        },
+        ("paths",),
     ),
     "inspect_python_symbol": _object_schema(
         {"path": _STR, "qualified_name": _STR}, ("path", "qualified_name")
@@ -375,6 +387,19 @@ def _builtin_tools() -> list[Tool]:
             result_runner=dependency_graph_result,
         ),
         Tool(
+            name="inspect_change_impact",
+            description=(
+                "Inspect candidate files and tests affected by changed Python files. "
+                'Arguments: {"paths": [string, ...], "max_depth": optional int, '
+                '"max_nodes": optional int, "max_tests": optional int}. '
+                "Returns confirmed, ambiguous, and filename-fallback candidates with provenance. "
+                "Candidates must be inspected before editing and validated with tests."
+            ),
+            runner=inspect_change_impact,
+            result_runner=inspect_change_impact_result,
+            read_only=True,
+        ),
+        Tool(
             name="inspect_python_symbol",
             description=(
                 "Inspect one top-level Python function/class or direct class method without knowing line numbers. "
@@ -419,7 +444,15 @@ def bind_semantic_workspace_tools(tools: list[Tool], engine: SemanticWorkspaceEn
                 read_only=tool.read_only,
                 input_schema=tool.input_schema,
             )
-            return
+        elif tool.name == "inspect_change_impact" and tool.runner is inspect_change_impact:
+            tools[index] = Tool(
+                name=tool.name,
+                description=tool.description,
+                runner=partial(inspect_change_impact, engine=engine),
+                result_runner=partial(inspect_change_impact_result, engine=engine),
+                read_only=tool.read_only,
+                input_schema=tool.input_schema,
+            )
 
 
 def register_builtin_tools(api: ExtensionAPI) -> None:

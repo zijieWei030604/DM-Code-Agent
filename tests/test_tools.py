@@ -7,7 +7,7 @@ import dm_agent.tools.file_tools as file_tools_module
 from dm_agent.core.observation import is_failure_observation
 from dm_agent.tools import task_complete
 from dm_agent.tools.code_analysis_tools import get_code_metrics, get_function_signature, parse_ast
-from dm_agent.tools.code_index_tools import dependency_graph, search_symbol
+from dm_agent.tools.code_index_tools import dependency_graph, inspect_change_impact, search_symbol
 from dm_agent.tools.execution_tools import available_linters, run_linter, run_python
 from dm_agent.tools.file_tools import (
     EDIT_ECHO_MAX_LINES,
@@ -406,6 +406,30 @@ def test_code_index_tools_find_symbols_and_dependencies(tmp_path):
 
     graph = json.loads(dependency_graph({"root": str(tmp_path)}))
     assert {"from": "pkg.service", "to": "pkg.models", "import": "pkg.models"} in graph["edges"]
+
+
+def test_inspect_change_impact_returns_confidence_tiers_and_provenance(tmp_path):
+    (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n",
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_service.py").write_text("def test_value():\n    assert True\n", encoding="utf-8")
+
+    result = json.loads(
+        inspect_change_impact({"root": str(tmp_path), "paths": ["service.py"]})
+    )
+
+    assert any(
+        item["path"] == "consumer.py" and item["confidence_level"] == "confirmed"
+        for item in result["affected_symbols"]
+    )
+    assert result["test_candidates"] == [
+        {"path": "tests/test_service.py", "confidence_level": "fallback"}
+    ]
+    assert "candidates" in result["notice"].casefold()
 
 
 def test_run_python_executes_inline_code():

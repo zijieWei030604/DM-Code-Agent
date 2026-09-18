@@ -787,8 +787,8 @@ def test_semantic_capability_injects_bounded_impact_once_after_change(tmp_path):
     assert "<change_impact>" in messages[1]["content"]
     assert "service.py" in messages[1]["content"]
     assert "consumer.py" in messages[1]["content"]
-    assert "likely_affected: consumer.py" in messages[1]["content"]
-    assert "ambiguous_candidates: none" in messages[1]["content"]
+    assert "confirmed_affected: consumer.py" in messages[1]["content"]
+    assert "Use inspect_change_impact" in messages[1]["content"]
     assert metadata["semantic_impact_injection_count"] == 1
     injected = next(payload for event, payload in recorded if event == "semantic_impact_injected")
     assert injected["content"] == messages[1]["content"]
@@ -931,6 +931,32 @@ def test_semantic_capability_suppresses_an_identical_impact_summary(tmp_path):
     assert metadata["semantic_impact_injection_count"] == 1
     assert metadata["semantic_impact_duplicate_suppressions"] == 1
     engine.close()
+
+
+def test_semantic_capability_soft_fails_when_initial_indexing_breaks(tmp_path):
+    class BrokenEngine:
+        root = tmp_path
+
+        def update(self, paths=None):
+            raise OSError("index unavailable")
+
+    recorded: list[tuple[str, dict[str, object]]] = []
+
+    class TraceWriter:
+        def record(self, event: str, payload: dict[str, object]) -> None:
+            recorded.append((event, payload))
+
+    bus = EventBus()
+    SemanticWorkspaceCapability(BrokenEngine()).install(
+        CapabilityContext(bus, lambda phase: None, TraceWriter())
+    )
+    metadata: dict[str, object] = {}
+
+    bus.emit_run_start(RunStartEvent("continue normally", 1, "run", metadata=metadata))
+
+    assert metadata["semantic_workspace_enabled"] is True
+    assert metadata["semantic_workspace_errors"] == 1
+    assert any(event == "semantic_workspace_error" for event, _ in recorded)
 
 
 def test_package_init_relative_import_keeps_the_package_prefix(tmp_path):

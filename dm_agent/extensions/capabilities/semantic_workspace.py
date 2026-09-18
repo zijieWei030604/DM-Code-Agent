@@ -18,7 +18,7 @@ class SemanticWorkspaceCapability:
         self,
         engine: SemanticWorkspaceEngine,
         *,
-        impact_summary_chars: int = 1200,
+        impact_summary_chars: int = 600,
     ) -> None:
         if impact_summary_chars < 200:
             raise ValueError("impact_summary_chars must be at least 200")
@@ -49,15 +49,27 @@ class SemanticWorkspaceCapability:
         self._impact_revision = 0
         self._injected_revision = 0
         self._last_injected_sha256 = ""
-        stats = self.engine.update()
         event.metadata.update(
             {
                 "semantic_workspace_enabled": True,
                 "semantic_impact_enabled": True,
+                "semantic_impact_injection_count": 0,
+            }
+        )
+        try:
+            stats = self.engine.update()
+        except Exception as exc:  # Auxiliary indexing must not abort the Agent run.
+            event.metadata["semantic_workspace_errors"] = 1
+            self._record(
+                "semantic_workspace_error",
+                {"step_number": 0, "phase": "run_start", "error": str(exc)},
+            )
+            return
+        event.metadata.update(
+            {
                 "semantic_index_files": stats.scanned_files,
                 "semantic_index_cache_hits": stats.cache_hits,
                 "semantic_index_parse_errors": stats.parse_errors,
-                "semantic_impact_injection_count": 0,
             }
         )
 
@@ -67,9 +79,24 @@ class SemanticWorkspaceCapability:
         path = event.arguments.get("path")
         if not isinstance(path, str) or not path:
             return
-        stats = self.engine.update([path])
-        self._changed_paths.add(path)
-        impact = self.engine.analyze_impact(self._changed_paths)
+        try:
+            stats = self.engine.update([path])
+            self._changed_paths.add(path)
+            impact = self.engine.analyze_impact(self._changed_paths)
+        except Exception as exc:  # Keep ordinary tools available when semantic analysis fails.
+            event.metadata["semantic_workspace_errors"] = (
+                int(event.metadata.get("semantic_workspace_errors", 0)) + 1
+            )
+            self._record(
+                "semantic_workspace_error",
+                {
+                    "step_number": event.step_number,
+                    "phase": "incremental_update",
+                    "path": path,
+                    "error": str(exc),
+                },
+            )
+            return
         self._pending_impact = impact
         self._impact_revision += 1
         event.metadata["semantic_index_incremental_updates"] = (
@@ -156,26 +183,14 @@ def _render_impact_summary(impact: ImpactReport, *, max_chars: int) -> str:
             }
         )
     )
-    ambiguous_files = tuple(
-        sorted(
-            {
-                item.path
-                for item in impact.ambiguous_symbols
-                if item.path not in impact.changed_files
-            }
-        )
-    )
     lines = [
         "<change_impact>",
-        "Heuristic candidates only; inspect files before editing and validate with tests.",
-        f"risk: {impact.risk_level} ({impact.risk_score:.2f})",
+        "Candidate impact only; inspect before editing and validate with tests.",
         f"changed: {', '.join(impact.changed_files[:5]) or 'none'}",
-        f"likely_affected: {', '.join(confirmed_files[:5]) or 'none'}",
-        f"ambiguous_candidates: {', '.join(ambiguous_files[:5]) or 'none'}",
-        f"related_tests: {', '.join(impact.graph_tests[:5]) or 'none'}",
-        f"fallback_tests: {', '.join(impact.fallback_tests[:5]) or 'none'}",
+        f"confirmed_affected: {', '.join(confirmed_files[:4]) or 'none'}",
+        f"suggested_tests: {', '.join(impact.graph_tests[:4]) or 'none'}",
+        "Use inspect_change_impact for provenance, ambiguous candidates, and fallbacks.",
     ]
-    lines.extend(f"reason: {reason}" for reason in impact.reasons[:3])
     lines.append("</change_impact>")
     summary = "\n".join(lines)
     if len(summary) <= max_chars:

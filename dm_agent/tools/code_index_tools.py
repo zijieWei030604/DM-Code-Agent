@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import sqlite3
 import tempfile
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -129,6 +130,51 @@ def dependency_graph(arguments: dict[str, Any]) -> str:
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
+def inspect_change_impact(
+    arguments: dict[str, Any],
+    *,
+    engine: SemanticWorkspaceEngine | None = None,
+) -> str:
+    """Inspect explainable, confidence-tiered impact candidates for changed files."""
+    raw_paths = arguments.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths or not all(
+        isinstance(path, str) and path.strip() for path in raw_paths
+    ):
+        raise ValueError("paths must be a non-empty array of file paths")
+    root = Path(arguments.get("root", engine.root if engine else ".")).resolve()
+    max_depth = int(arguments.get("max_depth", 2))
+    max_nodes = int(arguments.get("max_nodes", 50))
+    max_tests = int(arguments.get("max_tests", 8))
+    if not 0 <= max_depth <= 5:
+        raise ValueError("max_depth must be between 0 and 5")
+    if max_nodes < 1 or max_tests < 0:
+        raise ValueError("max_nodes must be positive and max_tests must not be negative")
+    if engine is not None and engine.root != root:
+        raise ValueError(f"inspection root {root} does not match semantic workspace {engine.root}")
+
+    owned_engine = engine is None
+    current_engine = engine or SemanticWorkspaceEngine(
+        root,
+        database_path=_standalone_index_path(root),
+    )
+    try:
+        current_engine.update()
+        report = current_engine.analyze_impact(
+            raw_paths,
+            max_depth=max_depth,
+            max_nodes=max_nodes,
+            max_tests=max_tests,
+        )
+        result = report.to_dict()
+        result["notice"] = (
+            "Impact entries are candidates: inspect source before editing and validate with tests."
+        )
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    finally:
+        if owned_engine:
+            current_engine.close()
+
+
 def _standalone_index_path(root: Path) -> Path:
     """Keep ad-hoc symbol-search indexes outside the inspected repository."""
     root_hash = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
@@ -172,6 +218,23 @@ def search_symbol_result(
 def dependency_graph_result(arguments: dict[str, Any]) -> ToolResult:
     failure = _index_root_failure(arguments)
     return failure or ToolResult("success", dependency_graph(arguments))
+
+
+def inspect_change_impact_result(
+    arguments: dict[str, Any],
+    *,
+    engine: SemanticWorkspaceEngine | None = None,
+) -> ToolResult:
+    checked_arguments = dict(arguments)
+    if engine is not None and "root" not in checked_arguments:
+        checked_arguments["root"] = str(engine.root)
+    failure = _index_root_failure(checked_arguments)
+    if failure:
+        return failure
+    try:
+        return ToolResult("success", inspect_change_impact(arguments, engine=engine))
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return ToolResult("failed", str(exc), error_code="impact_analysis_failed")
 
 
 def _iter_python_files(root: Path, *, max_files: int, include_tests: bool) -> Iterable[Path]:
