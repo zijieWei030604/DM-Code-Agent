@@ -13,9 +13,9 @@
     "scikit-learn__scikit-learn-10844",
     "scikit-learn__scikit-learn-25102",
     "sphinx-doc__sphinx-10614",
-    "sphinx-doc__sphinx-7590",
+    "sphinx-doc__sphinx-9229",
     "sympy__sympy-13615",
-    "sympy__sympy-13878",
+    "sympy__sympy-14248",
     "astropy__astropy-13398",
     "astropy__astropy-13977",
     "django__django-14631",
@@ -44,10 +44,9 @@
     "sympy/sympy": 2
   },
   "difficulty_counts": {
-    "1-4 hours": 6,
+    "1-4 hours": 8,
     "15 min - 1 hour": 7,
-    "<15 min fix": 5,
-    ">4 hours": 2
+    "<15 min fix": 5
   },
-  "selection_signature": "eb25ce4bf290a7cbe3f3e17d2844aa9d512c8fac2659bf52fc085c299d0eff9f"
+  "selection_signature": "fc645ee884252815c46171acf913dd3144aabdb93e54870bd2011a7ecea4965b"
 }
