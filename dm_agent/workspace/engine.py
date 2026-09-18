@@ -280,12 +280,14 @@ class SemanticWorkspaceEngine:
         *,
         max_depth: int = 2,
         max_nodes: int = 100,
+        max_tests: int = 8,
     ) -> ImpactReport:
         """Return reverse dependencies, related tests, and an explainable risk score."""
         return self._impact_graph.analyze(
             changed_paths,
             max_depth=max_depth,
             max_nodes=max_nodes,
+            max_tests=max_tests,
         )
 
     def build_repo_map(

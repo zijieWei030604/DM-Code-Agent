@@ -932,3 +932,54 @@ def test_from_import_does_not_create_a_whole_package_dependency(tmp_path):
     assert "sample/__init__.py" in impact.affected_files
     assert "consumer.py" not in impact.affected_files
     engine.close()
+
+
+def test_related_tests_are_ranked_by_dependency_distance(tmp_path):
+    (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n",
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_z_direct.py").write_text(
+        "from service import value\n\ndef test_value():\n    assert value() == 1\n",
+        encoding="utf-8",
+    )
+    (tests / "test_a_indirect.py").write_text(
+        "from consumer import consume\n\ndef test_consume():\n    assert consume() == 1\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    impact = engine.analyze_impact(["service.py"])
+
+    assert impact.related_tests[:2] == (
+        "tests/test_z_direct.py",
+        "tests/test_a_indirect.py",
+    )
+    engine.close()
+
+
+def test_related_tests_prefer_exact_companions_and_respect_the_budget(tmp_path):
+    (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_service.py").write_text(
+        "def test_service():\n    assert True\n", encoding="utf-8"
+    )
+    for index in range(10):
+        (tests / f"test_consumer_{index}.py").write_text(
+            "from service import value\n\ndef test_value():\n    assert value() == 1\n",
+            encoding="utf-8",
+        )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    impact = engine.analyze_impact(["service.py"], max_tests=4)
+
+    assert len(impact.related_tests) == 4
+    assert "tests/test_service.py" in impact.related_tests
+    assert impact.fallback_tests == ("tests/test_service.py",)
+    engine.close()

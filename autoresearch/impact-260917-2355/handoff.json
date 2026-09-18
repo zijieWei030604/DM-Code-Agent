@@ -4,14 +4,14 @@
   "manifest": "benchmarks/semantic_workspace/impact_cases.json",
   "baseline_report": "bench_reports/semantic-impact-baseline.json",
   "latest_report": "bench_reports/semantic-impact-controlled-final.json",
-  "repository_report": "bench_reports/semantic-impact-repository-final.json",
+  "repository_report": "bench_reports/semantic-impact-repository-20-budgeted.json",
   "status": "controlled and repository-derived tiers complete",
   "best_iteration": 1,
   "repository_result": {
     "affected_file_f1": 0.8,
-    "related_test_f1": 0.7273,
-    "test_recall_at_3": 0.8,
-    "case_count": 8,
-    "limitations": "Small manually labeled repository tier; import side effects and behavioral test coverage need separate labels."
+    "related_test_f1": 0.5625,
+    "test_recall_at_3": 0.725,
+    "case_count": 20,
+    "limitations": "Manually labeled repository tier; production impact is exhaustively scored in six cases, while focused test selection is scored in nineteen cases."
   }
 }

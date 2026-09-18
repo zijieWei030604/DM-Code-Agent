@@ -76,6 +76,138 @@
         "tests/test_workspace_evaluation.py"
       ],
       "evaluate_affected_files": false
+    },
+    {
+      "id": "context_budget_contract",
+      "description": "Token estimation, truncation, and file-ledger behavior with focused tests.",
+      "changed_files": ["dm_agent/memory/context_budget.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_checkpoint.py",
+        "tests/test_context_budget.py",
+        "tests/test_memory_compressor.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "checkpoint_contract",
+      "description": "Run checkpoint persistence exercised by checkpoint and evidence tests.",
+      "changed_files": ["dm_agent/core/checkpoint.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_checkpoint.py",
+        "tests/test_evidence_graph.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "context_window_contract",
+      "description": "Context-window assembly and compression integration tests.",
+      "changed_files": ["dm_agent/core/context_window.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_agent_internals.py",
+        "tests/test_memory_compressor.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "tool_invoker_contract",
+      "description": "Tool invocation lifecycle contract and middleware behavior.",
+      "changed_files": ["dm_agent/core/tool_invoker.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_runtime_contracts.py"],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "event_bus_contract",
+      "description": "Lifecycle event bus behavior used by runtime and capabilities.",
+      "changed_files": ["dm_agent/core/events.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_agent_events.py",
+        "tests/test_agent_guards.py",
+        "tests/test_evidence_graph.py",
+        "tests/test_extension_registry.py",
+        "tests/test_runtime_contracts.py",
+        "tests/test_semantic_workspace.py",
+        "tests/test_swebench_verified.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "trace_session_contract",
+      "description": "Session-log reconstruction consumed by persistence and server inspection.",
+      "changed_files": ["dm_agent/tracing/session.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_server_readonly.py",
+        "tests/test_session_log.py",
+        "tests/test_tracing.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "trace_analysis_contract",
+      "description": "Trace diagnosis used by the trace CLI and server session inspection.",
+      "changed_files": ["dm_agent/tracing/analysis.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_server_readonly.py",
+        "tests/test_tracing.py",
+        "tests/test_tracing_cli.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "trace_summary_contract",
+      "description": "Trace summary and diff behavior covered through public tracing contracts.",
+      "changed_files": ["dm_agent/tracing/summary.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_server_readonly.py",
+        "tests/test_tracing.py",
+        "tests/test_tracing_cli.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "extension_discovery_contract",
+      "description": "Extension source discovery and trust behavior.",
+      "changed_files": ["dm_agent/extensions/discovery.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_extension_discovery.py"],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "extension_registry_contract",
+      "description": "Extension registration and event-hook integration.",
+      "changed_files": ["dm_agent/extensions/registry.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_extension_providers.py",
+        "tests/test_extension_registry.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "server_settings_contract",
+      "description": "Server configuration, token generation, and session-path safety.",
+      "changed_files": ["dm_agent/server/settings.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_server_cli.py",
+        "tests/test_server_security.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "mcp_config_contract",
+      "description": "MCP server configuration parsing and manager setup.",
+      "changed_files": ["dm_agent/mcp/config.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_skills_and_mcp.py"],
+      "evaluate_affected_files": false
     }
   ]
 }

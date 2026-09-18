@@ -129,6 +129,7 @@ class ImpactGraph:
         *,
         max_depth: int = 2,
         max_nodes: int = 100,
+        max_tests: int = 8,
     ) -> ImpactReport:
         changed_files = tuple(sorted({_relative(self.root, item) for item in changed_paths}))
         symbol_rows = []
@@ -199,13 +200,41 @@ class ImpactGraph:
         affected_files = tuple(
             sorted({item.path for item in affected if item.path not in changed_files})
         )
-        graph_tests = {
-            item.path
-            for item in affected
-            if _is_test(item.path) and item.confidence >= HIGH_CONFIDENCE
-        }
-        fallback_tests = self._test_companions(changed_files) - graph_tests
-        tests = graph_tests | fallback_tests
+        graph_test_nodes: dict[str, ImpactNode] = {}
+        for item in affected:
+            if not _is_test(item.path) or item.confidence < HIGH_CONFIDENCE:
+                continue
+            previous = graph_test_nodes.get(item.path)
+            if previous is None or _test_rank(item) < _test_rank(previous):
+                graph_test_nodes[item.path] = item
+        graph_tests = tuple(
+            sorted(graph_test_nodes, key=lambda path: (*_test_rank(graph_test_nodes[path]), path))
+        )
+        fallback_candidates = self._test_companions(changed_files) - set(graph_tests)
+        direct_graph_tests = tuple(
+            path for path in graph_tests if graph_test_nodes[path].distance == 1
+        )
+        indirect_graph_tests = tuple(
+            path for path in graph_tests if graph_test_nodes[path].distance != 1
+        )
+        exact_fallback_tests = tuple(
+            sorted(
+                path
+                for path in fallback_candidates
+                if _is_exact_test_companion(path, changed_files)
+            )
+        )
+        remaining_fallback_tests = tuple(
+            sorted(set(fallback_candidates) - set(exact_fallback_tests))
+        )
+        ranked_tests = (
+            *exact_fallback_tests,
+            *direct_graph_tests,
+            *indirect_graph_tests,
+            *remaining_fallback_tests,
+        )
+        tests = ranked_tests[: max(0, max_tests)]
+        fallback_tests = tuple(path for path in tests if path in fallback_candidates)
         risk_score = _risk_score(symbol_rows, affected, changed_files)
         risk_level = "high" if risk_score >= 0.7 else "medium" if risk_score >= 0.35 else "low"
         if graph_tests:
@@ -219,11 +248,11 @@ class ImpactGraph:
             changed_symbols,
             tuple(affected),
             affected_files,
-            tuple(sorted(tests)),
+            tests,
             risk_score,
             risk_level,
             tuple(dict.fromkeys(reasons)),
-            tuple(sorted(fallback_tests)),
+            fallback_tests,
         )
 
     def _create_schema(self) -> None:
@@ -426,6 +455,15 @@ def _relative(root: Path, path: str | Path) -> str:
 def _is_test(path: str) -> bool:
     parts = {part.casefold() for part in Path(path).parts}
     return bool(parts & {"test", "tests"}) or Path(path).name.startswith("test_")
+
+
+def _test_rank(item: ImpactNode) -> tuple[int, float]:
+    return item.distance, -item.confidence
+
+
+def _is_exact_test_companion(path: str, changed_files: Iterable[str]) -> bool:
+    test_stem = _normalized_stem(path)
+    return any(test_stem == _normalized_stem(changed) for changed in changed_files)
 
 
 def _name_tokens(path: str) -> set[str]:

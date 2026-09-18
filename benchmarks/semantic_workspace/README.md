@@ -16,7 +16,9 @@ The report separates affected production files from related tests and records fa
 false negatives per case. These controlled cases are the first evaluation tier; repository-derived
 cases should be added as a separate tier before claiming real-world accuracy.
 
-The repository-derived tier evaluates manually checked relationships in this project:
+The repository-derived tier evaluates 20 manually checked relationships in this project. It mixes
+production impact cases with focused test-selection cases; an axis is scored only when its gold set
+can be labeled exhaustively:
 
 ```powershell
 dm-agent-impact-eval `
@@ -27,3 +29,5 @@ dm-agent-impact-eval `
 
 Each case can disable an axis when its gold set cannot be exhaustively labeled. Disabled axes are
 excluded from aggregate metrics instead of treating unknown relationships as false positives.
+Related tests are returned in dependency-distance order, with exact filename companions promoted,
+and are capped at eight files to keep downstream verification work bounded.
