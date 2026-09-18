@@ -28,6 +28,7 @@ class SemanticWorkspaceCapability:
         self._pending_impact: ImpactReport | None = None
         self._impact_revision = 0
         self._injected_revision = 0
+        self._last_injected_sha256 = ""
         self._trace_writer: Any | None = None
 
     def install(self, context: CapabilityContext) -> None:
@@ -47,6 +48,7 @@ class SemanticWorkspaceCapability:
         self._pending_impact = None
         self._impact_revision = 0
         self._injected_revision = 0
+        self._last_injected_sha256 = ""
         stats = self.engine.update()
         event.metadata.update(
             {
@@ -106,8 +108,23 @@ class SemanticWorkspaceCapability:
             self._pending_impact,
             max_chars=self.impact_summary_chars,
         )
-        event.messages.append({"role": "system", "content": summary})
+        summary_sha256 = hashlib.sha256(summary.encode("utf-8")).hexdigest()
         self._injected_revision = self._impact_revision
+        if summary_sha256 == self._last_injected_sha256:
+            event.metadata["semantic_impact_duplicate_suppressions"] = (
+                int(event.metadata.get("semantic_impact_duplicate_suppressions", 0)) + 1
+            )
+            self._record(
+                "semantic_impact_duplicate_suppressed",
+                {
+                    "step_number": event.step_number,
+                    "revision": self._impact_revision,
+                    "sha256": summary_sha256,
+                },
+            )
+            return
+        event.messages.append({"role": "system", "content": summary})
+        self._last_injected_sha256 = summary_sha256
         event.metadata["semantic_impact_injection_count"] = (
             int(event.metadata.get("semantic_impact_injection_count", 0)) + 1
         )
@@ -120,7 +137,7 @@ class SemanticWorkspaceCapability:
                 # Persist exactly the bounded text sent to the model so offline
                 # analysis can audit candidate paths rather than just counts.
                 "content": summary,
-                "sha256": hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+                "sha256": summary_sha256,
             },
         )
 

@@ -891,6 +891,48 @@ def test_semantic_capability_keeps_replanner_context_model_driven(tmp_path):
     engine.close()
 
 
+def test_semantic_capability_suppresses_an_identical_impact_summary(tmp_path):
+    target = tmp_path / "service.py"
+    target.write_text("def value():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from service import value\n\ndef consume():\n    return value()\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    recorded: list[tuple[str, dict[str, object]]] = []
+
+    class TraceWriter:
+        def record(self, event: str, payload: dict[str, object]) -> None:
+            recorded.append((event, payload))
+
+    bus = EventBus()
+    SemanticWorkspaceCapability(engine).install(
+        CapabilityContext(bus, lambda phase: None, TraceWriter())
+    )
+    metadata: dict[str, object] = {}
+    bus.emit_run_start(RunStartEvent("change value", 1, "run", metadata=metadata))
+
+    for step, value in ((1, 2), (3, 3)):
+        target.write_text(f"def value():\n    return {value}\n", encoding="utf-8")
+        bus.emit_after_tool_result(
+            AfterToolResultEvent(
+                "edit_file", {"path": "service.py"}, "written", step, "run", True, metadata
+            )
+        )
+        messages = [{"role": "user", "content": "continue"}]
+        bus.emit_before_llm_request(
+            BeforeLLMRequestEvent(messages, step + 1, "run", "agent", metadata)
+        )
+
+    injected = [event for event, _ in recorded if event == "semantic_impact_injected"]
+    suppressed = [event for event, _ in recorded if event == "semantic_impact_duplicate_suppressed"]
+    assert len(injected) == 1
+    assert len(suppressed) == 1
+    assert metadata["semantic_impact_injection_count"] == 1
+    assert metadata["semantic_impact_duplicate_suppressions"] == 1
+    engine.close()
+
+
 def test_package_init_relative_import_keeps_the_package_prefix(tmp_path):
     package = tmp_path / "sample"
     package.mkdir()

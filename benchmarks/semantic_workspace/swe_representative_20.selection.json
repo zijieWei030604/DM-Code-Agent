@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "dataset": "princeton-nlp/SWE-bench_Verified",
+  "config": "default",
+  "split": "test",
+  "selection_strategy": "repo-difficulty-round-robin",
+  "selection_version": "v1",
+  "candidate_count": 500,
+  "candidate_fingerprint": "13b4d320ef91ad2bca8772e1035d568df6f111b4acb795c9f617afae0f5f7a3f",
+  "requested_limit": 20,
+  "selected_count": 20,
+  "instance_ids": [
+    "scikit-learn__scikit-learn-10844",
+    "scikit-learn__scikit-learn-25102",
+    "sphinx-doc__sphinx-10614",
+    "sphinx-doc__sphinx-7590",
+    "sympy__sympy-13615",
+    "sympy__sympy-13878",
+    "astropy__astropy-13398",
+    "astropy__astropy-13977",
+    "django__django-14631",
+    "django__django-12858",
+    "matplotlib__matplotlib-14623",
+    "matplotlib__matplotlib-23476",
+    "psf__requests-5414",
+    "psf__requests-2317",
+    "pydata__xarray-3993",
+    "pydata__xarray-4356",
+    "pylint-dev__pylint-8898",
+    "pylint-dev__pylint-4604",
+    "pytest-dev__pytest-5787",
+    "pytest-dev__pytest-6202"
+  ],
+  "repo_counts": {
+    "astropy/astropy": 2,
+    "django/django": 2,
+    "matplotlib/matplotlib": 2,
+    "psf/requests": 2,
+    "pydata/xarray": 2,
+    "pylint-dev/pylint": 2,
+    "pytest-dev/pytest": 2,
+    "scikit-learn/scikit-learn": 2,
+    "sphinx-doc/sphinx": 2,
+    "sympy/sympy": 2
+  },
+  "difficulty_counts": {
+    "1-4 hours": 6,
+    "15 min - 1 hour": 7,
+    "<15 min fix": 5,
+    ">4 hours": 2
+  },
+  "selection_signature": "eb25ce4bf290a7cbe3f3e17d2844aa9d512c8fac2659bf52fc085c299d0eff9f"
+}
