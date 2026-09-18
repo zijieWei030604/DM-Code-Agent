@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "repository_root": "../..",
+  "max_scan_files": 2000,
+  "cases": [
+    {
+      "id": "benchmark_score_diff",
+      "description": "Offline score comparison utility and its dedicated tests.",
+      "changed_files": ["dm_agent/benchmarks/score_diff.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_score_diff.py"]
+    },
+    {
+      "id": "benchmark_manifest_diff",
+      "description": "Benchmark manifest comparison utility and its test module.",
+      "changed_files": ["dm_agent/benchmarks/manifest_diff.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_coding_benchmarks.py"]
+    },
+    {
+      "id": "benchmark_economics",
+      "description": "Benchmark economics reporting utility and its test module.",
+      "changed_files": ["dm_agent/benchmarks/economics.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_coding_benchmarks.py"]
+    },
+    {
+      "id": "evaluation_gate",
+      "description": "Deterministic evaluation gate and its dedicated tests.",
+      "changed_files": ["dm_agent/evals/gate.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_evals.py"]
+    },
+    {
+      "id": "server_streaming_routes",
+      "description": "Streaming primitives consumed by both run and conversation routes.",
+      "changed_files": ["dm_agent/server/streaming.py"],
+      "affected_files": [
+        "dm_agent/server/routes/conversations.py",
+        "dm_agent/server/routes/runs.py"
+      ],
+      "related_tests": [],
+      "evaluate_related_tests": false
+    },
+    {
+      "id": "mcp_client_stack",
+      "description": "MCP transport used by the manager, package facade, and CLI assembly.",
+      "changed_files": ["dm_agent/mcp/client.py"],
+      "affected_files": [
+        "dm_agent/cli/interactive.py",
+        "dm_agent/cli/runner.py",
+        "dm_agent/mcp/__init__.py",
+        "dm_agent/mcp/manager.py"
+      ],
+      "related_tests": ["tests/test_skills_and_mcp.py"]
+    },
+    {
+      "id": "deepseek_client_contract",
+      "description": "Provider client behavior covered by its focused contract tests.",
+      "changed_files": ["dm_agent/clients/deepseek_client.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_coding_benchmarks.py",
+        "tests/test_deepseek_client.py",
+        "tests/test_extension_providers.py"
+      ],
+      "evaluate_affected_files": false
+    },
+    {
+      "id": "workspace_evaluation_contract",
+      "description": "Impact evaluator behavior covered by its dedicated test module.",
+      "changed_files": ["dm_agent/workspace/evaluation.py"],
+      "affected_files": [],
+      "related_tests": [
+        "tests/test_semantic_workspace.py",
+        "tests/test_workspace_evaluation.py"
+      ],
+      "evaluate_affected_files": false
+    }
+  ]
+}

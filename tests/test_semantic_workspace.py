@@ -49,6 +49,27 @@ def test_semantic_workspace_persists_symbols_references_and_affected_tests(tmp_p
     reopened.close()
 
 
+def test_semantic_workspace_excludes_virtualenv_and_temporary_workspaces(tmp_path):
+    (tmp_path / "module.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+    excluded = [
+        ".swebench-venv/lib/python.py",
+        ".test-tmp-agent/generated.py",
+        ".pytest-run/copied.py",
+        "virtualenv/lib/dependency.py",
+    ]
+    for relative in excluded:
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("def excluded():\n    return 0\n", encoding="utf-8")
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+
+    stats = engine.update()
+
+    assert stats.scanned_files == 1
+    assert engine.search_symbols("excluded") == []
+    engine.close()
+
+
 def test_impact_graph_uses_semantic_index_as_single_source_of_truth(tmp_path):
     (tmp_path / "service.py").write_text("def value():\n    return 1\n", encoding="utf-8")
     (tmp_path / "consumer.py").write_text(
@@ -103,6 +124,46 @@ def test_semantic_workspace_propagates_change_impact_through_callers(tmp_path):
     engine.close()
 
 
+def test_semantic_workspace_allows_one_terminal_test_hop_beyond_depth(tmp_path):
+    (tmp_path / "service.py").write_text("def execute():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "facade.py").write_text(
+        "from service import execute\n\ndef run():\n    return execute()\n", encoding="utf-8"
+    )
+    (tmp_path / "controller.py").write_text(
+        "from facade import run\n\ndef handle():\n    return run()\n", encoding="utf-8"
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_controller.py").write_text(
+        "from controller import handle\n\ndef test_handle():\n    assert handle() == 1\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    report = engine.analyze_impact(["service.py"], max_depth=2)
+
+    assert "controller.py" in report.affected_files
+    assert report.related_tests == ("tests/test_controller.py",)
+    engine.close()
+
+
+def test_semantic_workspace_rejects_generic_single_token_test_fallback(tmp_path):
+    (tmp_path / "user.py").write_text("def get_user():\n    return {}\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_super_user_permissions.py").write_text(
+        "def test_permissions():\n    assert True\n", encoding="utf-8"
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    report = engine.analyze_impact(["user.py"])
+
+    assert report.related_tests == ()
+    engine.close()
+
+
 def test_ambiguous_edges_are_reported_but_do_not_propagate(tmp_path):
     (tmp_path / "first.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     (tmp_path / "second.py").write_text("def run():\n    return 2\n", encoding="utf-8")
@@ -124,6 +185,27 @@ def test_ambiguous_edges_are_reported_but_do_not_propagate(tmp_path):
     assert any(item.path == "caller.py" for item in report.ambiguous_symbols)
     assert "tests/test_caller.py" not in report.affected_files
     assert "tests/test_caller.py" not in report.related_tests
+    engine.close()
+
+
+def test_external_import_does_not_bind_to_same_named_local_method(tmp_path):
+    (tmp_path / "application.py").write_text(
+        "import json\n\ndef encode(value):\n    return json.dumps(value)\n",
+        encoding="utf-8",
+    )
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    helper = tests / "test_helper.py"
+    helper.write_text(
+        "class FakeResponse:\n    def json(self):\n        return {}\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    report = engine.analyze_impact([helper])
+
+    assert "application.py" not in report.affected_files
     engine.close()
 
 
@@ -806,4 +888,47 @@ def test_semantic_capability_keeps_replanner_context_model_driven(tmp_path):
 
     assert messages[0]["content"] == "Replan after failed test"
     assert metadata["semantic_impact_enabled"] is True
+    engine.close()
+
+
+def test_package_init_relative_import_keeps_the_package_prefix(tmp_path):
+    package = tmp_path / "sample"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "from .client import Client\n",
+        encoding="utf-8",
+    )
+    (package / "client.py").write_text(
+        "class Client:\n    pass\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    impact = engine.analyze_impact(["sample/client.py"])
+
+    assert "sample/__init__.py" in impact.affected_files
+    engine.close()
+
+
+def test_from_import_does_not_create_a_whole_package_dependency(tmp_path):
+    package = tmp_path / "sample"
+    package.mkdir()
+    (package / "__init__.py").write_text(
+        "from .client import Client\nfrom .other import Other\n",
+        encoding="utf-8",
+    )
+    (package / "client.py").write_text("class Client:\n    pass\n", encoding="utf-8")
+    (package / "other.py").write_text("class Other:\n    pass\n", encoding="utf-8")
+    (tmp_path / "consumer.py").write_text(
+        "from sample import Other\n",
+        encoding="utf-8",
+    )
+    engine = SemanticWorkspaceEngine(tmp_path, database_path=tmp_path / "index.db")
+    engine.update()
+
+    impact = engine.analyze_impact(["sample/client.py"])
+
+    assert "sample/__init__.py" in impact.affected_files
+    assert "consumer.py" not in impact.affected_files
     engine.close()

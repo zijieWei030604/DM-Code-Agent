@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "direct_function_import",
+      "description": "A consumer and its test directly import a changed function.",
+      "files": {
+        "service.py": "def calculate_total(items):\n    return sum(items)\n",
+        "consumer.py": "from service import calculate_total\n\ndef checkout(items):\n    return calculate_total(items)\n",
+        "tests/test_consumer.py": "from consumer import checkout\n\ndef test_checkout():\n    assert checkout([1, 2]) == 3\n"
+      },
+      "changed_files": ["service.py"],
+      "affected_files": ["consumer.py"],
+      "related_tests": ["tests/test_consumer.py"]
+    },
+    {
+      "id": "aliased_function_import",
+      "description": "An imported function is renamed locally before use.",
+      "files": {
+        "pricing.py": "def quote(value):\n    return value * 2\n",
+        "api.py": "from pricing import quote as calculate_quote\n\ndef price(value):\n    return calculate_quote(value)\n",
+        "tests/test_api.py": "from api import price\n\ndef test_price():\n    assert price(2) == 4\n"
+      },
+      "changed_files": ["pricing.py"],
+      "affected_files": ["api.py"],
+      "related_tests": ["tests/test_api.py"]
+    },
+    {
+      "id": "qualified_module_call",
+      "description": "A caller invokes a changed function through a module-qualified name.",
+      "files": {
+        "storage.py": "def save(value):\n    return value\n",
+        "worker.py": "import storage\n\ndef persist(value):\n    return storage.save(value)\n",
+        "tests/test_worker.py": "from worker import persist\n\ndef test_persist():\n    assert persist('x') == 'x'\n"
+      },
+      "changed_files": ["storage.py"],
+      "affected_files": ["worker.py"],
+      "related_tests": ["tests/test_worker.py"]
+    },
+    {
+      "id": "two_hop_call_chain",
+      "description": "Impact propagates from a service through a facade to a test.",
+      "files": {
+        "service.py": "def execute():\n    return 1\n",
+        "facade.py": "from service import execute\n\ndef run():\n    return execute()\n",
+        "controller.py": "from facade import run\n\ndef handle():\n    return run()\n",
+        "tests/test_controller.py": "from controller import handle\n\ndef test_handle():\n    assert handle() == 1\n"
+      },
+      "changed_files": ["service.py"],
+      "affected_files": ["controller.py", "facade.py"],
+      "related_tests": ["tests/test_controller.py"]
+    },
+    {
+      "id": "class_inheritance",
+      "description": "A subclass and its test depend on a changed base class.",
+      "files": {
+        "base.py": "class Repository:\n    def get(self):\n        return 1\n",
+        "sqlite_repo.py": "from base import Repository\n\nclass SQLiteRepository(Repository):\n    pass\n",
+        "tests/test_sqlite_repo.py": "from sqlite_repo import SQLiteRepository\n\ndef test_get():\n    assert SQLiteRepository().get() == 1\n"
+      },
+      "changed_files": ["base.py"],
+      "affected_files": ["sqlite_repo.py"],
+      "related_tests": ["tests/test_sqlite_repo.py"]
+    },
+    {
+      "id": "same_leaf_exact_import",
+      "description": "Two modules expose the same leaf name, but an explicit import identifies the target.",
+      "files": {
+        "alpha.py": "def parse(value):\n    return 'a' + value\n",
+        "beta.py": "def parse(value):\n    return 'b' + value\n",
+        "consumer.py": "from alpha import parse\n\ndef consume(value):\n    return parse(value)\n",
+        "tests/test_consumer.py": "from consumer import consume\n\ndef test_consume():\n    assert consume('x') == 'ax'\n"
+      },
+      "changed_files": ["alpha.py"],
+      "affected_files": ["consumer.py"],
+      "related_tests": ["tests/test_consumer.py"]
+    },
+    {
+      "id": "unrelated_same_leaf",
+      "description": "Changing one duplicate leaf symbol must not affect a caller of the other module.",
+      "files": {
+        "alpha.py": "def load():\n    return 'a'\n",
+        "beta.py": "def load():\n    return 'b'\n",
+        "consumer.py": "from beta import load\n\ndef consume():\n    return load()\n",
+        "tests/test_consumer.py": "from consumer import consume\n\ndef test_consume():\n    assert consume() == 'b'\n"
+      },
+      "changed_files": ["alpha.py"],
+      "affected_files": [],
+      "related_tests": []
+    },
+    {
+      "id": "package_relative_import",
+      "description": "A package module uses a relative import from the changed sibling module.",
+      "files": {
+        "pkg/__init__.py": "",
+        "pkg/service.py": "def value():\n    return 1\n",
+        "pkg/api.py": "from .service import value\n\ndef expose():\n    return value()\n",
+        "tests/test_pkg_api.py": "from pkg.api import expose\n\ndef test_expose():\n    assert expose() == 1\n"
+      },
+      "changed_files": ["pkg/service.py"],
+      "affected_files": ["pkg/api.py"],
+      "related_tests": ["tests/test_pkg_api.py"]
+    },
+    {
+      "id": "imported_constant",
+      "description": "A caller reads a constant imported from the changed module.",
+      "files": {
+        "settings.py": "TIMEOUT = 10\n",
+        "client.py": "from settings import TIMEOUT\n\ndef timeout():\n    return TIMEOUT\n",
+        "tests/test_client.py": "from client import timeout\n\ndef test_timeout():\n    assert timeout() == 10\n"
+      },
+      "changed_files": ["settings.py"],
+      "affected_files": ["client.py"],
+      "related_tests": ["tests/test_client.py"]
+    },
+    {
+      "id": "decorator_registration",
+      "description": "A route module depends on a decorator defined in the changed framework module.",
+      "files": {
+        "framework.py": "def route(path):\n    def wrap(fn):\n        return fn\n    return wrap\n",
+        "views.py": "from framework import route\n\n@route('/items')\ndef items():\n    return []\n",
+        "tests/test_views.py": "from views import items\n\ndef test_items():\n    assert items() == []\n"
+      },
+      "changed_files": ["framework.py"],
+      "affected_files": ["views.py"],
+      "related_tests": ["tests/test_views.py"]
+    },
+    {
+      "id": "type_annotation_dependency",
+      "description": "A public API exposes a class from the changed model module in annotations.",
+      "files": {
+        "models.py": "class User:\n    pass\n",
+        "service.py": "from models import User\n\ndef load_user() -> User:\n    return User()\n",
+        "tests/test_service.py": "from service import load_user\n\ndef test_user():\n    assert load_user().__class__.__name__ == 'User'\n"
+      },
+      "changed_files": ["models.py"],
+      "affected_files": ["service.py"],
+      "related_tests": ["tests/test_service.py"]
+    },
+    {
+      "id": "filename_fallback_test",
+      "description": "A conventionally named test is relevant even without an import edge.",
+      "files": {
+        "user_cache.py": "def clear():\n    return None\n",
+        "tests/test_user_cache.py": "def test_cache_contract():\n    assert True\n"
+      },
+      "changed_files": ["user_cache.py"],
+      "affected_files": [],
+      "related_tests": ["tests/test_user_cache.py"]
+    },
+    {
+      "id": "filename_fallback_noise",
+      "description": "A partial filename token must not make an unrelated test relevant.",
+      "files": {
+        "user.py": "def get_user():\n    return {}\n",
+        "tests/test_super_user_permissions.py": "def test_permissions():\n    assert True\n"
+      },
+      "changed_files": ["user.py"],
+      "affected_files": [],
+      "related_tests": []
+    },
+    {
+      "id": "dynamic_getattr_call",
+      "description": "A dynamic getattr call is a labeled hard case for static analysis.",
+      "files": {
+        "handlers.py": "def process(value):\n    return value\n",
+        "dispatcher.py": "import handlers\n\ndef dispatch(name, value):\n    return getattr(handlers, name)(value)\n",
+        "tests/test_dispatcher.py": "from dispatcher import dispatch\n\ndef test_dispatch():\n    assert dispatch('process', 1) == 1\n"
+      },
+      "changed_files": ["handlers.py"],
+      "affected_files": ["dispatcher.py"],
+      "related_tests": ["tests/test_dispatcher.py"]
+    },
+    {
+      "id": "independent_modules",
+      "description": "An isolated change should produce no affected source files or tests.",
+      "files": {
+        "alpha.py": "def alpha():\n    return 1\n",
+        "beta.py": "def beta():\n    return 2\n",
+        "tests/test_beta.py": "from beta import beta\n\ndef test_beta():\n    assert beta() == 2\n"
+      },
+      "changed_files": ["alpha.py"],
+      "affected_files": [],
+      "related_tests": []
+    }
+  ]
+}

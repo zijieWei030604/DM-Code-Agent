@@ -1,0 +1,4 @@
+iteration	affected_precision	affected_recall	affected_f1	test_precision	test_recall	test_f1	test_recall_at_1	test_recall_at_3	decision
+baseline	1.0000	0.5000	0.6667	0.7778	1.0000	0.8750	0.8571	1.0000	keep as repository baseline
+package-relative-import	1.0000	0.6667	0.8000	0.2813	0.9000	0.4286	0.6000	0.6000	discard whole-package dependency behavior
+symbol-only-from-import	1.0000	0.6667	0.8000	0.6667	0.8000	0.7273	0.6000	0.8000	keep; reduces package-facade false positives

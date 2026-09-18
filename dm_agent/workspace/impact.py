@@ -147,7 +147,8 @@ class ImpactGraph:
         affected_by_source: dict[tuple[str, str], ImpactNode] = {}
         while queue and len(affected_by_source) < max_nodes:
             target_path, target_symbol, distance = queue.popleft()
-            if distance >= max(0, max_depth):
+            test_only = distance >= max(0, max_depth)
+            if distance > max(0, max_depth):
                 continue
             if target_symbol == "<module>":
                 rows = self.connection.execute(
@@ -167,6 +168,9 @@ class ImpactGraph:
                 ).fetchall()
             for row in rows:
                 source = (str(row["source_path"]), str(row["source_symbol"]))
+                confidence = float(row["confidence"])
+                if test_only and (not _is_test(source[0]) or confidence < HIGH_CONFIDENCE):
+                    continue
                 if source in propagated:
                     continue
                 item = ImpactNode(
@@ -174,7 +178,7 @@ class ImpactGraph:
                     source[1],
                     str(row["relation"]),
                     distance + 1,
-                    float(row["confidence"]),
+                    confidence,
                     target_path,
                     target_symbol,
                 )
@@ -184,7 +188,7 @@ class ImpactGraph:
                 affected_by_source[source] = item
                 # Ambiguous leaf-name matches are useful direct candidates, but
                 # propagating through them compounds one guess into many.
-                if item.confidence >= HIGH_CONFIDENCE:
+                if item.confidence >= HIGH_CONFIDENCE and not test_only:
                     propagated.add(source)
                     queue.append((source[0], source[1], distance + 1))
         affected = list(affected_by_source.values())
@@ -299,10 +303,12 @@ class ImpactGraph:
             query += f" WHERE path IN ({placeholders})"
             parameters = tuple(sorted(sources))
         for row in self.connection.execute(query, parameters):
+            relation = str(row["relation"] or "references")
             targets = _resolve_targets(
                 str(row["path"]),
                 str(row["name"]),
                 str(row["target_hint"] or row["name"]),
+                relation,
                 by_leaf,
                 modules,
             )
@@ -318,7 +324,7 @@ class ImpactGraph:
                         ),
                         target_path,
                         target_symbol,
-                        str(row["relation"] or "references"),
+                        relation,
                         int(row["line"]),
                         confidence,
                     )
@@ -339,7 +345,19 @@ class ImpactGraph:
         result: set[str] = set()
         for path in changed:
             changed_tokens = _name_tokens(path)
-            result.update(test for test in tests if changed_tokens & _name_tokens(test))
+            changed_stem = _normalized_stem(path)
+            for test in tests:
+                test_tokens = _name_tokens(test)
+                test_stem = _normalized_stem(test)
+                single_token_prefix = len(changed_tokens) == 1 and test_stem.startswith(
+                    f"{changed_stem}_"
+                )
+                if (
+                    test_stem == changed_stem
+                    or single_token_prefix
+                    or (len(changed_tokens) >= 2 and changed_tokens <= test_tokens)
+                ):
+                    result.add(test)
         return result
 
 
@@ -357,6 +375,7 @@ def _resolve_targets(
     source_path: str,
     leaf: str,
     hint: str,
+    relation: str,
     by_leaf: dict[str, list[tuple[str, str]]],
     modules: dict[str, str],
 ) -> list[tuple[str, str, float]]:
@@ -369,11 +388,13 @@ def _resolve_targets(
             return [(path, symbol, 1.0) for path, symbol in exact]
         if not candidates or hint == module_hint:
             return [(module_path, "<module>", 0.95)]
+    if relation == "imports":
+        return []
     same_file = [item for item in candidates if item[0] == source_path]
     if same_file:
         return [(path, symbol, 0.95) for path, symbol in same_file[:3]]
     if len(candidates) == 1:
-        return [(candidates[0][0], candidates[0][1], 0.9)]
+        return [(candidates[0][0], candidates[0][1], AMBIGUOUS_CONFIDENCE)]
     return [(path, symbol, AMBIGUOUS_CONFIDENCE) for path, symbol in candidates[:3]]
 
 
@@ -408,8 +429,12 @@ def _is_test(path: str) -> bool:
 
 
 def _name_tokens(path: str) -> set[str]:
-    stem = Path(path).stem.casefold().removeprefix("test_")
+    stem = _normalized_stem(path)
     return {part for part in stem.split("_") if len(part) >= 2}
+
+
+def _normalized_stem(path: str) -> str:
+    return Path(path).stem.casefold().removeprefix("test_")
 
 
 def _risk_score(rows: list[Any], nodes: list[ImpactNode], changed: tuple[str, ...]) -> float:

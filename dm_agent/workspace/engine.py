@@ -23,11 +23,16 @@ DEFAULT_EXCLUDES = frozenset(
         ".ruff_cache",
         ".tox",
         ".venv",
+        ".swebench-venv",
+        ".verified-edits-subprocess-temp",
         "__pycache__",
         "build",
         "dist",
+        "env",
         "node_modules",
         "site-packages",
+        "venv",
+        "virtualenv",
     }
 )
 _TASK_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{2,}")
@@ -465,7 +470,11 @@ class SemanticWorkspaceEngine:
         result = []
         for path in sorted(self.root.rglob("*.py")):
             parts = path.relative_to(self.root).parts
-            if any(part in DEFAULT_EXCLUDES or part.startswith(".pytest-tmp-") for part in parts):
+            if any(
+                part in DEFAULT_EXCLUDES
+                or part.startswith((".pytest-tmp-", ".test-tmp-", ".pytest-"))
+                for part in parts
+            ):
                 continue
             result.append(path)
             if len(result) >= self.max_scan_files:
@@ -488,6 +497,7 @@ class _ReferenceVisitor(ast.NodeVisitor):
     def __init__(self, path: str) -> None:
         self.path = path
         self.module = _module_name(Path(path))
+        self.is_package = Path(path).stem == "__init__"
         self.aliases: dict[str, str] = {}
         self.classes: list[str] = []
         self.owners: list[str] = []
@@ -507,9 +517,12 @@ class _ReferenceVisitor(ast.NodeVisitor):
             self._reference(alias.name.rsplit(".", 1)[-1], alias.name, "imports", node.lineno)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        base = _resolve_import(self.module, node.level, node.module)
-        if base:
-            self._reference(base.rsplit(".", 1)[-1], base, "imports", node.lineno)
+        base = _resolve_import(
+            self.module,
+            node.level,
+            node.module,
+            is_package=self.is_package,
+        )
         for alias in node.names:
             if alias.name == "*":
                 continue
@@ -570,10 +583,17 @@ class _ReferenceVisitor(ast.NodeVisitor):
         )
 
 
-def _resolve_import(current: str, level: int, module: str | None) -> str:
+def _resolve_import(
+    current: str,
+    level: int,
+    module: str | None,
+    *,
+    is_package: bool = False,
+) -> str:
     if level <= 0:
         return module or ""
-    package = current.split(".")[:-1]
+    parts = current.split(".")
+    package = parts if is_package else parts[:-1]
     base = package[: max(0, len(package) - level + 1)]
     if module:
         base.extend(module.split("."))

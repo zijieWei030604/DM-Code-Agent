@@ -1,0 +1,17 @@
+{
+  "goal": "Improve Semantic Workspace change-impact accuracy against a labeled benchmark.",
+  "metric": "Affected-file F1 and related-test F1, with per-case false positives and negatives.",
+  "manifest": "benchmarks/semantic_workspace/impact_cases.json",
+  "baseline_report": "bench_reports/semantic-impact-baseline.json",
+  "latest_report": "bench_reports/semantic-impact-controlled-final.json",
+  "repository_report": "bench_reports/semantic-impact-repository-final.json",
+  "status": "controlled and repository-derived tiers complete",
+  "best_iteration": 1,
+  "repository_result": {
+    "affected_file_f1": 0.8,
+    "related_test_f1": 0.7273,
+    "test_recall_at_3": 0.8,
+    "case_count": 8,
+    "limitations": "Small manually labeled repository tier; import side effects and behavioral test coverage need separate labels."
+  }
+}
