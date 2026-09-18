@@ -23,6 +23,7 @@ EvidenceStatus = Literal[
     "verified",
     "contradicted",
 ]
+EvidenceConfidence = Literal["deterministic", "claimed", "inferred"]
 ChangeEvidenceStatus = Literal[
     "missing_read_basis",
     "unverified",
@@ -63,18 +64,26 @@ class EvidenceEdge:
     source_id: str
     target_id: str
     relation: str
-    confidence: str = "deterministic"
+    confidence: EvidenceConfidence = "deterministic"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> EvidenceEdge:
+        confidence = str(data.get("confidence", "deterministic"))
+        # Older checkpoints used direct/indirect for provenance strength.
+        confidence = {
+            "direct": "deterministic",
+            "indirect": "inferred",
+        }.get(confidence, confidence)
+        if confidence not in {"deterministic", "claimed", "inferred"}:
+            confidence = "inferred"
         return cls(
             source_id=str(data.get("source_id", "")),
             target_id=str(data.get("target_id", "")),
             relation=str(data.get("relation", "")),
-            confidence=str(data.get("confidence", "deterministic")),
+            confidence=confidence,  # type: ignore[arg-type]
         )
 
 
@@ -145,7 +154,12 @@ class EvidenceGraph:
                 node = EvidenceNode(node_id, "plan_step", reason or action, step_number, metadata)
                 self.nodes[node_id] = node
                 added_nodes.append(node)
-                edge = self._add_edge(node_id, self.ROOT_REQUIREMENT_ID, "decomposes")
+                edge = self._add_edge(
+                    node_id,
+                    self.ROOT_REQUIREMENT_ID,
+                    "decomposes",
+                    confidence="claimed",
+                )
                 if edge:
                     added_edges.append(edge)
             elif existing.metadata.get("completed") != completed:
@@ -238,7 +252,10 @@ class EvidenceGraph:
         ]
         for observation in sorted(observations, key=lambda item: item.step_number or 0)[-1:]:
             edge = self._add_edge(
-                node.node_id, observation.node_id, "motivated_by", confidence="direct"
+                node.node_id,
+                observation.node_id,
+                "motivated_by",
+                confidence="deterministic",
             )
             if edge:
                 edges.append(edge)
@@ -286,7 +303,7 @@ class EvidenceGraph:
                 node.node_id,
                 change_id,
                 "verifies" if passed else "contradicts",
-                confidence="direct" if is_direct else "indirect",
+                confidence="deterministic" if is_direct else "inferred",
             )
             if edge:
                 edges.append(edge)
@@ -294,7 +311,7 @@ class EvidenceGraph:
             node.node_id,
             self.ROOT_REQUIREMENT_ID,
             "verifies" if passed and is_direct and targets else ("supports" if passed else "contradicts"),
-            confidence="direct" if is_direct else "indirect",
+            confidence="deterministic" if (not passed or is_direct) else "inferred",
         )
         if edge:
             edges.append(edge)
@@ -334,13 +351,19 @@ class EvidenceGraph:
         for item in sorted(
             supporting, key=lambda candidate: candidate.step_number or 0, reverse=True
         )[:5]:
-            edge = self._add_edge(node.node_id, item.node_id, "supported_by")
+            edge = self._add_edge(
+                node.node_id,
+                item.node_id,
+                "supported_by",
+                confidence="inferred",
+            )
             if edge:
                 edges.append(edge)
         edge = self._add_edge(
             node.node_id,
             self.ROOT_REQUIREMENT_ID,
             "concludes" if accepted else "attempts_to_conclude",
+            confidence="claimed",
         )
         if edge:
             edges.append(edge)
@@ -370,7 +393,7 @@ class EvidenceGraph:
             has_read_basis = any(
                 edge.source_id == change.node_id
                 and edge.relation == "motivated_by"
-                and (edge.confidence == "direct" or legacy_change)
+                and (edge.confidence == "deterministic" or legacy_change)
                 for edge in self.edges
             )
             if (
@@ -491,10 +514,15 @@ class EvidenceGraph:
         accepted_conclusions = [
             node for node in conclusions if bool(node.metadata.get("accepted", True))
         ]
+        edge_confidence_counts = {
+            confidence: sum(1 for edge in self.edges if edge.confidence == confidence)
+            for confidence in ("deterministic", "claimed", "inferred")
+        }
         return {
             "status": self.status(),
             "node_count": len(self.nodes),
             "edge_count": len(self.edges),
+            "edge_confidence_counts": edge_confidence_counts,
             "counts": counts,
             "failed_verifications": failed,
             "has_conclusion": bool(accepted_conclusions),
@@ -595,7 +623,7 @@ class EvidenceGraph:
         target_id: str,
         relation: str,
         *,
-        confidence: str = "deterministic",
+        confidence: EvidenceConfidence = "deterministic",
     ) -> EvidenceEdge | None:
         if source_id not in self.nodes or target_id not in self.nodes:
             return None
@@ -610,7 +638,12 @@ class EvidenceGraph:
     def _link_current_plan(self, node_id: str, relation: str) -> list[EvidenceEdge]:
         if not self.current_plan_id:
             return []
-        edge = self._add_edge(self.current_plan_id, node_id, relation)
+        edge = self._add_edge(
+            self.current_plan_id,
+            node_id,
+            relation,
+            confidence="inferred",
+        )
         return [edge] if edge else []
 
     def _nodes_of_kind(self, kind: EvidenceKind) -> list[EvidenceNode]:

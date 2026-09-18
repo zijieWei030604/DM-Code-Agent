@@ -64,7 +64,7 @@ class EvidenceCompletionPolicy:
             if status == "contradicted":
                 issues.append(_issue(change, "contradicted"))
             elif status == "missing_read_basis":
-                issues.append(_issue(change, "missing_read_basis"))
+                warnings.append(_issue(change, "missing_read_basis"))
 
         checks = graph.current_verifications()
         passed_checks = [node for node in checks if bool(node.metadata.get("passed"))]
@@ -80,7 +80,16 @@ class EvidenceCompletionPolicy:
         ]
 
         if failed_tests:
-            issues[0:0] = [_issue(change, "transaction_test_failed") for change in changes]
+            transaction_issues = [
+                _issue(change, "transaction_test_failed") for change in changes
+            ] or [
+                {
+                    "node_id": failed_tests[-1].node_id,
+                    "path": "<workspace>",
+                    "status": "transaction_test_failed",
+                }
+            ]
+            issues[0:0] = transaction_issues
             return EvidenceCompletionResult("block", tuple(issues), tuple(warnings))
 
         if issues:
@@ -105,8 +114,6 @@ class EvidenceCompletionPolicy:
             elif category == "other" and not passed_checks:
                 warnings.append(_issue(change, "change_unchecked"))
 
-        if issues:
-            return EvidenceCompletionResult("block", tuple(issues), tuple(warnings))
         if warnings:
             return EvidenceCompletionResult("warn", warnings=tuple(warnings))
         return EvidenceCompletionResult("allow")

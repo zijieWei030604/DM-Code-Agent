@@ -80,14 +80,50 @@ def test_evidence_graph_builds_a_verified_chain_and_round_trips() -> None:
 
     assert graph.status() == "verified"
     assert graph.audit()["counts"]["change"] == 1
+    assert graph.audit()["edge_confidence_counts"] == {
+        "deterministic": 3,
+        "claimed": 4,
+        "inferred": 5,
+    }
     assert any(edge.relation == "motivated_by" for edge in graph.edges)
     assert any(edge.relation == "verifies" for edge in graph.edges)
+    assert {
+        edge.confidence for edge in graph.edges
+    } == {"deterministic", "claimed", "inferred"}
     assert conclusion[0].metadata["evidence_status"] == graph.status()
 
     restored = EvidenceGraph.from_dict(graph.to_dict())
     assert restored.audit() == graph.audit()
     assert restored.prompt_summary(max_chars=200).startswith("[Task Evidence]")
     assert len(restored.prompt_summary(max_chars=200)) <= 200
+
+
+def test_legacy_edge_confidence_is_migrated_to_the_three_source_levels() -> None:
+    graph = EvidenceGraph.from_dict(
+        {
+            "task": "legacy",
+            "nodes": [
+                {"node_id": "requirement-1", "kind": "requirement", "title": "legacy"},
+                {"node_id": "change-1", "kind": "change", "title": "changed"},
+            ],
+            "edges": [
+                {
+                    "source_id": "change-1",
+                    "target_id": "requirement-1",
+                    "relation": "old-direct",
+                    "confidence": "direct",
+                },
+                {
+                    "source_id": "requirement-1",
+                    "target_id": "change-1",
+                    "relation": "old-indirect",
+                    "confidence": "indirect",
+                },
+            ],
+        }
+    )
+
+    assert [edge.confidence for edge in graph.edges] == ["deterministic", "inferred"]
 
 
 def test_failed_verification_contradicts_a_change() -> None:
@@ -409,7 +445,27 @@ def test_completion_policy_still_blocks_failed_checks_and_missing_read_basis() -
     assert {item["status"] for item in decision.issues} == {"transaction_test_failed"}
 
 
-def test_evidence_capability_injects_changed_state_once_and_bounds_repeated_finishes() -> None:
+def test_completion_policy_warns_instead_of_blocking_for_missing_read_basis() -> None:
+    graph = EvidenceGraph("Update service")
+    graph.add_change(
+        tool="edit_file",
+        path="service.py",
+        step_number=1,
+        before_version="v1",
+        after_version="v2",
+    )
+
+    decision = EvidenceCompletionPolicy().evaluate(graph)
+
+    assert decision.decision == "warn"
+    assert decision.issues == ()
+    assert {item["status"] for item in decision.warnings} == {
+        "missing_read_basis",
+        "source_unverified",
+    }
+
+
+def test_evidence_capability_injects_after_compression_and_bounds_repeated_finishes() -> None:
     bus = EventBus()
     trace = _Trace()
     state = {"plan": _plan()}
@@ -437,8 +493,21 @@ def test_evidence_capability_injects_changed_state_once_and_bounds_repeated_fini
         metadata,
     )
     outgoing = bus.emit_before_llm_request(request)
-    assert outgoing[-1]["role"] == "system"
-    assert outgoing[-1]["content"].startswith("[Task Evidence]")
+    assert outgoing == [{"role": "user", "content": "continue"}]
+    assert metadata["evidence_summary_injection_count"] == 0
+
+    metadata["memory_compression_count"] = 1
+    compressed = bus.emit_before_llm_request(
+        BeforeLLMRequestEvent(
+            [{"role": "user", "content": "continue compressed"}],
+            2,
+            "run-1",
+            "agent",
+            metadata,
+        )
+    )
+    assert compressed[-1]["role"] == "system"
+    assert compressed[-1]["content"].startswith("[Task Evidence]")
     assert metadata["evidence_summary_injection_count"] == 1
 
     # A duplicate pending signal without any operational evidence change does
@@ -469,7 +538,7 @@ def test_evidence_capability_injects_changed_state_once_and_bounds_repeated_fini
     assert first is not None and "Latest failed test" in first["reason"]
     assert second is not None and "verification state has not changed" in second["reason"]
     assert third is not None and "after repeated attempts" in third["reason"]
-    assert metadata["evidence_contradiction_block_count"] == 0
+    assert metadata["evidence_contradiction_block_count"] == 3
     assert metadata["evidence_completion_block_count"] == 3
     assert metadata["evidence_recovery_prompt_count"] == 1
     assert metadata["evidence_terminal_rejection_count"] == 1
@@ -477,6 +546,68 @@ def test_evidence_capability_injects_changed_state_once_and_bounds_repeated_fini
     assert conclusions and all(node.metadata["accepted"] is False for node in conclusions)
     assert capability.graph.audit()["has_conclusion"] is False
     assert any(edge.relation == "attempts_to_conclude" for edge in capability.graph.edges)
+
+
+def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> None:
+    bus = EventBus()
+    capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix users", 1, "run-1", metadata=metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_tests",
+            {"test_path": "tests"},
+            "1 failed\nreturncode: 1",
+            1,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+        )
+    )
+    finish = BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
+
+    first = bus.emit_before_finish(finish)
+    second = bus.emit_before_finish(finish)
+
+    assert first is not None
+    assert metadata["evidence_terminal_completion_rejection"] is True
+    assert second is not None and "after repeated attempts" in second["reason"]
+    assert metadata["evidence_completion_block_count"] == 2
+    assert metadata["evidence_terminal_rejection_count"] == 1
+
+
+def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    def failed_test(arguments: dict[str, Any]) -> ToolResult:
+        return ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",))
+
+    agent = ReactAgent(
+        _ScriptedClient(
+            [
+                _action("run_tests", {"test_path": "tests"}),
+                _action("finish", {"answer": "done"}),
+                _action("finish", {"answer": "done again"}),
+            ]
+        ),
+        [Tool("run_tests", "test", lambda arguments: "", result_runner=failed_test)],
+        enable_planning=False,
+        enable_compression=False,
+        capabilities=[
+            EvidenceGraphCapability(repeated_contradiction="critic_rejected")
+        ],
+    )
+
+    result = agent.run("Fix the failing test", max_steps=3)
+
+    assert result["metadata"]["status"] == "critic_rejected"
+    assert result["metadata"]["evidence_completion_block_count"] == 2
+    assert result["metadata"]["evidence_terminal_rejection_count"] == 1
+    assert result["steps"][-1]["action"] == "finish"
 
 
 def test_react_agent_allows_unverified_finish_with_explicit_status(tmp_path, monkeypatch) -> None:

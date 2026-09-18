@@ -838,7 +838,9 @@ def _run_benchmark_task_in_workspace(
         capabilities.append(SemanticWorkspaceCapability(workspace_engine))
         owned_resources.append(workspace_engine)
     if evidence_graph_enabled:
-        capabilities.append(EvidenceGraphCapability())
+        capabilities.append(
+            EvidenceGraphCapability(repeated_contradiction="critic_rejected")
+        )
 
     agent_tools = default_tools(include_mcp=False)
     if workspace_engine is not None:

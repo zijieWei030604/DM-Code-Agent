@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
@@ -25,6 +25,7 @@ from dm_agent.core.workspace_version import workspace_version
 
 VERIFICATION_ACTIONS = frozenset({"run_python", "run_tests", "run_linter"})
 EvidenceEnforcement = Literal["observe", "warn", "strict"]
+RepeatedContradiction = Literal["continue", "critic_rejected"]
 
 
 class EvidenceGraphCapability:
@@ -39,6 +40,7 @@ class EvidenceGraphCapability:
         inject_summaries: bool = True,
         enforcement: EvidenceEnforcement = "strict",
         max_stalled_completion_attempts: int = 2,
+        repeated_contradiction: RepeatedContradiction = "continue",
     ) -> None:
         if summary_chars < 200:
             raise ValueError("summary_chars must be at least 200.")
@@ -46,10 +48,13 @@ class EvidenceGraphCapability:
             raise ValueError("enforcement must be 'observe', 'warn', or 'strict'.")
         if max_stalled_completion_attempts < 1:
             raise ValueError("max_stalled_completion_attempts must be at least 1.")
+        if repeated_contradiction not in {"continue", "critic_rejected"}:
+            raise ValueError("repeated_contradiction must be 'continue' or 'critic_rejected'.")
         self.summary_chars = summary_chars
         self.inject_summaries = inject_summaries
         self.enforcement = enforcement
         self.max_stalled_completion_attempts = max_stalled_completion_attempts
+        self.repeated_contradiction = repeated_contradiction
         self.graph = EvidenceGraph()
         self.completion_policy = EvidenceCompletionPolicy()
         self._trace_writer: Any | None = None
@@ -60,6 +65,7 @@ class EvidenceGraphCapability:
         self._write_basis_kinds: dict[int, str] = {}
         self._recovery_signature = ""
         self._stalled_completion_attempts = 0
+        self._last_compression_count = 0
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -90,6 +96,7 @@ class EvidenceGraphCapability:
             "graph": self.graph.to_dict(),
             "recovery_signature": self._recovery_signature,
             "stalled_completion_attempts": self._stalled_completion_attempts,
+            "last_compression_count": self._last_compression_count,
         }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
@@ -97,6 +104,7 @@ class EvidenceGraphCapability:
         self.graph = EvidenceGraph.from_dict(graph_state)
         self._recovery_signature = str(state.get("recovery_signature", ""))
         self._stalled_completion_attempts = int(state.get("stalled_completion_attempts", 0))
+        self._last_compression_count = int(state.get("last_compression_count", 0))
 
     def _on_run_start(self, event: RunStartEvent) -> None:
         nodes, edges = self.graph.start(event.task)
@@ -107,6 +115,7 @@ class EvidenceGraphCapability:
         self._write_basis_kinds.clear()
         self._recovery_signature = ""
         self._stalled_completion_attempts = 0
+        self._last_compression_count = int(event.metadata.get("memory_compression_count", 0))
         self._record(nodes, edges)
         event.metadata.update(
             {
@@ -228,8 +237,14 @@ class EvidenceGraphCapability:
 
     def _before_llm_request(self, event: BeforeLLMRequestEvent) -> None:
         self._sync_plan()
-        if not self.inject_summaries or event.phase != "agent" or not self.graph.summary_pending:
+        compression_count = int(event.metadata.get("memory_compression_count", 0))
+        if (
+            not self.inject_summaries
+            or event.phase != "agent"
+            or compression_count <= self._last_compression_count
+        ):
             return
+        self._last_compression_count = compression_count
         summary = self.graph.prompt_summary(max_chars=self.summary_chars)
         fingerprint = hashlib.sha256(summary.encode("utf-8")).hexdigest() if summary else ""
         if summary and fingerprint != self.graph.last_summary_fingerprint:
@@ -244,6 +259,7 @@ class EvidenceGraphCapability:
                     "chars": len(summary),
                     "status": self.graph.status(),
                     "fingerprint": fingerprint[:16],
+                    "reason": "context_compressed",
                 },
             )
             self.graph.last_summary_fingerprint = fingerprint
@@ -279,7 +295,10 @@ class EvidenceGraphCapability:
         event.metadata["evidence_completion_block_count"] = (
             int(event.metadata.get("evidence_completion_block_count", 0)) + 1
         )
-        if any(item["status"] == "contradicted" for item in issues):
+        if any(
+            item["status"] in {"contradicted", "transaction_test_failed"}
+            for item in issues
+        ):
             event.metadata["evidence_contradiction_block_count"] = (
                 int(event.metadata.get("evidence_contradiction_block_count", 0)) + 1
             )
@@ -301,7 +320,13 @@ class EvidenceGraphCapability:
                 "Completion blocked by evidence policy: verification state has not changed. "
                 "Make a new relevant edit or run a relevant test before trying to finish again."
             )
-        terminal = self._stalled_completion_attempts >= self.max_stalled_completion_attempts
+        repeated_contradiction = detailed is False and any(
+            item["status"] in {"contradicted", "transaction_test_failed"}
+            for item in issues
+        )
+        terminal = (
+            self.repeated_contradiction == "critic_rejected" and repeated_contradiction
+        ) or self._stalled_completion_attempts >= self.max_stalled_completion_attempts
         if terminal:
             event.metadata["evidence_terminal_completion_rejection"] = True
             event.metadata["evidence_terminal_rejection_count"] = (
