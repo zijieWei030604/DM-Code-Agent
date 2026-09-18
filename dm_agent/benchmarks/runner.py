@@ -447,6 +447,16 @@ def _summarize_evidence_gate(
             if int(result.metadata.get("evidence_completion_block_count", 0) or 0) > 0
         ]
         recovered = [result for result in blocked if result.metadata.get("status") == "success"]
+        state_recovered = [
+            result
+            for result in blocked
+            if bool(result.metadata.get("evidence_recovered_after_block"))
+        ]
+        budget_exhausted = [
+            result
+            for result in blocked
+            if bool(result.metadata.get("evidence_recovery_budget_exhausted"))
+        ]
         summary[variant] = {
             "runs": len(group),
             "enabled_runs": len(enabled),
@@ -461,6 +471,16 @@ def _summarize_evidence_gate(
             ),
             "recovered_after_block": len(recovered),
             "recovery_after_block_rate": len(recovered) / len(blocked) if blocked else None,
+            "evidence_state_recovered": len(state_recovered),
+            "recovery_tool_calls": sum(
+                int(result.metadata.get("evidence_recovery_tool_calls", 0) or 0)
+                for result in blocked
+            ),
+            "recovery_progress_events": sum(
+                int(result.metadata.get("evidence_recovery_progress_events", 0) or 0)
+                for result in blocked
+            ),
+            "recovery_budget_exhausted_runs": len(budget_exhausted),
         }
     return summary
 
@@ -644,20 +664,28 @@ def write_markdown_report(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Evidence Completion Gate",
                 "",
-                "| Variant | Enabled runs | Blocked runs | Completion blocks | Recovered after block | Recovery rate |",
-                "| --- | ---: | ---: | ---: | ---: | ---: |",
+                "| Variant | Enabled | Blocked | Blocks | State recovered | Finished recovered | Recovery tools | Progress | Budget exhausted | Recovery rate |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for name, data in evidence.items():
             rate = data.get("recovery_after_block_rate")
             lines.append(
                 "| {name} | {enabled_runs} | {blocked_runs} | {completion_blocks} | "
-                "{recovered_after_block} | {rate} |".format(
+                "{evidence_state_recovered} | {recovered_after_block} | "
+                "{recovery_tool_calls} | {recovery_progress_events} | "
+                "{recovery_budget_exhausted_runs} | {rate} |".format(
                     name=name,
                     enabled_runs=data["enabled_runs"],
                     blocked_runs=data["blocked_runs"],
                     completion_blocks=data["completion_blocks"],
+                    evidence_state_recovered=data["evidence_state_recovered"],
                     recovered_after_block=data["recovered_after_block"],
+                    recovery_tool_calls=data["recovery_tool_calls"],
+                    recovery_progress_events=data["recovery_progress_events"],
+                    recovery_budget_exhausted_runs=data[
+                        "recovery_budget_exhausted_runs"
+                    ],
                     rate=f"{rate:.1%}" if rate is not None else "-",
                 )
             )

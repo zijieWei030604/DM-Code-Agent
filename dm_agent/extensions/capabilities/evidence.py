@@ -41,6 +41,7 @@ class EvidenceGraphCapability:
         enforcement: EvidenceEnforcement = "strict",
         max_stalled_completion_attempts: int = 2,
         repeated_contradiction: RepeatedContradiction = "continue",
+        max_recovery_tool_steps: int = 8,
     ) -> None:
         if summary_chars < 200:
             raise ValueError("summary_chars must be at least 200.")
@@ -50,11 +51,14 @@ class EvidenceGraphCapability:
             raise ValueError("max_stalled_completion_attempts must be at least 1.")
         if repeated_contradiction not in {"continue", "critic_rejected"}:
             raise ValueError("repeated_contradiction must be 'continue' or 'critic_rejected'.")
+        if max_recovery_tool_steps < 1:
+            raise ValueError("max_recovery_tool_steps must be at least 1.")
         self.summary_chars = summary_chars
         self.inject_summaries = inject_summaries
         self.enforcement = enforcement
         self.max_stalled_completion_attempts = max_stalled_completion_attempts
         self.repeated_contradiction = repeated_contradiction
+        self.max_recovery_tool_steps = max_recovery_tool_steps
         self.graph = EvidenceGraph()
         self.completion_policy = EvidenceCompletionPolicy()
         self._trace_writer: Any | None = None
@@ -66,6 +70,9 @@ class EvidenceGraphCapability:
         self._recovery_signature = ""
         self._stalled_completion_attempts = 0
         self._last_compression_count = 0
+        self._recovery_active = False
+        self._recovery_tool_calls = 0
+        self._recovery_progress_events = 0
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -97,6 +104,9 @@ class EvidenceGraphCapability:
             "recovery_signature": self._recovery_signature,
             "stalled_completion_attempts": self._stalled_completion_attempts,
             "last_compression_count": self._last_compression_count,
+            "recovery_active": self._recovery_active,
+            "recovery_tool_calls": self._recovery_tool_calls,
+            "recovery_progress_events": self._recovery_progress_events,
         }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
@@ -105,6 +115,9 @@ class EvidenceGraphCapability:
         self._recovery_signature = str(state.get("recovery_signature", ""))
         self._stalled_completion_attempts = int(state.get("stalled_completion_attempts", 0))
         self._last_compression_count = int(state.get("last_compression_count", 0))
+        self._recovery_active = bool(state.get("recovery_active", False))
+        self._recovery_tool_calls = int(state.get("recovery_tool_calls", 0))
+        self._recovery_progress_events = int(state.get("recovery_progress_events", 0))
 
     def _on_run_start(self, event: RunStartEvent) -> None:
         nodes, edges = self.graph.start(event.task)
@@ -116,6 +129,9 @@ class EvidenceGraphCapability:
         self._recovery_signature = ""
         self._stalled_completion_attempts = 0
         self._last_compression_count = int(event.metadata.get("memory_compression_count", 0))
+        self._recovery_active = False
+        self._recovery_tool_calls = 0
+        self._recovery_progress_events = 0
         self._record(nodes, edges)
         event.metadata.update(
             {
@@ -128,6 +144,12 @@ class EvidenceGraphCapability:
                 "evidence_stalled_completion_count": 0,
                 "evidence_terminal_rejection_count": 0,
                 "evidence_enforcement": self.enforcement,
+                "evidence_recovery_active": False,
+                "evidence_recovery_tool_calls": 0,
+                "evidence_recovery_progress_events": 0,
+                "evidence_recovery_budget": self.max_recovery_tool_steps,
+                "evidence_recovery_budget_exhausted": False,
+                "evidence_recovered_after_block": False,
             }
         )
 
@@ -234,6 +256,7 @@ class EvidenceGraphCapability:
         if nodes or edges:
             self._record(nodes, edges)
             self._update_metadata(event.metadata)
+        self._advance_recovery(event)
 
     def _before_llm_request(self, event: BeforeLLMRequestEvent) -> None:
         self._sync_plan()
@@ -274,6 +297,18 @@ class EvidenceGraphCapability:
                 event.metadata.get("edit_transaction_status", "")
             ).startswith("committed"),
         )
+        if self._recovery_active and decision.decision == "warn":
+            decision = EvidenceCompletionResult(
+                "block",
+                (
+                    {
+                        "node_id": "evidence-recovery",
+                        "path": "<workspace>",
+                        "status": "recovery_verification_required",
+                    },
+                ),
+                decision.warnings,
+            )
         issues = list(decision.issues)
         warnings = list(decision.warnings)
         should_block = self.enforcement == "strict" and decision.decision == "block"
@@ -287,6 +322,8 @@ class EvidenceGraphCapability:
         self._record(nodes, edges)
         self._update_metadata(event.metadata, decision=decision)
         if not should_block:
+            if self._recovery_active:
+                self._finish_recovery(event.metadata, succeeded=True)
             if decision.decision == "warn":
                 event.metadata["evidence_completion_status"] = "unverified"
             else:
@@ -311,6 +348,8 @@ class EvidenceGraphCapability:
             event.metadata["evidence_recovery_prompt_count"] = (
                 int(event.metadata.get("evidence_recovery_prompt_count", 0)) + 1
             )
+            if not self._recovery_active:
+                self._start_recovery(event.metadata)
         else:
             self._stalled_completion_attempts += 1
             event.metadata["evidence_stalled_completion_count"] = (
@@ -324,8 +363,10 @@ class EvidenceGraphCapability:
             item["status"] in {"contradicted", "transaction_test_failed"}
             for item in issues
         )
+        repeated_recovery_stall = detailed is False and self._recovery_active
         terminal = (
-            self.repeated_contradiction == "critic_rejected" and repeated_contradiction
+            self.repeated_contradiction == "critic_rejected"
+            and (repeated_contradiction or repeated_recovery_stall)
         ) or self._stalled_completion_attempts >= self.max_stalled_completion_attempts
         if terminal:
             event.metadata["evidence_terminal_completion_rejection"] = True
@@ -350,6 +391,87 @@ class EvidenceGraphCapability:
             },
         )
         return {"block": True, "reason": reason}
+
+    def _start_recovery(self, metadata: dict[str, Any]) -> None:
+        self._recovery_active = True
+        self._recovery_tool_calls = 0
+        self._recovery_progress_events = 0
+        metadata.update(
+            {
+                "evidence_recovery_active": True,
+                "evidence_recovery_tool_calls": 0,
+                "evidence_recovery_progress_events": 0,
+                "evidence_recovery_budget_exhausted": False,
+            }
+        )
+        self._record_event(
+            "evidence_recovery_started",
+            {"budget": self.max_recovery_tool_steps},
+        )
+
+    def _advance_recovery(self, event: AfterToolResultEvent) -> None:
+        if not self._recovery_active:
+            return
+        self._recovery_tool_calls += 1
+        progressed = False
+        if event.tool_name in WRITE_ACTIONS:
+            progressed = bool(event.has_effect and not event.no_change)
+        elif event.tool_name in VERIFICATION_ACTIONS:
+            progressed = event.result is None or event.result.status not in {
+                "unavailable",
+                "cancelled",
+                "unknown",
+            }
+        if progressed:
+            self._recovery_progress_events += 1
+
+        event.metadata.update(
+            {
+                "evidence_recovery_active": True,
+                "evidence_recovery_tool_calls": self._recovery_tool_calls,
+                "evidence_recovery_progress_events": self._recovery_progress_events,
+            }
+        )
+        decision = self.completion_policy.evaluate(
+            self.graph,
+            verified_transaction=str(
+                event.metadata.get("edit_transaction_status", "")
+            ).startswith("committed"),
+        )
+        if decision.decision == "allow":
+            self._finish_recovery(event.metadata, succeeded=True)
+            return
+        if self._recovery_tool_calls < self.max_recovery_tool_steps:
+            return
+
+        event.metadata["evidence_recovery_budget_exhausted"] = True
+        event.metadata["evidence_terminal_completion_rejection"] = True
+        event.metadata["evidence_terminal_rejection_count"] = (
+            int(event.metadata.get("evidence_terminal_rejection_count", 0)) + 1
+        )
+        self._record_event(
+            "evidence_recovery_exhausted",
+            {
+                "tool_calls": self._recovery_tool_calls,
+                "progress_events": self._recovery_progress_events,
+                "budget": self.max_recovery_tool_steps,
+            },
+        )
+
+    def _finish_recovery(self, metadata: dict[str, Any], *, succeeded: bool) -> None:
+        if not self._recovery_active:
+            return
+        metadata["evidence_recovery_active"] = False
+        metadata["evidence_recovered_after_block"] = succeeded
+        self._record_event(
+            "evidence_recovery_finished",
+            {
+                "succeeded": succeeded,
+                "tool_calls": self._recovery_tool_calls,
+                "progress_events": self._recovery_progress_events,
+            },
+        )
+        self._recovery_active = False
 
     def _completion_signature(self, decision: EvidenceCompletionResult) -> str:
         current_checks = [
@@ -460,6 +582,7 @@ def _completion_block_reason(issues: list[dict[str, str]]) -> str:
         "source_unverified": "has no successful test for the current change transaction",
         "source_indirect_only": "has only indirect checks for the current change transaction",
         "transaction_test_failed": "has a failing test for the current change transaction",
+        "recovery_verification_required": "requires a successful current-version verification",
     }
     detail = "; ".join(
         f"{item['path']}: {labels.get(item['status'], item['status'])}" for item in issues[:5]

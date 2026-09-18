@@ -578,6 +578,150 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
     assert metadata["evidence_terminal_rejection_count"] == 1
 
 
+def test_evidence_recovery_budget_terminates_without_operational_progress() -> None:
+    bus = EventBus()
+    trace = _Trace()
+    capability = EvidenceGraphCapability(
+        repeated_contradiction="critic_rejected",
+        max_recovery_tool_steps=2,
+    )
+    capability.install(CapabilityContext(bus, lambda phase: None, trace_writer=trace))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix users", 1, "run-1", metadata=metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_tests",
+            {"test_path": "tests"},
+            "1 failed",
+            1,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+        )
+    )
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
+    )
+
+    assert block is not None
+    assert metadata["evidence_recovery_active"] is True
+    for step in (3, 4):
+        bus.emit_after_tool_result(
+            AfterToolResultEvent(
+                "read_file",
+                {"path": "service.py"},
+                "contents",
+                step,
+                "run-1",
+                True,
+                metadata,
+            )
+        )
+
+    assert metadata["evidence_recovery_tool_calls"] == 2
+    assert metadata["evidence_recovery_progress_events"] == 0
+    assert metadata["evidence_recovery_budget_exhausted"] is True
+    assert metadata["evidence_terminal_completion_rejection"] is True
+    assert any(item["event"] == "evidence_recovery_exhausted" for item in trace.events)
+
+
+def test_evidence_recovery_counts_new_verification_and_exits_on_success() -> None:
+    bus = EventBus()
+    trace = _Trace()
+    capability = EvidenceGraphCapability(max_recovery_tool_steps=8)
+    capability.install(CapabilityContext(bus, lambda phase: None, trace_writer=trace))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix users", 1, "run-1", metadata=metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_tests",
+            {"test_path": "tests"},
+            "1 failed",
+            1,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+        )
+    )
+    bus.emit_before_finish(
+        BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
+    )
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_tests",
+            {"test_path": "tests"},
+            "1 passed",
+            3,
+            "run-1",
+            True,
+            metadata,
+            result=ToolResult("success", "1 passed", exit_code=0, check_scope=("tests",)),
+        )
+    )
+
+    assert metadata["evidence_recovery_tool_calls"] == 1
+    assert metadata["evidence_recovery_progress_events"] == 1
+    assert metadata["evidence_recovery_active"] is False
+    assert metadata["evidence_recovered_after_block"] is True
+    assert metadata["evidence_recovery_budget_exhausted"] is False
+    assert any(item["event"] == "evidence_recovery_finished" for item in trace.events)
+
+
+def test_evidence_recovery_keeps_new_edit_pending_until_current_version_is_verified(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "service.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    bus = EventBus()
+    capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix service", 1, "run-1", metadata=metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_tests",
+            {"test_path": "tests"},
+            "1 failed",
+            1,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+        )
+    )
+    bus.emit_before_finish(
+        BeforeFinishEvent("Fix service", "finish", "done", [], 2, "run-1", metadata)
+    )
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("edit_file", {"path": "service.py"}, 3, "run-1", metadata)
+    )
+    target.write_text("value = 2\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file",
+            {"path": "service.py"},
+            "updated",
+            3,
+            "run-1",
+            True,
+            metadata,
+            result=ToolResult("success", "updated", changed_files=(str(target),)),
+        )
+    )
+
+    assert metadata["evidence_recovery_active"] is True
+    assert metadata["evidence_recovery_progress_events"] == 1
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix service", "finish", "done", [], 4, "run-1", metadata)
+    )
+    assert block is not None
+    assert "successful current-version verification" in block["reason"]
+    assert metadata["evidence_recovered_after_block"] is False
+
+
 def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
     tmp_path, monkeypatch
 ) -> None:

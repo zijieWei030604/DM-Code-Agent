@@ -470,6 +470,10 @@ def test_benchmark_summary_reports_evidence_gate_intervention_and_recovery():
             "evidence_graph_enabled": True,
             "evidence_completion_block_count": 2,
             "evidence_rejected_completion_attempts": 2,
+            "evidence_recovered_after_block": True,
+            "evidence_recovery_tool_calls": 4,
+            "evidence_recovery_progress_events": 2,
+            "evidence_recovery_budget_exhausted": False,
         },
     )
     blocked = replace(blocked, variant="evidence_gate")
@@ -491,6 +495,10 @@ def test_benchmark_summary_reports_evidence_gate_intervention_and_recovery():
     assert gate["evidence_gate"]["completion_blocks"] == 2
     assert gate["evidence_gate"]["recovered_after_block"] == 1
     assert gate["evidence_gate"]["recovery_after_block_rate"] == 1.0
+    assert gate["evidence_gate"]["evidence_state_recovered"] == 1
+    assert gate["evidence_gate"]["recovery_tool_calls"] == 4
+    assert gate["evidence_gate"]["recovery_progress_events"] == 2
+    assert gate["evidence_gate"]["recovery_budget_exhausted_runs"] == 0
     assert gate["no_evidence_gate"]["enabled_runs"] == 0
 
 
