@@ -43,6 +43,7 @@ from .persistence import (
     steps_from_checkpoint,
     warn_on_config_mismatch,
 )
+from .plan_progress import PlanProgressTracker, summarize_plan
 from .planner import AdaptiveReplanPolicy, PlanStep, TaskPlanner
 from .prompting import activate_skills, build_user_prompt
 from .replan import FailureContext, ReplanCoordinator
@@ -170,6 +171,7 @@ class ReactAgent:
         # 规划器
         self.enable_planning = enable_planning
         self.planner = TaskPlanner(client_for("planner"), tools) if enable_planning else None
+        self._plan_progress = PlanProgressTracker()
 
         # 上下文压缩器：默认先充分利用现代 LLM 上下文，长会话再分批压缩。
         # token 预算超限时也会提前触发压缩（0 表示只按消息节奏压缩）。
@@ -834,6 +836,17 @@ class ReactAgent:
                 steps.append(step)
 
                 if accepted:
+                    self._update_plan_progress(
+                        plan,
+                        action=action,
+                        result=None,
+                        observation=final,
+                        accepted_completion=True,
+                        no_progress=False,
+                        tool_succeeded=True,
+                        metadata=metadata,
+                        runtime_step=step_num,
+                    )
                     metadata["status"] = "success"
                     metadata["failure_reason"] = ""
                     metadata["duration_seconds"] = time.perf_counter() - started_at
@@ -955,12 +968,17 @@ class ReactAgent:
                     failed=invocation_failed,
                 )
 
-            # 更新计划进度（如果有计划；被拦下或明确无进展的调用不算完成）。
-            # 只有下一个待办步骤的动作匹配时才标记，消除同名动作的二义性。
-            if plan and self.planner and not no_progress:
-                next_step = self.planner.get_next_step()
-                if next_step and next_step.action == action:
-                    self.planner.mark_completed(next_step.step_number, observation)
+            self._update_plan_progress(
+                plan,
+                action=action,
+                result=invocation.result,
+                observation=observation,
+                accepted_completion=accepted,
+                no_progress=no_progress,
+                tool_succeeded=invocation.tool_succeeded,
+                metadata=metadata,
+                runtime_step=step_num,
+            )
 
             # 将工具执行结果添加到历史记录
             tool_info = f"执行工具 {action}，输入：{json.dumps(action_input, ensure_ascii=False)}\n观察：{observation}"
@@ -1014,6 +1032,50 @@ class ReactAgent:
                 limit=limit,
             )
         return finish_result("Reached step limit without completion.")
+
+    def _update_plan_progress(
+        self,
+        plan: list[PlanStep],
+        *,
+        action: str,
+        result: Any,
+        observation: str,
+        accepted_completion: bool,
+        no_progress: bool,
+        tool_succeeded: bool,
+        metadata: dict[str, Any],
+        runtime_step: int,
+    ) -> None:
+        """Project one runtime outcome onto plan phases and preserve an audit trail."""
+        if not plan or not self.planner:
+            return
+        preferred = {
+            tool
+            for step in plan
+            if step.status != "satisfied"
+            for tool in step.preferred_tools
+        }
+        if action not in preferred and action not in {"finish", "task_complete"}:
+            metadata["plan_tool_deviation_count"] = int(
+                metadata.get("plan_tool_deviation_count", 0)
+            ) + 1
+        changes = self._plan_progress.observe(
+            plan,
+            action=action,
+            result=result,
+            observation=observation,
+            accepted_completion=accepted_completion,
+            no_progress=no_progress,
+            tool_succeeded=tool_succeeded,
+            step_number=runtime_step,
+        )
+        for change in changes:
+            metadata["plan_progress_event_count"] = int(
+                metadata.get("plan_progress_event_count", 0)
+            ) + 1
+            if self.trace_writer:
+                self.trace_writer.record("plan_progress", change.to_dict())
+        metadata["plan_progress"] = summarize_plan(plan)
 
     def _apply_skills_for_task(self, task: str) -> list[str]:
         """根据任务自动选择技能，并把增量合并进本轮的 prompt 与工具表。"""

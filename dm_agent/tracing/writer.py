@@ -123,6 +123,11 @@ class TraceWriter:
                     "action": getattr(step, "action", None),
                     "reason": getattr(step, "reason", None),
                     "completed": getattr(step, "completed", False),
+                    "phase": getattr(step, "phase", ""),
+                    "goal": getattr(step, "goal", ""),
+                    "preferred_tools": list(getattr(step, "preferred_tools", ())),
+                    "completion_evidence": getattr(step, "completion_evidence", ""),
+                    "status": getattr(step, "status", "pending"),
                 }
             )
         self.record("plan", {"steps": plan})
@@ -237,6 +242,11 @@ class TraceWriter:
                     "step_number": getattr(step, "step_number", None),
                     "action": getattr(step, "action", None),
                     "reason": getattr(step, "reason", None),
+                    "phase": getattr(step, "phase", ""),
+                    "goal": getattr(step, "goal", ""),
+                    "preferred_tools": list(getattr(step, "preferred_tools", ())),
+                    "completion_evidence": getattr(step, "completion_evidence", ""),
+                    "status": getattr(step, "status", "pending"),
                 }
             )
         payload: dict[str, Any] = {"reason": reason, "steps": plan}

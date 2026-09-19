@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from dm_agent.clients.base_client import BaseLLMClient
@@ -17,13 +17,91 @@ from dm_agent.tools.base import Tool
 # TaskPlanner：真正生成计划、管理计划、重新规划
 @dataclass
 class PlanStep:
-    """计划中的单个步骤"""
+    """Intent-level plan phase with legacy tool-step compatibility."""
 
-    step_number: int  # 步骤编号
-    action: str  # 工具名称
-    reason: str  # 使用工具的原因
-    completed: bool = False  # 是否完成当前步骤
-    result: str | None = None  # 返回结果
+    step_number: int
+    action: str = ""
+    reason: str = ""
+    completed: bool = False
+    result: str | None = None
+    phase: str = ""
+    goal: str = ""
+    preferred_tools: tuple[str, ...] = field(default_factory=tuple)
+    completion_evidence: str = ""
+    status: str = "pending"
+    status_reason: str = ""
+    evidence_refs: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        self.phase = self.phase or _phase_for_action(self.action)
+        self.goal = self.goal or self.reason
+        if not self.preferred_tools and self.action:
+            self.preferred_tools = (self.action,)
+        self.completion_evidence = self.completion_evidence or _evidence_for_phase(self.phase)
+        if self.completed:
+            self.status = "satisfied"
+        elif self.status not in PLAN_STATUSES:
+            self.status = "pending"
+        self._sync_legacy_fields()
+
+    def set_status(
+        self,
+        status: str,
+        *,
+        result: str | None = None,
+        reason: str = "",
+        evidence_ref: str = "",
+    ) -> None:
+        if status not in PLAN_STATUSES:
+            raise ValueError(f"Unsupported plan status: {status}")
+        self.status = status
+        self.completed = status == "satisfied"
+        if result is not None:
+            self.result = result
+        if reason:
+            self.status_reason = reason
+        if evidence_ref and evidence_ref not in self.evidence_refs:
+            self.evidence_refs = (*self.evidence_refs, evidence_ref)
+
+    def _sync_legacy_fields(self) -> None:
+        if not self.action:
+            self.action = self.preferred_tools[0] if self.preferred_tools else ""
+        if not self.reason:
+            self.reason = self.goal
+        self.completed = self.status == "satisfied"
+
+
+PLAN_PHASES = ("locate", "inspect", "change", "validate", "complete")
+PLAN_STATUSES = ("pending", "in_progress", "satisfied")
+COMPLETION_EVIDENCE = (
+    "candidate_observed",
+    "source_observed",
+    "workspace_changed",
+    "verification_passed",
+    "completion_accepted",
+)
+
+
+def _evidence_for_phase(phase: str) -> str:
+    return {
+        "locate": "candidate_observed",
+        "inspect": "source_observed",
+        "change": "workspace_changed",
+        "validate": "verification_passed",
+        "complete": "completion_accepted",
+    }.get(phase, "source_observed")
+
+
+def _phase_for_action(action: str) -> str:
+    if action in {"task_complete", "finish"}:
+        return "complete"
+    if action in {"run_tests", "run_linter", "run_python"}:
+        return "validate"
+    if action in {"edit_file", "create_file", "write_file", "apply_patch"}:
+        return "change"
+    if action in {"search_code", "search_symbol", "find_files", "list_directory"}:
+        return "locate"
+    return "inspect"
 
 
 @dataclass(frozen=True)
@@ -207,13 +285,26 @@ class TaskPlanner:
                         "type": "object",
                         "properties": {
                             "step": {"type": "integer", "minimum": 1},
-                            "action": {
-                                "type": "string",
-                                "enum": actions,
+                            "phase": {"type": "string", "enum": list(PLAN_PHASES)},
+                            "goal": {"type": "string", "minLength": 1},
+                            "preferred_tools": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 4,
+                                "items": {"type": "string", "enum": actions},
                             },
-                            "reason": {"type": "string", "minLength": 1},
+                            "completion_evidence": {
+                                "type": "string",
+                                "enum": list(COMPLETION_EVIDENCE),
+                            },
                         },
-                        "required": ["step", "action", "reason"],
+                        "required": [
+                            "step",
+                            "phase",
+                            "goal",
+                            "preferred_tools",
+                            "completion_evidence",
+                        ],
                         "additionalProperties": False,
                     },
                 }
@@ -237,11 +328,29 @@ class TaskPlanner:
                 raise ValueError("plan step 必须是 JSON object")
             if not isinstance(item.get("step"), int) or int(item["step"]) < 1:
                 raise ValueError("plan step 必须是正整数")
-            if item.get("action") not in available:
-                raise ValueError(f"plan 使用了未知工具：{item.get('action')}")
-            if not isinstance(item.get("reason"), str) or not item["reason"].strip():
-                raise ValueError("plan reason 必须是非空字符串")
+            self._normalize_plan_item(item)
+            if item["phase"] not in PLAN_PHASES:
+                raise ValueError(f"plan 使用了未知阶段：{item['phase']}")
+            if not isinstance(item.get("goal"), str) or not item["goal"].strip():
+                raise ValueError("plan goal 必须是非空字符串")
+            if not item["preferred_tools"] or any(
+                tool not in available for tool in item["preferred_tools"]
+            ):
+                raise ValueError("plan preferred_tools 包含未知工具")
+            expected = _evidence_for_phase(item["phase"])
+            if item["completion_evidence"] != expected:
+                item["completion_evidence"] = expected
         return plan_data
+
+    @staticmethod
+    def _normalize_plan_item(item: dict[str, Any]) -> None:
+        """Accept old action/reason plans while emitting the phase contract going forward."""
+        if "phase" not in item:
+            action = str(item.get("action") or "")
+            item["phase"] = _phase_for_action(action)
+            item["goal"] = str(item.get("reason") or action)
+            item["preferred_tools"] = [action] if action else []
+            item["completion_evidence"] = _evidence_for_phase(item["phase"])
 
     def plan(self, task: str) -> list[PlanStep]:
         """
@@ -279,24 +388,22 @@ class TaskPlanner:
 可用工具：
 {tool_descriptions}
 
-请生成一个结构化的执行计划，包含 3-8 个步骤。每个步骤应该：
-1. 使用可用的工具
-2. 有明确的目的
-3. 按逻辑顺序排列
-4. 能够独立验证
+请生成一个结构化的阶段计划，包含 3-5 个步骤。阶段只能从
+locate、inspect、change、validate、complete 中选择，可按任务省略不需要的阶段。
+计划描述目标和完成证据，不把执行过程锁死为固定工具脚本；preferred_tools 仅是建议。
 
 返回 JSON 格式：
 {{
   "plan": [
-    {{"step": 1, "action": "工具名称", "reason": "为什么需要这一步"}},
-    {{"step": 2, "action": "工具名称", "reason": "为什么需要这一步"}},
+    {{"step": 1, "phase": "locate", "goal": "定位相关实现", "preferred_tools": ["search_code"], "completion_evidence": "candidate_observed"}},
     ...
   ]
 }}
 
 注意：
-- action 必须是可用工具列表中的工具名称
-- 最后一步应该是 "task_complete"
+- preferred_tools 必须来自可用工具列表
+- completion_evidence 必须与阶段对应
+- 最后一步必须是 complete，建议工具为 task_complete
 - 保持计划简洁高效，避免不必要的步骤
 """
         # 发送请求并获得client端的响应
@@ -309,8 +416,10 @@ class TaskPlanner:
                 steps.append(
                     PlanStep(
                         step_number=item["step"],
-                        action=item["action"],
-                        reason=item["reason"],
+                        phase=item["phase"],
+                        goal=item["goal"],
+                        preferred_tools=tuple(item["preferred_tools"]),
+                        completion_evidence=item["completion_evidence"],
                     )
                 )
             self.current_plan = steps
@@ -368,7 +477,7 @@ class TaskPlanner:
         for step in self.current_plan:
             if step.step_number == step_number:
                 step.completed = True
-                step.result = result
+                step.set_status("satisfied", result=result, reason="legacy completion")
                 break
 
     def get_next_step(self) -> PlanStep | None:
@@ -418,14 +527,18 @@ class TaskPlanner:
             return "无计划"
 
         # 已完成的步骤数和总步骤数
-        completed = sum(1 for step in self.current_plan if step.completed)
+        completed = sum(1 for step in self.current_plan if step.status == "satisfied")
         total = len(self.current_plan)
 
         # 生成文本
         progress_text = f"计划进度：{completed}/{total} 步骤已完成\n\n"
         for step in self.current_plan:
-            status = "✓" if step.completed else "○"
-            progress_text += f"{status} 步骤 {step.step_number}: {step.action} - {step.reason}\n"
+            status = {"satisfied": "✓", "in_progress": "~", "pending": "○"}[step.status]
+            tools = ", ".join(step.preferred_tools)
+            progress_text += (
+                f"{status} 步骤 {step.step_number}: {step.phase} - {step.goal}"
+                f"（建议工具：{tools}）\n"
+            )
             if step.completed and step.result:
                 progress_text += f"   结果：{step.result[:100]}...\n"
 
@@ -463,7 +576,11 @@ class TaskPlanner:
             ...     print("重新规划失败")
         """
         completed_summary = "\n".join(
-            [f"步骤 {s.step_number}: {s.action} - {s.reason} (已完成)" for s in completed_steps]
+            [
+                f"步骤 {s.step_number}: {s.phase} - {s.goal} "
+                f"(状态={s.status}, 结果={_compact_message(s.result or '', limit=160)})"
+                for s in completed_steps
+            ]
         )
 
         error_info = f"\n{error}" if error else ""
@@ -488,10 +605,11 @@ class TaskPlanner:
 策略提示：
 {strategy_guidance}
 
-请生成新的执行计划，继续完成剩余任务。返回 JSON 格式：
+请根据真实进度生成新的阶段计划，保留已经满足的事实，不机械重复失败路线。
+返回 JSON 格式：
 {{
   "plan": [
-    {{"step": 1, "action": "工具名称", "reason": "为什么需要这一步"}},
+    {{"step": 1, "phase": "inspect", "goal": "确认失败原因", "preferred_tools": ["read_file"], "completion_evidence": "source_observed"}},
     ...
   ]
 }}
@@ -502,15 +620,17 @@ class TaskPlanner:
             plan_data = self._request_plan(messages)
             # 保留已完成步骤的进度，新步骤编号顺延——重规划不再把已完成
             # 工作显示为待办，进度统计跨 replan 连续。
-            carried = [step for step in completed_steps if step.completed]
+            carried = [step for step in completed_steps if step.status == "satisfied"]
             next_number = max((step.step_number for step in carried), default=0)
             steps: list[PlanStep] = []
             for offset, item in enumerate(plan_data.get("plan", []), start=1):
                 steps.append(
                     PlanStep(
                         step_number=next_number + offset,
-                        action=item["action"],
-                        reason=item["reason"],
+                        phase=item["phase"],
+                        goal=item["goal"],
+                        preferred_tools=tuple(item["preferred_tools"]),
+                        completion_evidence=item["completion_evidence"],
                     )
                 )
             self.current_plan = carried + steps

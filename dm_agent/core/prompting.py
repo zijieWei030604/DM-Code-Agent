@@ -54,9 +54,15 @@ def build_user_prompt(
     if plan:
         lines.append("\n执行计划：")
         for plan_step in plan:
-            status = "[done]" if plan_step.completed else "[todo]"
+            status = {
+                "satisfied": "[done]",
+                "in_progress": "[active]",
+                "pending": "[todo]",
+            }.get(plan_step.status, "[todo]")
+            tools = ", ".join(plan_step.preferred_tools)
             lines.append(
-                f"{status} 步骤 {plan_step.step_number}: {plan_step.action} - {plan_step.reason}"
+                f"{status} {plan_step.phase}: {plan_step.goal} "
+                f"(建议工具: {tools}; 完成证据: {plan_step.completion_evidence})"
             )
 
     if not native_tool_calling:

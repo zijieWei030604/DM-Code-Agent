@@ -85,7 +85,9 @@ class ReplanCoordinator:
         default_budget: int,
     ) -> ReplanOutcome:
         """按当前策略决定是否重规划，返回新计划（或原计划）与要追加的历史提示。"""
-        completed_steps = [step for step in plan if step.completed]
+        # Pass the full projected state. The planner needs attempted phases as well as
+        # satisfied ones to avoid regenerating the same failed route.
+        completed_steps = list(plan)
         signal: ReplanSignal | None = None
         decision = None
         if self.adaptive:
@@ -128,7 +130,14 @@ class ReplanCoordinator:
             plan=new_plan,
             history_note=(
                 "Recovery: execution plan was regenerated after failure.\n"
-                f"Failure observation: {failure.observation}"
+                f"Failure observation: {failure.observation}\n"
+                "Updated remaining plan:\n"
+                + "\n".join(
+                    f"- {step.phase}: {step.goal} "
+                    f"(evidence: {step.completion_evidence})"
+                    for step in new_plan
+                    if step.status != "satisfied"
+                )
             ),
         )
 

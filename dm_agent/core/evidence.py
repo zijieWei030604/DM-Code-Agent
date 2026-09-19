@@ -145,15 +145,32 @@ class EvidenceGraph:
             step_number = int(raw.get("step_number", raw.get("step", index)))
             action = str(raw.get("action", ""))
             reason = str(raw.get("reason", ""))
-            signature = hashlib.sha256(f"{step_number}\0{action}\0{reason}".encode()).hexdigest()[
+            phase = str(raw.get("phase", ""))
+            goal = str(raw.get("goal", ""))
+            status = str(raw.get("status", ""))
+            signature = hashlib.sha256(
+                f"{step_number}\0{phase or action}\0{goal or reason}".encode()
+            ).hexdigest()[
                 :8
             ]
             node_id = f"plan-{step_number}-{signature}"
-            completed = bool(raw.get("completed", False))
+            completed = bool(raw.get("completed", False)) or status == "satisfied"
             existing = self.nodes.get(node_id)
-            metadata = {"action": action, "completed": completed}
+            metadata = {
+                "action": action,
+                "phase": phase,
+                "status": status or ("satisfied" if completed else "pending"),
+                "completed": completed,
+                "completion_evidence": str(raw.get("completion_evidence", "")),
+            }
             if existing is None:
-                node = EvidenceNode(node_id, "plan_step", reason or action, step_number, metadata)
+                node = EvidenceNode(
+                    node_id,
+                    "plan_step",
+                    goal or reason or phase or action,
+                    step_number,
+                    metadata,
+                )
                 self.nodes[node_id] = node
                 added_nodes.append(node)
                 edge = self._add_edge(
@@ -704,6 +721,11 @@ def plan_snapshot(plan: Iterable[Any]) -> list[dict[str, Any]]:
                 "action": str(getattr(step, "action", "")),
                 "reason": str(getattr(step, "reason", "")),
                 "completed": bool(getattr(step, "completed", False)),
+                "phase": str(getattr(step, "phase", "")),
+                "goal": str(getattr(step, "goal", "")),
+                "preferred_tools": list(getattr(step, "preferred_tools", ())),
+                "completion_evidence": str(getattr(step, "completion_evidence", "")),
+                "status": str(getattr(step, "status", "pending")),
             }
         )
     return result

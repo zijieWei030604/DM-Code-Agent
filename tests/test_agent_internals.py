@@ -276,7 +276,8 @@ def test_build_user_prompt_renders_task_and_plan():
 
     assert "任务：排查回归" in prompt
     assert "执行计划：" in prompt
-    assert "[todo] 步骤 1: echo - inspect the file" in prompt
+    assert "[todo] inspect: inspect the file" in prompt
+    assert "建议工具: echo" in prompt
     assert "之前的步骤：" not in prompt
 
 

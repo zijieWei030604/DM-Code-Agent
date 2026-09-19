@@ -46,7 +46,17 @@ def test_task_planner_uses_strict_schema_when_client_supports_it():
 
     schema = client.requests[0][1]["json_schema"]
     step_schema = schema["properties"]["plan"]["items"]
-    assert step_schema["properties"]["action"]["enum"] == ["read_file", "task_complete"]
+    assert step_schema["properties"]["phase"]["enum"] == [
+        "locate",
+        "inspect",
+        "change",
+        "validate",
+        "complete",
+    ]
+    assert step_schema["properties"]["preferred_tools"]["items"]["enum"] == [
+        "read_file",
+        "task_complete",
+    ]
     assert step_schema["additionalProperties"] is False
     assert [step.action for step in plan] == ["read_file"]
 

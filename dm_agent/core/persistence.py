@@ -252,6 +252,13 @@ def plan_to_checkpoint(plan: Iterable[PlanStep]) -> list[dict[str, Any]]:
             "reason": step.reason,
             "completed": step.completed,
             "result": step.result,
+            "phase": step.phase,
+            "goal": step.goal,
+            "preferred_tools": list(step.preferred_tools),
+            "completion_evidence": step.completion_evidence,
+            "status": step.status,
+            "status_reason": step.status_reason,
+            "evidence_refs": list(step.evidence_refs),
         }
         for step in plan
     ]
@@ -266,6 +273,13 @@ def plan_from_checkpoint(raw_plan: Iterable[Mapping[str, Any]]) -> list[PlanStep
             reason=str(item.get("reason", "")),
             completed=bool(item.get("completed", False)),
             result=item.get("result"),
+            phase=str(item.get("phase", "")),
+            goal=str(item.get("goal", "")),
+            preferred_tools=tuple(str(value) for value in item.get("preferred_tools", ())),
+            completion_evidence=str(item.get("completion_evidence", "")),
+            status=str(item.get("status", "pending")),
+            status_reason=str(item.get("status_reason", "")),
+            evidence_refs=tuple(str(value) for value in item.get("evidence_refs", ())),
         )
         for index, item in enumerate(raw_plan)
     ]
