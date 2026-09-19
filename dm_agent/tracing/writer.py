@@ -18,13 +18,14 @@ from dm_agent.memory.context_budget import estimate_tokens_from_chars
 
 from .session import new_entry_id, normalize_entries
 
+# 3.0: 证据完成状态收敛为 tested/contradicted/unavailable/not_run；不兼容旧证据状态。
 # 2.0: 每条 entry 带 id/parent_id，会话日志成为可导航的树；新增 message /
 # compaction / checkpoint / fork 四类条目。老字段（event/payload）一个没动，
 # 1.x 的文件仍然可读（读侧按序补 id），下游分析工具行为不变。
 # 1.2: 新增 hook_error 增量事件；不改变既有 envelope 与字段语义。
 # 1.1: additive events (observation_truncated, context_budget, edit_guard, ...)
 # and the llm_call estimated_prompt_tokens field. Older traces stay parseable.
-TRACE_SCHEMA_VERSION = "2.0"
+TRACE_SCHEMA_VERSION = "3.0"
 SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL")
 
 

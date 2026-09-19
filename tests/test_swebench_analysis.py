@@ -140,6 +140,7 @@ def _write_trace(
     metadata: dict[str, Any] | None = None,
     runtime_id: str | None = None,
     malformed_line: bool = False,
+    schema_version: str = "2.0",
 ) -> Path:
     actions = actions or [("read_file", {"path": "a.py"}), ("task_complete", {})]
     owner, repository_with_issue = (runtime_id or instance_id).split("__", 1)
@@ -149,7 +150,7 @@ def _write_trace(
             "runtime",
             {"instance_id": runtime_id or instance_id, "repo": f"{owner}/{repository}"},
         ),
-        _event("run_start", {"schema_version": "2.0"}),
+        _event("run_start", {"schema_version": schema_version}),
     ]
     for index, (action, action_input) in enumerate(actions, start=1):
         events.append(
@@ -405,7 +406,7 @@ def test_prefix_scopes_are_additive_and_report_order_is_set_based(tmp_path: Path
         )
 
 
-def test_evidence_completion_status_groups_official_outcomes(tmp_path: Path) -> None:
+def test_evidence_verification_state_groups_official_outcomes(tmp_path: Path) -> None:
     ids = IDS[:3]
     predictions = _write_predictions(tmp_path / "predictions.jsonl", [_prediction(item) for item in ids])
     report = _write_json(
@@ -417,25 +418,54 @@ def test_evidence_completion_status_groups_official_outcomes(tmp_path: Path) -> 
     _write_trace(
         trace_dir / f"{ids[0]}.jsonl",
         ids[0],
-        metadata={"evidence_completion_status": "verified"},
+        metadata={
+            "evidence_graph_enabled": True,
+            "evidence_verification_state": "tested",
+        },
+        schema_version="3.0",
     )
     _write_trace(
         trace_dir / f"{ids[1]}.jsonl",
         ids[1],
-        metadata={"evidence_completion_status": "unverified"},
+        metadata={
+            "evidence_graph_enabled": True,
+            "evidence_verification_state": "unavailable",
+        },
+        schema_version="3.0",
     )
     _write_trace(trace_dir / f"{ids[2]}.jsonl", ids[2], status="critic_rejected")
 
     analysis = analyze_paths(predictions, report, trace_dirs=[trace_dir])
-    groups = analysis["summary"]["by_evidence_completion_status"]
+    groups = analysis["summary"]["by_evidence_verification_state"]
 
-    assert groups["verified"]["official_outcomes"]["resolved"] == 1
-    assert groups["unverified"]["official_outcomes"]["unresolved"] == 1
-    assert groups["critic_rejected"]["official_outcomes"]["unresolved"] == 1
-    assert "unmeasured" not in groups
+    assert groups["tested"]["official_outcomes"]["resolved"] == 1
+    assert groups["unavailable"]["official_outcomes"]["unresolved"] == 1
+    assert groups["unmeasured"]["official_outcomes"]["unresolved"] == 1
     markdown = render_markdown(analysis)
     assert "## 决策证据完成等级" in markdown
-    assert "| verified | 1 | 1 | 0 | 0 | 0 | 0 | 0 |" in markdown
+    assert "| tested | 1 | 1 | 0 | 0 | 0 | 0 | 0 |" in markdown
+
+
+def test_old_evidence_trace_schema_is_rejected(tmp_path: Path) -> None:
+    instance_id = IDS[0]
+    predictions = _write_predictions(
+        tmp_path / "predictions.jsonl", [_prediction(instance_id)]
+    )
+    report = _write_json(
+        tmp_path / "report.json",
+        _report([instance_id], resolved=[], unresolved=[instance_id], empty=[], error=[]),
+    )
+    trace_dir = tmp_path / "traces"
+    trace_dir.mkdir()
+    _write_trace(
+        trace_dir / f"{instance_id}.jsonl",
+        instance_id,
+        metadata={"evidence_graph_enabled": True},
+        schema_version="2.0",
+    )
+
+    with pytest.raises(AnalysisInputError, match=r"expected schema_version=3\.0"):
+        analyze_paths(predictions, report, trace_dirs=[trace_dir])
 
 
 def test_missing_legacy_fields_are_null_not_zero(tmp_path: Path) -> None:

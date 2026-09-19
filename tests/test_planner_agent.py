@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from dm_agent.clients.base_client import LLMError
 from dm_agent.core.agent import ReactAgent
 from dm_agent.core.planner import AdaptiveReplanPolicy, TaskPlanner
 from dm_agent.tools.base import Tool
@@ -22,6 +23,12 @@ class FakeRespondClient:
 
 class NativeToolFakeClient(FakeRespondClient):
     supports_tool_calling = True
+
+    def respond(self, messages, **extra):
+        response = super().respond(messages, **extra)
+        self.last_response_mode = "native_tool_call"
+        self.last_tool_call_count = 1
+        return response
 
 
 class StructuredFakeClient(FakeRespondClient):
@@ -162,6 +169,125 @@ def test_react_agent_sends_provider_neutral_single_call_tool_definitions():
     assert client.requests[0][1]["tool_definitions"] == [
         {"name": "task_complete", "description": "Finish", "parameters": schema}
     ]
+
+
+def test_react_agent_retries_missing_native_call_without_polluting_history():
+    class MissingThenNativeClient(FakeRespondClient):
+        supports_tool_calling = True
+
+        def respond(self, messages, **extra):
+            response = super().respond(messages, **extra)
+            self.last_response_mode = (
+                "json_fallback" if len(self.requests) == 1 else "native_tool_call"
+            )
+            self.last_tool_call_count = 0 if len(self.requests) == 1 else 1
+            return response
+
+    response = json.dumps(
+        {"thought": "", "action": "finish", "action_input": {"answer": "done"}}
+    )
+    client = MissingThenNativeClient(["plain text", response])
+    agent = ReactAgent(
+        client,
+        [Tool("task_complete", "Finish", lambda arguments: "finished")],
+        enable_planning=False,
+        enable_compression=False,
+    )
+
+    result = agent.run("finish immediately", max_steps=1)
+
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["native_tool_call_missing_count"] == 1
+    assert result["metadata"]["native_tool_retry_count"] == 1
+    assert len(client.requests) == 2
+    assert client.requests[0][1]["tool_choice"] == "auto"
+    assert client.requests[1][1]["tool_choice"] == "required"
+    assert client.requests[1][0][-1]["role"] == "system"
+    assert "native tool call" in client.requests[1][0][-1]["content"]
+    assert all(
+        "native tool call" not in message.get("content", "")
+        for message in agent.conversation_history
+    )
+
+
+def test_react_agent_downgrades_only_explicit_required_tool_choice_rejection():
+    class RequiredUnsupportedClient(FakeRespondClient):
+        supports_tool_calling = True
+
+        def respond(self, messages, **extra):
+            self.requests.append((messages, extra))
+            if len(self.requests) == 1:
+                self.last_response_mode = "json_fallback"
+                self.last_tool_call_count = 0
+                return self.responses.pop(0)
+            if len(self.requests) == 2:
+                raise LLMError("400: tool_choice required is not supported")
+            self.last_response_mode = "native_tool_call"
+            self.last_tool_call_count = 1
+            return self.responses.pop(0)
+
+    invalid = "plain text"
+    response = json.dumps(
+        {"thought": "", "action": "finish", "action_input": {"answer": "done"}}
+    )
+    client = RequiredUnsupportedClient([invalid, response])
+    agent = ReactAgent(
+        client,
+        [Tool("task_complete", "Finish", lambda arguments: "finished")],
+        enable_planning=False,
+        enable_compression=False,
+    )
+
+    result = agent.run("finish immediately", max_steps=1)
+
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["protocol_downgrade_count"] == 1
+    assert [request[1]["tool_choice"] for request in client.requests] == [
+        "auto",
+        "required",
+        "auto",
+    ]
+
+
+def test_react_agent_bounds_native_retries_across_the_run():
+    class RepeatedMissingClient(FakeRespondClient):
+        supports_tool_calling = True
+
+        def respond(self, messages, **extra):
+            response = super().respond(messages, **extra)
+            self.last_response_mode = (
+                "native_tool_call"
+                if extra.get("tool_choice") == "required"
+                else "json_fallback"
+            )
+            self.last_tool_call_count = 1 if self.last_response_mode == "native_tool_call" else 0
+            return response
+
+    noop = json.dumps({"thought": "", "action": "noop", "action_input": {}})
+    finish = json.dumps(
+        {"thought": "", "action": "finish", "action_input": {"answer": "done"}}
+    )
+    client = RepeatedMissingClient(
+        ["plain text", noop, "plain text", noop, "plain text", noop, finish]
+    )
+    agent = ReactAgent(
+        client,
+        [
+            Tool("noop", "No operation", lambda arguments: "ok"),
+            Tool("task_complete", "Finish", lambda arguments: "finished"),
+        ],
+        enable_planning=False,
+        enable_compression=False,
+    )
+
+    result = agent.run("finish after three checks", max_steps=4)
+
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["native_tool_call_missing_count"] == 4
+    assert result["metadata"]["native_tool_retry_count"] == 3
+    assert result["metadata"]["native_tool_call_count"] == 3
+    assert result["metadata"]["json_fallback_count"] == 1
+    assert len(client.requests) == 7
 
 
 def test_react_agent_stops_on_common_terminal_action_alias():

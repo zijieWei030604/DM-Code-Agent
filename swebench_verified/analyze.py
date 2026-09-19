@@ -41,7 +41,13 @@ HARNESS_DETAIL_STATUSES = (
 )
 AGENT_OUTCOMES = ("success", "max_steps", "exception", "unknown")
 TRACE_STATUSES = ("measured", "missing", "unmeasured", "invalid")
-EVIDENCE_COMPLETION_STATUSES = ("verified", "unverified", "critic_rejected", "unmeasured")
+EVIDENCE_VERIFICATION_STATES = (
+    "tested",
+    "contradicted",
+    "unavailable",
+    "not_run",
+    "unmeasured",
+)
 FAILURE_LABELS = (
     "empty_patch",
     "no_edit",
@@ -229,7 +235,7 @@ def analyze_paths(
     summary["by_difficulty"] = _facet_summaries(rows, "difficulty")
     summary["by_official_outcome"] = _facet_summaries(rows, "official", "outcome")
     summary["by_failure_label"] = _label_summaries(rows)
-    summary["by_evidence_completion_status"] = _facet_summaries(
+    summary["by_evidence_verification_state"] = _facet_summaries(
         rows, "evidence_completion", "status"
     )
 
@@ -371,8 +377,8 @@ def render_markdown(analysis: dict[str, Any]) -> str:
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
-    for status in EVIDENCE_COMPLETION_STATUSES:
-        bucket = (summary.get("by_evidence_completion_status", {}) or {}).get(status)
+    for status in EVIDENCE_VERIFICATION_STATES:
+        bucket = (summary.get("by_evidence_verification_state", {}) or {}).get(status)
         if bucket is None:
             continue
         counts = bucket.get("official_outcomes", {})
@@ -1026,12 +1032,19 @@ def _trace_record(
     instance_id: str, path: Path, events: list[dict[str, Any]], malformed: bool
 ) -> dict[str, Any]:
     runtime = next((event for event in events if event.get("event") == "runtime"), None)
+    run_start = next((event for event in events if event.get("event") == "run_start"), None)
     run_end = next((event for event in reversed(events) if event.get("event") == "run_end"), None)
     runtime_payload = runtime.get("payload", {}) if isinstance(runtime, dict) else {}
     end_payload = run_end.get("payload", {}) if isinstance(run_end, dict) else {}
     metadata = (
         end_payload.get("metadata", {}) if isinstance(end_payload.get("metadata"), dict) else {}
     )
+    if metadata.get("evidence_graph_enabled"):
+        start_payload = run_start.get("payload", {}) if isinstance(run_start, dict) else {}
+        if start_payload.get("schema_version") != "3.0":
+            raise AnalysisInputError(
+                f"trace 使用不受支持的旧证据格式: {path}; expected schema_version=3.0"
+            )
     status_raw = end_payload.get("status") if isinstance(end_payload, dict) else None
     step_events = [event for event in events if event.get("event") == "step"]
     tool_events = [event for event in events if event.get("event") == "tool_call"]
@@ -1109,23 +1122,17 @@ def _trace_record(
         "verification_actions": verification_actions,
         "verification_before_finish": before_finish if run_end is not None else None,
         "verification_gap": verification_gap,
-        "evidence_completion_status": _evidence_completion_status(metadata, status_raw),
+        "evidence_verification_state": _evidence_verification_state(metadata),
         "event_count": len(events),
         "json_malformed": malformed,
     }
 
 
-def _evidence_completion_status(metadata: dict[str, Any], status_raw: Any) -> str:
-    """Return only completion states the trace can establish.
-
-    Old traces and runs without the evidence capability remain unmeasured;
-    they must not be folded into an evidence-policy denominator.
-    """
-    status = metadata.get("evidence_completion_status")
-    if status in {"verified", "unverified"}:
+def _evidence_verification_state(metadata: dict[str, Any]) -> str:
+    """Return the explicit four-state verification result for new traces."""
+    status = metadata.get("evidence_verification_state")
+    if status in {"tested", "contradicted", "unavailable", "not_run"}:
         return str(status)
-    if status_raw == "critic_rejected":
-        return "critic_rejected"
     return "unmeasured"
 
 
@@ -1556,9 +1563,9 @@ def _trace_output(trace: dict[str, Any] | None, status: str) -> dict[str, Any]:
 def _evidence_completion_output(trace: dict[str, Any] | None, trace_status: str) -> dict[str, Any]:
     if trace is None or trace_status != "measured":
         return {"status": "unmeasured"}
-    status = trace.get("evidence_completion_status")
+    status = trace.get("evidence_verification_state")
     return {
-        "status": status if status in EVIDENCE_COMPLETION_STATUSES else "unmeasured",
+        "status": status if status in EVIDENCE_VERIFICATION_STATES else "unmeasured",
     }
 
 

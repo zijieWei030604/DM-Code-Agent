@@ -105,6 +105,7 @@ class EvidenceGraph:
         self._counters: dict[str, int] = {}
         self.current_plan_id = ""
         self.workspace_version = ""
+        self.change_revision = 0
         self.summary_pending = False
         self.last_summary_fingerprint = ""
         self.contradiction_blocked_once = False
@@ -120,6 +121,7 @@ class EvidenceGraph:
         self._counters.clear()
         self.current_plan_id = ""
         self.workspace_version = ""
+        self.change_revision = 0
         self.summary_pending = False
         self.last_summary_fingerprint = ""
         self.contradiction_blocked_once = False
@@ -208,6 +210,7 @@ class EvidenceGraph:
         after_version: str = "",
         requires_read_basis: bool | None = None,
         basis_kind: str = "read",
+        change_revision: int | None = None,
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         if after_version:
             self.workspace_version = after_version
@@ -229,6 +232,9 @@ class EvidenceGraph:
                 "after_version": after_version,
                 "requires_read_basis": require_basis,
                 "basis_kind": basis_kind,
+                "change_revision": (
+                    self.change_revision if change_revision is None else change_revision
+                ),
             },
         )
         edges = self._link_current_plan(node.node_id, "implements")
@@ -274,6 +280,11 @@ class EvidenceGraph:
         target_change_ids: Sequence[str] = (),
         direct: bool | None = None,
         details: str = "",
+        execution_status: str = "completed",
+        outcome: str = "",
+        failure_kind: str = "",
+        blocking: bool = True,
+        change_revision: int | None = None,
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         is_direct = False if direct is None else direct
         targets = tuple(
@@ -295,6 +306,13 @@ class EvidenceGraph:
                 "details": _shorten(details, 800),
                 "scope": list(scope),
                 "target_change_ids": list(targets),
+                "execution_status": execution_status,
+                "outcome": outcome or ("passed" if passed else "unknown"),
+                "failure_kind": failure_kind,
+                "blocking": blocking,
+                "change_revision": (
+                    self.change_revision if change_revision is None else change_revision
+                ),
             },
         )
         edges: list[EvidenceEdge] = []
@@ -310,8 +328,12 @@ class EvidenceGraph:
         edge = self._add_edge(
             node.node_id,
             self.ROOT_REQUIREMENT_ID,
-            "verifies" if passed and is_direct and targets else ("supports" if passed else "contradicts"),
-            confidence="deterministic" if (not passed or is_direct) else "inferred",
+            (
+                "verifies"
+                if passed and is_direct and targets
+                else ("supports" if passed else ("contradicts" if blocking else "reports"))
+            ),
+            confidence="deterministic" if (blocking or is_direct) else "inferred",
         )
         if edge:
             edges.append(edge)
@@ -382,7 +404,11 @@ class EvidenceGraph:
         result: dict[str, ChangeEvidenceStatus] = {}
         for change in self._nodes_of_kind("change"):
             checks = self._current_checks_for_change(change.node_id)
-            if any(not bool(node.metadata.get("passed")) for node in checks):
+            if any(
+                not bool(node.metadata.get("passed"))
+                and bool(node.metadata.get("blocking", True))
+                for node in checks
+            ):
                 result[change.node_id] = "contradicted"
                 continue
             legacy_change = "before_version" not in change.metadata
@@ -457,7 +483,10 @@ class EvidenceGraph:
                 return "partially_verified"
             return "implemented"
         checks = self.current_verifications()
-        if any(not bool(node.metadata.get("passed")) for node in checks):
+        if any(
+            not bool(node.metadata.get("passed")) and bool(node.metadata.get("blocking", True))
+            for node in checks
+        ):
             return "contradicted"
         if conclusions and any(
             bool(node.metadata.get("passed")) and bool(node.metadata.get("direct"))
@@ -547,13 +576,26 @@ class EvidenceGraph:
             paths = [str(node.metadata.get("path") or "<workspace>") for node in changes[-3:]]
             lines.append("Implemented: " + ", ".join(dict.fromkeys(paths)))
         passed = [node for node in verifications if bool(node.metadata.get("passed"))]
-        failed = [node for node in verifications if not bool(node.metadata.get("passed"))]
+        failed = [
+            node
+            for node in verifications
+            if not bool(node.metadata.get("passed")) and bool(node.metadata.get("blocking", True))
+        ]
+        unavailable = [
+            node
+            for node in verifications
+            if not bool(node.metadata.get("passed")) and not bool(node.metadata.get("blocking", True))
+        ]
         if passed:
             lines.append(
                 "Verified/supporting checks: " + ", ".join(node.title for node in passed[-3:])
             )
         if failed:
             lines.append("Contradicting checks: " + ", ".join(node.title for node in failed[-3:]))
+        if unavailable:
+            lines.append(
+                "Unverified checks: " + ", ".join(node.title for node in unavailable[-3:])
+            )
         issues = self.completion_issues()
         if issues:
             detail = ", ".join(f"{item['path']} ({item['status']})" for item in issues[:4])
@@ -568,6 +610,7 @@ class EvidenceGraph:
         return {
             "task": self.task,
             "workspace_version": self.workspace_version,
+            "change_revision": self.change_revision,
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "edges": [edge.to_dict() for edge in self.edges],
             "counters": dict(self._counters),
@@ -582,6 +625,7 @@ class EvidenceGraph:
         graph = cls()
         graph.task = str(data.get("task", ""))
         graph.workspace_version = str(data.get("workspace_version", ""))
+        graph.change_revision = int(data.get("change_revision", 0))
         for raw in data.get("nodes") or []:
             if not isinstance(raw, Mapping):
                 continue

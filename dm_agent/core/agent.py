@@ -53,6 +53,30 @@ from .tool_invoker import ToolInvoker
 __all__ = ["ReactAgent", "Step"]
 
 
+def _required_tool_choice_unsupported(exc: Exception) -> bool:
+    """Return true only for explicit provider rejection of required tool choice."""
+    chain: list[str] = []
+    current: BaseException | None = exc
+    while current is not None:
+        chain.append(str(current).lower())
+        current = current.__cause__
+    text = " ".join(chain)
+    mentions_option = "tool_choice" in text or "tool choice" in text
+    mentions_required = "required" in text
+    explicit_rejection = any(
+        token in text
+        for token in (
+            "unsupported",
+            "not supported",
+            "invalid",
+            "not allowed",
+            "unknown parameter",
+            "unrecognized",
+        )
+    )
+    return mentions_option and mentions_required and explicit_rejection
+
+
 class ReactAgent:
     """ReAct（推理 + 行动）循环的内核。
 
@@ -568,6 +592,7 @@ class ReactAgent:
             )
             self._append_history("user", task_prompt, kind="task")
 
+        native_tool_retry_budget = 3
         for step_num in range(resume_from + 1, limit + 1):
             self._run_context.step_number = step_num
             # 每步开始前落盘上一步完成后的快照（若启用 checkpoint）。
@@ -595,12 +620,87 @@ class ReactAgent:
             )
 
             # 获取 AI 响应
+            request_messages = messages_to_send
             try:
                 request_options: dict[str, Any] = {"temperature": self.temperature}
                 if getattr(self._request_client, "supports_tool_calling", False):
                     request_options["tool_definitions"] = tool_definitions
                     request_options["tool_choice"] = "auto"
-                raw = self._request_client.respond(messages_to_send, **request_options)
+                raw = self._request_client.respond(request_messages, **request_options)
+
+                response_mode = str(
+                    getattr(self._request_client, "last_response_mode", "")
+                    or ("json_fallback" if self.native_tool_calling else "prompt_json")
+                )
+                if (
+                    self.native_tool_calling
+                    and response_mode != "native_tool_call"
+                ):
+                    metadata["native_tool_call_missing_count"] += 1
+                    try:
+                        parse_agent_response(raw)
+                    except ValueError:
+                        needs_retry = True
+                    else:
+                        needs_retry = False
+                    can_retry = (
+                        needs_retry
+                        and metadata["native_tool_retry_count"] < native_tool_retry_budget
+                    )
+                    if self.trace_writer:
+                        self.trace_writer.record(
+                            "native_tool_call_missing",
+                            {
+                                "step_number": step_num,
+                                "response_mode": response_mode,
+                                "valid_json_fallback": not needs_retry,
+                                "retry": can_retry,
+                            },
+                        )
+                    if can_retry:
+                        metadata["native_tool_retry_count"] += 1
+                        request_messages = [
+                            *messages_to_send,
+                            {
+                                "role": "system",
+                                "content": (
+                                    "The previous response did not contain a native tool call. "
+                                    "Continue by calling exactly one available tool; call "
+                                    "task_complete when the task is finished."
+                                ),
+                            },
+                        ]
+                        if self.trace_writer:
+                            self.trace_writer.record(
+                                "native_tool_retry",
+                                {
+                                    "step_number": step_num,
+                                    "attempt": metadata["native_tool_retry_count"],
+                                    "task_budget": native_tool_retry_budget,
+                                },
+                            )
+                        retry_options = {**request_options, "tool_choice": "required"}
+                        try:
+                            raw = self._request_client.respond(
+                                request_messages, **retry_options
+                            )
+                        except Exception as exc:
+                            if not _required_tool_choice_unsupported(exc):
+                                raise
+                            metadata["protocol_downgrade_count"] += 1
+                            if self.trace_writer:
+                                self.trace_writer.record(
+                                    "tool_protocol_downgraded",
+                                    {
+                                        "step_number": step_num,
+                                        "from": "required",
+                                        "to": "auto",
+                                        "reason": str(exc),
+                                    },
+                                )
+                            raw = self._request_client.respond(
+                                request_messages, **request_options
+                            )
             except Exception as exc:
                 if self.trace_writer:
                     self.trace_writer.record(
@@ -617,7 +717,7 @@ class ReactAgent:
                 selected_tool = str(getattr(self._request_client, "last_selected_tool", "") or "")
                 self.trace_writer.record_llm_call(
                     step_number=step_num,
-                    messages=messages_to_send,
+                    messages=request_messages,
                     temperature=self.temperature,
                     raw_response=raw,
                     response_mode=response_mode,

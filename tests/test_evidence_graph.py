@@ -64,6 +64,36 @@ def _plan() -> list[dict[str, Any]]:
     ]
 
 
+def _test_result(
+    *,
+    outcome: str,
+    scope: tuple[str, ...] = ("tests/test_service.py",),
+    execution_status: str = "completed",
+    failure_kind: str = "assertion_failure",
+) -> ToolResult:
+    passed = outcome == "passed"
+    return ToolResult(
+        "success" if passed else "failed",
+        "1 passed" if passed else "1 failed",
+        exit_code=0 if passed else 1,
+        check_scope=scope,
+        metadata={
+            "verification": {
+                "execution_status": execution_status,
+                "outcome": outcome,
+                "framework": "pytest",
+                "scope": list(scope),
+                "collected": 1 if outcome in {"passed", "failed"} else 0,
+                "passed": 1 if passed else 0,
+                "failed": 1 if outcome == "failed" else 0,
+                "errors": 1 if outcome == "error" else 0,
+                "skipped": 0,
+                "failure_kind": "" if passed else failure_kind,
+            }
+        },
+    )
+
+
 def test_evidence_graph_builds_a_verified_chain_and_round_trips() -> None:
     graph = EvidenceGraph("Normalize imported users")
     graph.sync_plan(_plan())
@@ -393,7 +423,7 @@ def test_completion_policy_uses_transaction_level_test_for_source_changes() -> N
     assert decision.issues == ()
 
 
-def test_completion_policy_allows_docs_and_warns_for_unchecked_config() -> None:
+def test_completion_policy_marks_unchecked_changes_not_run() -> None:
     docs = EvidenceGraph("Update documentation")
     docs.add_change(
         tool="edit_file",
@@ -409,10 +439,13 @@ def test_completion_policy_allows_docs_and_warns_for_unchecked_config() -> None:
         requires_read_basis=False,
     )
 
-    assert EvidenceCompletionPolicy().evaluate(docs).decision == "allow"
+    docs_decision = EvidenceCompletionPolicy().evaluate(docs)
+    assert docs_decision.decision == "warn"
+    assert docs_decision.verification_state == "not_run"
     config_decision = EvidenceCompletionPolicy().evaluate(config)
     assert config_decision.decision == "warn"
-    assert config_decision.warnings[0]["status"] == "configuration_unchecked"
+    assert config_decision.verification_state == "not_run"
+    assert config_decision.warnings[0]["status"] == "verification_not_run"
 
 
 def test_completion_policy_still_blocks_failed_checks_and_missing_read_basis() -> None:
@@ -442,7 +475,7 @@ def test_completion_policy_still_blocks_failed_checks_and_missing_read_basis() -
     decision = EvidenceCompletionPolicy().evaluate(graph)
 
     assert decision.decision == "block"
-    assert {item["status"] for item in decision.issues} == {"transaction_test_failed"}
+    assert {item["status"] for item in decision.issues} == {"confirmed_test_failure"}
 
 
 def test_completion_policy_warns_instead_of_blocking_for_missing_read_basis() -> None:
@@ -458,18 +491,19 @@ def test_completion_policy_warns_instead_of_blocking_for_missing_read_basis() ->
     decision = EvidenceCompletionPolicy().evaluate(graph)
 
     assert decision.decision == "warn"
+    assert decision.verification_state == "not_run"
     assert decision.issues == ()
-    assert {item["status"] for item in decision.warnings} == {
-        "missing_read_basis",
-        "source_unverified",
-    }
+    assert {item["status"] for item in decision.warnings} == {"verification_not_run"}
 
 
-def test_evidence_capability_injects_after_compression_and_bounds_repeated_finishes() -> None:
+def test_evidence_capability_never_injects_status_and_rejects_repeated_contradiction() -> None:
     bus = EventBus()
     trace = _Trace()
     state = {"plan": _plan()}
-    capability = EvidenceGraphCapability(summary_chars=300)
+    capability = EvidenceGraphCapability(
+        summary_chars=300,
+        repeated_contradiction="critic_rejected",
+    )
     capability.install(CapabilityContext(bus, lambda phase: None, trace, lambda: state))
     metadata: dict[str, Any] = {}
 
@@ -494,8 +528,6 @@ def test_evidence_capability_injects_after_compression_and_bounds_repeated_finis
     )
     outgoing = bus.emit_before_llm_request(request)
     assert outgoing == [{"role": "user", "content": "continue"}]
-    assert metadata["evidence_summary_injection_count"] == 0
-
     metadata["memory_compression_count"] = 1
     compressed = bus.emit_before_llm_request(
         BeforeLLMRequestEvent(
@@ -506,13 +538,10 @@ def test_evidence_capability_injects_after_compression_and_bounds_repeated_finis
             metadata,
         )
     )
-    assert compressed[-1]["role"] == "system"
-    assert compressed[-1]["content"].startswith("[Task Evidence]")
-    assert metadata["evidence_summary_injection_count"] == 1
+    assert compressed == [{"role": "user", "content": "continue compressed"}]
 
     # A duplicate pending signal without any operational evidence change does
     # not append the same evidence summary again.
-    capability.graph.summary_pending = True
     duplicate = bus.emit_before_llm_request(
         BeforeLLMRequestEvent(
             [{"role": "user", "content": "continue"}], 2, "run-1", "agent", metadata
@@ -523,24 +552,23 @@ def test_evidence_capability_injects_after_compression_and_bounds_repeated_finis
     bus.emit_after_tool_result(
         AfterToolResultEvent(
             "run_tests",
-            {},
+            {"targets": ["tests/test_users.py"]},
             "1 failed\nreturncode: 1",
             2,
             "run-1",
-            True,
+            False,
             metadata,
+            result=_test_result(outcome="failed", scope=("tests/test_users.py",)),
         )
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 3, "run-1", metadata)
     first = bus.emit_before_finish(finish)
     second = bus.emit_before_finish(finish)
-    third = bus.emit_before_finish(finish)
     assert first is not None and "Latest failed test" in first["reason"]
-    assert second is not None and "verification state has not changed" in second["reason"]
-    assert third is not None and "after repeated attempts" in third["reason"]
-    assert metadata["evidence_contradiction_block_count"] == 3
-    assert metadata["evidence_completion_block_count"] == 3
-    assert metadata["evidence_recovery_prompt_count"] == 1
+    assert second is not None and "Completion rejected" in second["reason"]
+    assert metadata["evidence_contradiction_block_count"] == 2
+    assert metadata["evidence_completion_block_count"] == 2
+    assert metadata["evidence_intervention_prompt_count"] == 1
     assert metadata["evidence_terminal_rejection_count"] == 1
     conclusions = [node for node in capability.graph.nodes.values() if node.kind == "conclusion"]
     assert conclusions and all(node.metadata["accepted"] is False for node in conclusions)
@@ -557,13 +585,13 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
     bus.emit_after_tool_result(
         AfterToolResultEvent(
             "run_tests",
-            {"test_path": "tests"},
+            {"targets": ["tests/test_users.py"]},
             "1 failed\nreturncode: 1",
             1,
             "run-1",
             False,
             metadata,
-            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+            result=_test_result(outcome="failed", scope=("tests/test_users.py",)),
         )
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
@@ -578,59 +606,139 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
     assert metadata["evidence_terminal_rejection_count"] == 1
 
 
-def test_evidence_recovery_budget_terminates_without_operational_progress() -> None:
+def test_invalid_test_invocation_warns_without_blocking_completion() -> None:
     bus = EventBus()
-    trace = _Trace()
-    capability = EvidenceGraphCapability(
-        repeated_contradiction="critic_rejected",
-        max_recovery_tool_steps=2,
-    )
-    capability.install(CapabilityContext(bus, lambda phase: None, trace_writer=trace))
+    capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")
+    capability.install(CapabilityContext(bus, lambda phase: None))
     metadata: dict[str, Any] = {}
     bus.emit_run_start(RunStartEvent("Fix users", 1, "run-1", metadata=metadata))
     bus.emit_after_tool_result(
         AfterToolResultEvent(
             "run_tests",
-            {"test_path": "tests"},
-            "1 failed",
+            {"targets": ["tests/missing.py"]},
+            "test target missing",
             1,
             "run-1",
             False,
             metadata,
-            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+            result=_test_result(
+                outcome="unknown",
+                scope=("tests/missing.py",),
+                execution_status="invalid",
+                failure_kind="invalid_target",
+            ),
         )
     )
     block = bus.emit_before_finish(
         BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
     )
 
-    assert block is not None
-    assert metadata["evidence_recovery_active"] is True
-    for step in (3, 4):
-        bus.emit_after_tool_result(
-            AfterToolResultEvent(
-                "read_file",
-                {"path": "service.py"},
-                "contents",
-                step,
-                "run-1",
-                True,
-                metadata,
-            )
-        )
-
-    assert metadata["evidence_recovery_tool_calls"] == 2
-    assert metadata["evidence_recovery_progress_events"] == 0
-    assert metadata["evidence_recovery_budget_exhausted"] is True
-    assert metadata["evidence_terminal_completion_rejection"] is True
-    assert any(item["event"] == "evidence_recovery_exhausted" for item in trace.events)
+    assert block is None
+    assert metadata["evidence_completion_decision"] == "warn"
+    assert metadata["evidence_verification_state"] == "unavailable"
+    assert metadata["evidence_completion_block_count"] == 0
 
 
-def test_evidence_recovery_counts_new_verification_and_exits_on_success() -> None:
+def test_declared_shell_verification_can_mark_current_workspace_tested() -> None:
     bus = EventBus()
-    trace = _Trace()
-    capability = EvidenceGraphCapability(max_recovery_tool_steps=8)
-    capability.install(CapabilityContext(bus, lambda phase: None, trace_writer=trace))
+    capability = EvidenceGraphCapability()
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, Any] = {}
+    arguments = {"command": "pytest tests/test_service.py", "purpose": "verification"}
+    bus.emit_run_start(RunStartEvent("Fix service", 1, "run-1", metadata=metadata))
+    bus.emit_before_tool_call(BeforeToolCallEvent("run_shell", arguments, 1, "run-1", metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_shell",
+            arguments,
+            "1 passed\nreturncode: 0",
+            1,
+            "run-1",
+            True,
+            metadata,
+            result=ToolResult(
+                "success",
+                "1 passed\nreturncode: 0",
+                exit_code=0,
+                check_scope=(arguments["command"],),
+                metadata={
+                    "verification": {
+                        "execution_status": "completed",
+                        "outcome": "passed",
+                        "failure_kind": "",
+                        "scope": [arguments["command"]],
+                    }
+                },
+            ),
+        )
+    )
+
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix service", "finish", "done", [], 2, "run-1", metadata)
+    )
+
+    assert block is None
+    assert metadata["evidence_verification_state"] == "tested"
+
+
+def test_declared_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -> None:
+    bus = EventBus()
+    capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix service", 1, "run-1", metadata=metadata))
+
+    ordinary = {"command": "pytest tests/test_service.py"}
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_shell", ordinary, "FAILED - AssertionError", 1, "run-1", False, metadata
+        )
+    )
+    assert not capability.graph.current_verifications()
+
+    declared = {**ordinary, "purpose": "verification"}
+    bus.emit_before_tool_call(BeforeToolCallEvent("run_shell", declared, 2, "run-1", metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_shell",
+            declared,
+            "FAILED tests/test_service.py::test_update - AssertionError\nreturncode: 1",
+            2,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult(
+                "failed",
+                "FAILED tests/test_service.py::test_update - AssertionError\nreturncode: 1",
+                error_code="assertion_failure",
+                exit_code=1,
+                check_scope=(declared["command"],),
+                metadata={
+                    "verification": {
+                        "execution_status": "completed",
+                        "outcome": "failed",
+                        "failure_kind": "assertion_failure",
+                        "scope": [declared["command"]],
+                    }
+                },
+            ),
+        )
+    )
+
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix service", "finish", "done", [], 3, "run-1", metadata)
+    )
+
+    assert block is not None
+    assert "Latest failed verification" in block["reason"]
+    assert "AssertionError" in block["reason"]
+    assert metadata["evidence_verification_state"] == "contradicted"
+
+
+def test_full_suite_failure_is_a_warning_not_a_completion_block() -> None:
+    bus = EventBus()
+    capability = EvidenceGraphCapability()
+    capability.install(CapabilityContext(bus, lambda phase: None))
     metadata: dict[str, Any] = {}
     bus.emit_run_start(RunStartEvent("Fix users", 1, "run-1", metadata=metadata))
     bus.emit_after_tool_result(
@@ -642,34 +750,19 @@ def test_evidence_recovery_counts_new_verification_and_exits_on_success() -> Non
             "run-1",
             False,
             metadata,
-            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+            result=_test_result(outcome="failed", scope=("tests",)),
         )
     )
-    bus.emit_before_finish(
+    block = bus.emit_before_finish(
         BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
     )
-    bus.emit_after_tool_result(
-        AfterToolResultEvent(
-            "run_tests",
-            {"test_path": "tests"},
-            "1 passed",
-            3,
-            "run-1",
-            True,
-            metadata,
-            result=ToolResult("success", "1 passed", exit_code=0, check_scope=("tests",)),
-        )
-    )
 
-    assert metadata["evidence_recovery_tool_calls"] == 1
-    assert metadata["evidence_recovery_progress_events"] == 1
-    assert metadata["evidence_recovery_active"] is False
-    assert metadata["evidence_recovered_after_block"] is True
-    assert metadata["evidence_recovery_budget_exhausted"] is False
-    assert any(item["event"] == "evidence_recovery_finished" for item in trace.events)
+    assert block is None
+    assert metadata["evidence_completion_block_count"] == 0
+    assert metadata["evidence_verification_state"] == "unavailable"
 
 
-def test_evidence_recovery_keeps_new_edit_pending_until_current_version_is_verified(
+def test_new_edit_makes_prior_confirmed_failure_stale_and_allows_unverified_finish(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -683,18 +776,19 @@ def test_evidence_recovery_keeps_new_edit_pending_until_current_version_is_verif
     bus.emit_after_tool_result(
         AfterToolResultEvent(
             "run_tests",
-            {"test_path": "tests"},
+            {"targets": ["tests/test_service.py"]},
             "1 failed",
             1,
             "run-1",
             False,
             metadata,
-            result=ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",)),
+            result=_test_result(outcome="failed"),
         )
     )
-    bus.emit_before_finish(
+    first = bus.emit_before_finish(
         BeforeFinishEvent("Fix service", "finish", "done", [], 2, "run-1", metadata)
     )
+    assert first is not None
     bus.emit_before_tool_call(
         BeforeToolCallEvent("edit_file", {"path": "service.py"}, 3, "run-1", metadata)
     )
@@ -712,14 +806,58 @@ def test_evidence_recovery_keeps_new_edit_pending_until_current_version_is_verif
         )
     )
 
-    assert metadata["evidence_recovery_active"] is True
-    assert metadata["evidence_recovery_progress_events"] == 1
     block = bus.emit_before_finish(
         BeforeFinishEvent("Fix service", "finish", "done", [], 4, "run-1", metadata)
     )
+    assert block is None
+    assert metadata["evidence_verification_state"] == "not_run"
+
+
+def test_syntax_error_in_current_changed_file_blocks_completion(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "service.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    bus = EventBus()
+    capability = EvidenceGraphCapability()
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix service", 1, "run-1", metadata=metadata))
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("edit_file", {"path": "service.py"}, 1, "run-1", metadata)
+    )
+    target.write_text("def broken(:\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file",
+            {"path": "service.py"},
+            "updated",
+            1,
+            "run-1",
+            True,
+            metadata,
+            result=ToolResult("success", "updated", changed_files=(str(target),)),
+        )
+    )
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_python",
+            {"path": "service.py"},
+            f'File "{target}", line 1\nSyntaxError: invalid syntax',
+            2,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult("failed", "SyntaxError", exit_code=1),
+        )
+    )
+
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix service", "finish", "done", [], 3, "run-1", metadata)
+    )
+
     assert block is not None
-    assert "successful current-version verification" in block["reason"]
-    assert metadata["evidence_recovered_after_block"] is False
+    assert metadata["evidence_completion_decision"] == "block"
+    assert metadata["evidence_policy_issues"][0]["status"] == "confirmed_code_error"
 
 
 def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
@@ -728,12 +866,12 @@ def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
     monkeypatch.chdir(tmp_path)
 
     def failed_test(arguments: dict[str, Any]) -> ToolResult:
-        return ToolResult("failed", "1 failed", exit_code=1, check_scope=("tests",))
+        return _test_result(outcome="failed", scope=("tests/test_service.py",))
 
     agent = ReactAgent(
         _ScriptedClient(
             [
-                _action("run_tests", {"test_path": "tests"}),
+                _action("run_tests", {"targets": ["tests/test_service.py"]}),
                 _action("finish", {"answer": "done"}),
                 _action("finish", {"answer": "done again"}),
             ]
@@ -754,7 +892,7 @@ def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
     assert result["steps"][-1]["action"] == "finish"
 
 
-def test_react_agent_allows_unverified_finish_with_explicit_status(tmp_path, monkeypatch) -> None:
+def test_react_agent_allows_unchecked_finish_with_explicit_status(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "service.py"
     target.write_text("value = 1\n", encoding="utf-8")
@@ -787,13 +925,13 @@ def test_react_agent_allows_unverified_finish_with_explicit_status(tmp_path, mon
 
     assert result["metadata"]["status"] == "success"
     assert result["metadata"]["evidence_completion_decision"] == "warn"
-    assert result["metadata"]["evidence_completion_status"] == "unverified"
+    assert result["metadata"]["evidence_verification_state"] == "not_run"
     assert result["metadata"]["evidence_completion_block_count"] == 0
     assert result["steps"][-1]["observation"] == "<finished>"
-    assert result["metadata"]["completion_summary"].endswith("未获得成功的本地验证记录。")
+    assert result["metadata"]["completion_summary"].endswith("本轮未运行本地验证。")
 
 
-def test_react_agent_marks_verified_finish_after_tests(
+def test_react_agent_marks_tested_finish_after_tests(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -837,7 +975,7 @@ def test_react_agent_marks_verified_finish_after_tests(
     assert result["steps"][3]["observation"] == "<finished>"
     assert capability.graph.status() == "implemented"
     assert result["metadata"]["evidence_completion_decision"] == "allow"
-    assert result["metadata"]["evidence_completion_status"] == "verified"
+    assert result["metadata"]["evidence_verification_state"] == "tested"
 
 
 def test_evidence_gate_accepts_prior_verified_edit_transaction(tmp_path, monkeypatch) -> None:

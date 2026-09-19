@@ -120,10 +120,17 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "args": {"anyOf": [_STR, {"type": "array", "items": _STR}]},
         }
     ),
-    "run_shell": _object_schema({"command": _STR}, ("command",)),
+    "run_shell": _object_schema(
+        {
+            "command": _STR,
+            "purpose": {"type": "string", "enum": ["execution", "verification"]},
+        },
+        ("command",),
+    ),
     "run_tests": _object_schema(
         {
             "test_path": _STR,
+            "targets": {"type": "array", "items": _STR, "minItems": 1},
             "framework": {"type": "string", "enum": ["pytest", "unittest"]},
             "verbose": _BOOL,
         }
@@ -313,14 +320,19 @@ def _builtin_tools() -> list[Tool]:
         ),
         Tool(
             name="run_shell",
-            description='Execute a shell command. Arguments: {"command": string}.',
+            description=(
+                'Execute a shell command. Arguments: {"command": string, "purpose": optional '
+                '"execution"|"verification" (default "execution")}. Set purpose to '
+                '"verification" only when the command is intended to validate the current code.'
+            ),
             runner=run_shell,
             result_runner=run_shell_result,
         ),
         Tool(
             name="run_tests",
             description=(
-                "Run Python test suite. Arguments: {\"test_path\": optional string (default '.'), "
+                "Run Python tests. Arguments: {\"targets\": optional list of paths or pytest "
+                "node ids, \"test_path\": legacy optional single path (default '.'), "
                 '"framework": optional "pytest"|"unittest" (default \'pytest\'), "verbose": optional bool (default false)}.'
             ),
             runner=run_tests,

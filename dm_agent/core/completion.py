@@ -80,8 +80,11 @@ def build_run_result(
     """组装一次 run 的返回值；成功时顺带补一段完成摘要。"""
     if metadata.get("status") == "success":
         summary = build_completion_summary(final_answer, steps)
-        if metadata.get("evidence_completion_status") == "unverified":
-            summary += " 本轮未获得成功的本地验证记录。"
+        verification_state = metadata.get("evidence_verification_state")
+        if verification_state == "unavailable":
+            summary += " 本轮本地验证不可用。"
+        elif verification_state == "not_run":
+            summary += " 本轮未运行本地验证。"
         metadata["completion_summary"] = summary
     return {
         "final_answer": final_answer,

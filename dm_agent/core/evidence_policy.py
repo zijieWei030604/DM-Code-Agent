@@ -1,52 +1,33 @@
-"""Completion policy built on top of recorded decision evidence."""
+"""Small, execution-grounded completion policy for decision evidence."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import PurePosixPath
 from typing import Literal
 
 from .evidence import EvidenceGraph, EvidenceNode
 
 CompletionDecision = Literal["allow", "warn", "block"]
-
-_SOURCE_SUFFIXES = frozenset(
-    {
-        ".c",
-        ".cc",
-        ".cpp",
-        ".cs",
-        ".go",
-        ".java",
-        ".js",
-        ".jsx",
-        ".kt",
-        ".php",
-        ".py",
-        ".rb",
-        ".rs",
-        ".swift",
-        ".ts",
-        ".tsx",
-    }
-)
-_CONFIG_SUFFIXES = frozenset(
-    {".cfg", ".ini", ".json", ".lock", ".toml", ".xml", ".yaml", ".yml"}
-)
-_DOCUMENT_SUFFIXES = frozenset({".md", ".rst", ".txt"})
+VerificationState = Literal["tested", "contradicted", "unavailable", "not_run"]
 
 
 @dataclass(frozen=True)
 class EvidenceCompletionResult:
-    """A policy decision without mutating the underlying evidence graph."""
+    """A completion decision derived only from current execution facts."""
 
     decision: CompletionDecision
+    verification_state: VerificationState
     issues: tuple[dict[str, str], ...] = ()
     warnings: tuple[dict[str, str], ...] = ()
 
 
 class EvidenceCompletionPolicy:
-    """Evaluate a change transaction instead of demanding one test per file."""
+    """Block only explicit current-version contradictions.
+
+    Repository CI or an external harness remains the correctness authority.
+    This policy only distinguishes usable local test feedback from unavailable
+    or missing verification.
+    """
 
     def evaluate(
         self,
@@ -54,89 +35,51 @@ class EvidenceCompletionPolicy:
         *,
         verified_transaction: bool = False,
     ) -> EvidenceCompletionResult:
-        states = graph.change_states()
-        changes = [node for node in graph.nodes.values() if node.kind == "change"]
-        issues: list[dict[str, str]] = []
-        warnings: list[dict[str, str]] = []
-
-        for change in changes:
-            status = states.get(change.node_id, "unverified")
-            if status == "contradicted":
-                issues.append(_issue(change, "contradicted"))
-            elif status == "missing_read_basis":
-                warnings.append(_issue(change, "missing_read_basis"))
-
         checks = graph.current_verifications()
-        passed_checks = [node for node in checks if bool(node.metadata.get("passed"))]
-        failed_tests = [
+        contradictions = [
             node
             for node in checks
-            if node.metadata.get("tool") == "run_tests" and not bool(node.metadata.get("passed"))
+            if not bool(node.metadata.get("passed"))
+            and bool(node.metadata.get("blocking", False))
         ]
-        passed_tests = [
-            node
-            for node in passed_checks
-            if node.metadata.get("tool") == "run_tests"
-        ]
+        if contradictions:
+            latest = contradictions[-1]
+            issue = _verification_issue(latest, _blocking_status(latest))
+            return EvidenceCompletionResult("block", "contradicted", (issue,))
 
-        if failed_tests:
-            transaction_issues = [
-                _issue(change, "transaction_test_failed") for change in changes
-            ] or [
-                {
-                    "node_id": failed_tests[-1].node_id,
-                    "path": "<workspace>",
-                    "status": "transaction_test_failed",
-                }
-            ]
-            issues[0:0] = transaction_issues
-            return EvidenceCompletionResult("block", tuple(issues), tuple(warnings))
+        if verified_transaction or any(bool(node.metadata.get("passed")) for node in checks):
+            return EvidenceCompletionResult("allow", "tested")
 
-        if issues:
-            return EvidenceCompletionResult("block", tuple(issues), tuple(warnings))
+        if checks:
+            latest = checks[-1]
+            warning = _verification_issue(latest, "verification_unavailable")
+            return EvidenceCompletionResult("warn", "unavailable", warnings=(warning,))
 
-        if verified_transaction:
-            return EvidenceCompletionResult("allow")
-
-        source_changes = [node for node in changes if _change_category(node) == "source"]
-        if source_changes and not passed_tests:
-            # A missing successful local test is important evidence for the
-            # caller, but it is not proof that the patch is wrong.  The Agent
-            # must not present this as verified completion, while an offline
-            # evaluator may still establish that the patch is correct.
-            status = "source_indirect_only" if passed_checks else "source_unverified"
-            warnings.extend(_issue(node, status) for node in source_changes)
-
-        for change in changes:
-            category = _change_category(change)
-            if category == "config" and not passed_checks:
-                warnings.append(_issue(change, "configuration_unchecked"))
-            elif category == "other" and not passed_checks:
-                warnings.append(_issue(change, "change_unchecked"))
-
-        if warnings:
-            return EvidenceCompletionResult("warn", warnings=tuple(warnings))
-        return EvidenceCompletionResult("allow")
+        warning = {
+            "node_id": "",
+            "path": "<workspace>",
+            "status": "verification_not_run",
+        }
+        return EvidenceCompletionResult("warn", "not_run", warnings=(warning,))
 
 
-def _change_category(node: EvidenceNode) -> str:
-    path = str(node.metadata.get("path") or "")
-    suffix = PurePosixPath(path.replace("\\", "/")).suffix.lower()
-    if suffix in _SOURCE_SUFFIXES:
-        return "source"
-    if suffix in _CONFIG_SUFFIXES:
-        return "config"
-    if suffix in _DOCUMENT_SUFFIXES:
-        return "document"
-    return "other"
-
-
-def _issue(node: EvidenceNode, status: str) -> dict[str, str]:
+def _verification_issue(node: EvidenceNode, status: str) -> dict[str, str]:
+    scope = [str(item) for item in node.metadata.get("scope") or () if item]
     return {
         "node_id": node.node_id,
-        "path": str(node.metadata.get("path") or "<workspace>"),
+        "path": scope[0] if scope else "<workspace>",
         "status": status,
     }
 
 
-__all__ = ["EvidenceCompletionPolicy", "EvidenceCompletionResult"]
+def _blocking_status(node: EvidenceNode) -> str:
+    if str(node.metadata.get("failure_kind", "")) == "syntax_error":
+        return "confirmed_code_error"
+    return "confirmed_test_failure"
+
+
+__all__ = [
+    "EvidenceCompletionPolicy",
+    "EvidenceCompletionResult",
+    "VerificationState",
+]

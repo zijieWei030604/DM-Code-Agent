@@ -1,5 +1,6 @@
 import ast
 import json
+import sys
 
 import pytest
 
@@ -8,7 +9,16 @@ from dm_agent.core.observation import is_failure_observation
 from dm_agent.tools import task_complete
 from dm_agent.tools.code_analysis_tools import get_code_metrics, get_function_signature, parse_ast
 from dm_agent.tools.code_index_tools import dependency_graph, inspect_change_impact, search_symbol
-from dm_agent.tools.execution_tools import available_linters, run_linter, run_python
+from dm_agent.tools.execution_tools import (
+    _classify_declared_shell_verification,
+    _classify_pytest_result,
+    available_linters,
+    run_linter,
+    run_python,
+    run_python_result,
+    run_shell_result,
+    run_tests_result,
+)
 from dm_agent.tools.file_tools import (
     EDIT_ECHO_MAX_LINES,
     _atomic_write_text,
@@ -20,6 +30,88 @@ from dm_agent.tools.file_tools import (
     search_in_file,
 )
 from dm_agent.tools.structured_edit_tools import edit_python_symbol, inspect_python_symbol
+
+
+def test_run_tests_returns_structured_pytest_counts_and_supports_node_ids(tmp_path):
+    target = tmp_path / "test_sample.py"
+    target.write_text(
+        "def test_ok():\n    assert True\n\ndef test_bad():\n    assert False\n",
+        encoding="utf-8",
+    )
+
+    result = run_tests_result({"targets": [f"{target}::test_bad"]})
+
+    verification = result.metadata["verification"]
+    assert result.status == "failed"
+    assert result.check_scope == (f"{target}::test_bad",)
+    assert verification["execution_status"] == "completed"
+    assert verification["outcome"] == "failed"
+    assert verification["collected"] == 1
+    assert verification["failed"] == 1
+    assert verification["failure_kind"] == "assertion_failure"
+
+    passed_result = run_tests_result({"targets": [f"{target}::test_ok"]})
+    passed_verification = passed_result.metadata["verification"]
+    assert passed_result.status == "success"
+    assert passed_verification["outcome"] == "passed"
+    assert passed_verification["collected"] == 1
+    assert passed_verification["passed"] == 1
+
+
+def test_run_tests_reports_invalid_target_without_calling_it_a_test_failure(tmp_path):
+    missing = tmp_path / "missing.py"
+
+    result = run_tests_result({"targets": [str(missing)]})
+
+    verification = result.metadata["verification"]
+    assert result.status == "failed"
+    assert result.error_code == "invalid_test_target"
+    assert verification["execution_status"] == "invalid"
+    assert verification["outcome"] == "unknown"
+
+
+def test_pytest_usage_and_empty_collection_are_non_assertion_outcomes():
+    empty = {"collected": 0, "passed": 0, "failed": 0, "errors": 0, "skipped": 0}
+
+    usage = _classify_pytest_result(4, counts=empty, scope=["tests"])
+    no_tests = _classify_pytest_result(5, counts=empty, scope=["tests"])
+
+    assert usage["execution_status"] == "invalid"
+    assert usage["failure_kind"] == "usage_error"
+    assert no_tests["outcome"] == "no_tests"
+    assert no_tests["failure_kind"] == "no_tests_collected"
+
+
+def test_run_shell_records_verification_only_when_declared():
+    ordinary = run_shell_result({"command": f'"{sys.executable}" -c "print(1)"'})
+    verified = run_shell_result(
+        {
+            "command": f'"{sys.executable}" -c "print(1)"',
+            "purpose": "verification",
+        }
+    )
+
+    assert "verification" not in ordinary.metadata
+    assert verified.metadata["verification"]["outcome"] == "passed"
+    assert verified.check_scope
+
+
+def test_declared_shell_verification_requires_real_process_result():
+    failed = _classify_declared_shell_verification(
+        1,
+        "FAILED tests/test_service.py::test_update - AssertionError",
+        "pytest tests/test_service.py::test_update",
+    )
+    unavailable = _classify_declared_shell_verification(
+        1,
+        "command not found",
+        "missing-checker",
+    )
+
+    assert failed["outcome"] == "failed"
+    assert failed["failure_kind"] == "assertion_failure"
+    assert unavailable["execution_status"] == "unavailable"
+    assert unavailable["outcome"] == "unknown"
 
 
 def test_file_tools_create_read_edit_and_search(tmp_path):
@@ -436,6 +528,10 @@ def test_run_python_executes_inline_code():
     result = run_python({"code": "print('agent-ready')"})
     assert "agent-ready" in result
     assert "returncode: 0" in result
+
+    structured = run_python_result({"code": "print('agent-ready')"})
+    assert structured.metadata["verification"]["execution_status"] == "completed"
+    assert structured.metadata["verification"]["outcome"] == "passed"
 
 
 def test_task_complete_accepts_message():

@@ -433,7 +433,7 @@ def summarize_benchmark_results(
 def _summarize_evidence_gate(
     results: Sequence[CodingBenchResult],
 ) -> dict[str, dict[str, Any]]:
-    """Measure gate interventions and whether an intervened run later completed."""
+    """Measure conservative completion-gate interventions and final outcomes."""
     by_variant: dict[str, list[CodingBenchResult]] = {}
     for result in results:
         by_variant.setdefault(result.variant, []).append(result)
@@ -446,17 +446,16 @@ def _summarize_evidence_gate(
             for result in enabled
             if int(result.metadata.get("evidence_completion_block_count", 0) or 0) > 0
         ]
-        recovered = [result for result in blocked if result.metadata.get("status") == "success"]
-        state_recovered = [
-            result
-            for result in blocked
-            if bool(result.metadata.get("evidence_recovered_after_block"))
+        finished_after_block = [
+            result for result in blocked if result.metadata.get("status") == "success"
         ]
-        budget_exhausted = [
-            result
-            for result in blocked
-            if bool(result.metadata.get("evidence_recovery_budget_exhausted"))
-        ]
+        state_counts = {
+            state: sum(
+                result.metadata.get("evidence_verification_state") == state
+                for result in enabled
+            )
+            for state in ("tested", "contradicted", "unavailable", "not_run")
+        }
         summary[variant] = {
             "runs": len(group),
             "enabled_runs": len(enabled),
@@ -469,18 +468,19 @@ def _summarize_evidence_gate(
                 int(result.metadata.get("evidence_rejected_completion_attempts", 0) or 0)
                 for result in enabled
             ),
-            "recovered_after_block": len(recovered),
-            "recovery_after_block_rate": len(recovered) / len(blocked) if blocked else None,
-            "evidence_state_recovered": len(state_recovered),
-            "recovery_tool_calls": sum(
-                int(result.metadata.get("evidence_recovery_tool_calls", 0) or 0)
-                for result in blocked
+            "finished_after_block": len(finished_after_block),
+            "finish_after_block_rate": (
+                len(finished_after_block) / len(blocked) if blocked else None
             ),
-            "recovery_progress_events": sum(
-                int(result.metadata.get("evidence_recovery_progress_events", 0) or 0)
-                for result in blocked
+            "intervention_prompts": sum(
+                int(result.metadata.get("evidence_intervention_prompt_count", 0) or 0)
+                for result in enabled
             ),
-            "recovery_budget_exhausted_runs": len(budget_exhausted),
+            "terminal_rejections": sum(
+                int(result.metadata.get("evidence_terminal_rejection_count", 0) or 0)
+                for result in enabled
+            ),
+            "verification_states": state_counts,
         }
     return summary
 
@@ -664,28 +664,28 @@ def write_markdown_report(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Evidence Completion Gate",
                 "",
-                "| Variant | Enabled | Blocked | Blocks | State recovered | Finished recovered | Recovery tools | Progress | Budget exhausted | Recovery rate |",
-                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+                "| Variant | Enabled | Blocked | Blocks | Prompts | Finished after block | Terminal rejections | Tested | Contradicted | Unavailable | Not run | Finish rate |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
             ]
         )
         for name, data in evidence.items():
-            rate = data.get("recovery_after_block_rate")
+            rate = data.get("finish_after_block_rate")
             lines.append(
                 "| {name} | {enabled_runs} | {blocked_runs} | {completion_blocks} | "
-                "{evidence_state_recovered} | {recovered_after_block} | "
-                "{recovery_tool_calls} | {recovery_progress_events} | "
-                "{recovery_budget_exhausted_runs} | {rate} |".format(
+                "{intervention_prompts} | {finished_after_block} | "
+                "{terminal_rejections} | {tested} | {contradicted} | {unavailable} | "
+                "{not_run} | {rate} |".format(
                     name=name,
                     enabled_runs=data["enabled_runs"],
                     blocked_runs=data["blocked_runs"],
                     completion_blocks=data["completion_blocks"],
-                    evidence_state_recovered=data["evidence_state_recovered"],
-                    recovered_after_block=data["recovered_after_block"],
-                    recovery_tool_calls=data["recovery_tool_calls"],
-                    recovery_progress_events=data["recovery_progress_events"],
-                    recovery_budget_exhausted_runs=data[
-                        "recovery_budget_exhausted_runs"
-                    ],
+                    finished_after_block=data["finished_after_block"],
+                    intervention_prompts=data["intervention_prompts"],
+                    terminal_rejections=data["terminal_rejections"],
+                    tested=data["verification_states"]["tested"],
+                    contradicted=data["verification_states"]["contradicted"],
+                    unavailable=data["verification_states"]["unavailable"],
+                    not_run=data["verification_states"]["not_run"],
                     rate=f"{rate:.1%}" if rate is not None else "-",
                 )
             )
