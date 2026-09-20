@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from dm_agent.tools.base import ToolResult
 
+from .execution_facts import ExecutionFact, build_execution_fact
 from .planner import PlanStep
 from .workspace_version import workspace_version
 
@@ -74,17 +74,20 @@ class PlanProgressTracker:
         no_progress: bool = False,
         tool_succeeded: bool = False,
         step_number: int = 0,
+        fact: ExecutionFact | None = None,
     ) -> list[PlanProgressChange]:
         if not plan:
             return []
-        evidence, successful, reason = _classify_event(
-            action,
-            result,
-            observation,
-            accepted_completion=accepted_completion,
-            no_progress=no_progress,
-            tool_succeeded=tool_succeeded,
-        )
+        if accepted_completion and action in {"finish", "task_complete"}:
+            evidence, successful, reason = (
+                "completion_accepted", True, "completion gate accepted the result"
+            )
+        else:
+            fact = fact or build_execution_fact(
+                action, result, observation, step_number=step_number,
+                tool_succeeded=tool_succeeded, no_progress=no_progress,
+            )
+            evidence, successful, reason = fact.evidence or None, fact.succeeded, fact.reason
         if evidence is None:
             return []
 
@@ -198,73 +201,6 @@ def summarize_plan(plan: Iterable[PlanStep]) -> dict[str, Any]:
 def _target_step(plan: Iterable[PlanStep], evidence: str) -> PlanStep | None:
     candidates = [step for step in plan if step.completion_evidence == evidence]
     return next((step for step in candidates if step.status != "satisfied"), None)
-
-
-def _classify_event(
-    action: str,
-    result: ToolResult | None,
-    observation: str,
-    *,
-    accepted_completion: bool,
-    no_progress: bool,
-    tool_succeeded: bool,
-) -> tuple[str | None, bool, str]:
-    succeeded = (tool_succeeded or bool(result and result.status == "success")) and not no_progress
-    if accepted_completion and action in {"finish", "task_complete"}:
-        return "completion_accepted", True, "completion gate accepted the result"
-    if result and result.changed_files:
-        return "workspace_changed", result.status == "success", "tool changed workspace files"
-    if action in VERIFY_TOOLS or (
-        action == "run_shell" and _purpose(result) == "verification"
-    ):
-        outcome = _verification_outcome(result)
-        return "verification_passed", outcome == "passed", f"verification outcome: {outcome}"
-    if action in LOCATE_TOOLS:
-        candidates = _candidate_count(action, observation)
-        if candidates == 0:
-            return "candidate_observed", False, "repository search returned no candidates"
-        if candidates is not None:
-            return (
-                "candidate_observed",
-                succeeded,
-                f"repository search returned {candidates} candidate(s)",
-            )
-        return "candidate_observed", succeeded, "repository candidate search completed"
-    if action in INSPECT_TOOLS:
-        return "source_observed", succeeded, "source evidence was inspected"
-    return None, False, ""
-
-
-def _candidate_count(action: str, observation: str) -> int | None:
-    if action in {"search_code", "search_symbol", "find_files"}:
-        try:
-            payload = json.loads(observation)
-        except (TypeError, ValueError):
-            return None
-        count = payload.get("match_count") if isinstance(payload, Mapping) else None
-        return count if isinstance(count, int) and not isinstance(count, bool) else None
-    if action == "list_directory":
-        value = observation.strip()
-        return 0 if value == "<空>" else len(value.splitlines()) if value else 0
-    return None
-
-
-def _purpose(result: ToolResult | None) -> str:
-    if result is None or not isinstance(result.metadata, Mapping):
-        return ""
-    verification = result.metadata.get("verification")
-    if isinstance(verification, Mapping):
-        return "verification"
-    return ""
-
-
-def _verification_outcome(result: ToolResult | None) -> str:
-    if result is None:
-        return "unknown"
-    verification = result.metadata.get("verification")
-    if isinstance(verification, Mapping):
-        return str(verification.get("outcome") or "unknown")
-    return "passed" if result.status == "success" else "failed"
 
 
 def _compact(text: str, limit: int = 240) -> str:

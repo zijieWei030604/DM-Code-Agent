@@ -181,7 +181,7 @@ class EvidenceGraph:
                 )
                 if edge:
                     added_edges.append(edge)
-            elif existing.metadata.get("completed") != completed:
+            elif existing.metadata != metadata:
                 self.nodes[node_id] = EvidenceNode(
                     existing.node_id,
                     existing.kind,
@@ -202,6 +202,7 @@ class EvidenceGraph:
         step_number: int,
         succeeded: bool,
         workspace_version: str = "",
+        phase: str = "",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         node = self._new_node(
             "observation",
@@ -214,7 +215,7 @@ class EvidenceGraph:
                 "workspace_version": workspace_version,
             },
         )
-        edges = self._link_current_plan(node.node_id, "supported_by")
+        edges = self._link_plan(node.node_id, "supported_by", phase)
         return [node], edges
 
     def add_change(
@@ -228,6 +229,7 @@ class EvidenceGraph:
         requires_read_basis: bool | None = None,
         basis_kind: str = "read",
         change_revision: int | None = None,
+        phase: str = "",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         if after_version:
             self.workspace_version = after_version
@@ -254,7 +256,7 @@ class EvidenceGraph:
                 ),
             },
         )
-        edges = self._link_current_plan(node.node_id, "implements")
+        edges = self._link_plan(node.node_id, "implements", phase)
         edge = self._add_edge(
             node.node_id,
             self.ROOT_REQUIREMENT_ID,
@@ -302,6 +304,8 @@ class EvidenceGraph:
         failure_kind: str = "",
         blocking: bool = True,
         change_revision: int | None = None,
+        phase: str = "",
+        scope_level: str = "related",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         is_direct = False if direct is None else direct
         targets = tuple(
@@ -327,12 +331,15 @@ class EvidenceGraph:
                 "outcome": outcome or ("passed" if passed else "unknown"),
                 "failure_kind": failure_kind,
                 "blocking": blocking,
+                "scope_level": scope_level,
                 "change_revision": (
                     self.change_revision if change_revision is None else change_revision
                 ),
             },
         )
-        edges: list[EvidenceEdge] = []
+        edges: list[EvidenceEdge] = (
+            self._link_plan(node.node_id, "supported_by", phase) if phase else []
+        )
         for change_id in targets:
             edge = self._add_edge(
                 node.node_id,
@@ -482,6 +489,16 @@ class EvidenceGraph:
                 continue
             result.append(node)
         return _latest_verifications(result)
+
+    def changed_paths(self) -> tuple[str, ...]:
+        """Return normalized paths changed during this run."""
+        return tuple(
+            dict.fromkeys(
+                str(node.metadata.get("path", ""))
+                for node in self._nodes_of_kind("change")
+                if node.metadata.get("path")
+            )
+        )
 
     def status(self) -> EvidenceStatus:
         observations = self._nodes_of_kind("observation")
@@ -707,6 +724,19 @@ class EvidenceGraph:
         )
         return [edge] if edge else []
 
+    def _link_plan(self, node_id: str, relation: str, phase: str = "") -> list[EvidenceEdge]:
+        if phase:
+            candidates = [
+                item for item in self.nodes.values()
+                if item.kind == "plan_step" and item.metadata.get("phase") == phase
+            ]
+            if candidates:
+                edge = self._add_edge(
+                    candidates[-1].node_id, node_id, relation, confidence="deterministic"
+                )
+                return [edge] if edge else []
+        return self._link_current_plan(node_id, relation)
+
     def _nodes_of_kind(self, kind: EvidenceKind) -> list[EvidenceNode]:
         return [node for node in self.nodes.values() if node.kind == kind]
 
@@ -758,8 +788,13 @@ def _latest_verifications(nodes: Sequence[EvidenceNode]) -> list[EvidenceNode]:
     latest: dict[tuple[str, tuple[str, ...]], EvidenceNode] = {}
     for node in nodes:
         key = (
-            str(node.metadata.get("check", node.metadata.get("tool", ""))),
-            tuple(str(item) for item in node.metadata.get("scope", [])),
+            str(node.metadata.get("tool", "")),
+            tuple(
+                sorted(
+                    str(item).replace("\\", "/")
+                    for item in node.metadata.get("scope", [])
+                )
+            ),
         )
         current = latest.get(key)
         if current is None or (node.step_number or 0) >= (current.step_number or 0):

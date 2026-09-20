@@ -36,7 +36,7 @@ class EvidenceGraphCapability:
         *,
         summary_chars: int = 800,
         enforcement: EvidenceEnforcement = "strict",
-        repeated_contradiction: RepeatedContradiction = "continue",
+        repeated_contradiction: RepeatedContradiction = "critic_rejected",
     ) -> None:
         if summary_chars < 200:
             raise ValueError("summary_chars must be at least 200.")
@@ -56,6 +56,7 @@ class EvidenceGraphCapability:
         self._write_versions: dict[int, str] = {}
         self._write_basis_kinds: dict[int, str] = {}
         self._last_contradiction_signature = ""
+        self._last_unverified_pause_signature = ""
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -82,6 +83,7 @@ class EvidenceGraphCapability:
         return {
             "graph": self.graph.to_dict(),
             "last_contradiction_signature": self._last_contradiction_signature,
+            "last_unverified_pause_signature": self._last_unverified_pause_signature,
         }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
@@ -89,6 +91,9 @@ class EvidenceGraphCapability:
         self.graph = EvidenceGraph.from_dict(graph_state)
         self._last_contradiction_signature = str(
             state.get("last_contradiction_signature", "")
+        )
+        self._last_unverified_pause_signature = str(
+            state.get("last_unverified_pause_signature", "")
         )
 
     def _on_run_start(self, event: RunStartEvent) -> None:
@@ -99,16 +104,20 @@ class EvidenceGraphCapability:
         self._write_versions.clear()
         self._write_basis_kinds.clear()
         self._last_contradiction_signature = ""
+        self._last_unverified_pause_signature = ""
         self._record(nodes, edges)
         event.metadata.update(
             {
                 "evidence_graph_enabled": True,
                 "evidence_contradiction_block_count": 0,
                 "evidence_completion_block_count": 0,
+                "evidence_completion_pause_count": 0,
+                "evidence_unverified_completion_count": 0,
+                "evidence_recovered_after_pause": 0,
                 "evidence_intervention_prompt_count": 0,
                 "evidence_terminal_rejection_count": 0,
                 "evidence_enforcement": self.enforcement,
-                "evidence_schema_version": 2,
+                "evidence_schema_version": 3,
                 "evidence_verification_state": "not_run",
             }
         )
@@ -122,6 +131,10 @@ class EvidenceGraphCapability:
 
     def _after_tool_result(self, event: AfterToolResultEvent) -> None:
         self._sync_plan()
+        fact = event.execution_fact
+        phase = fact.phase if fact is not None else ""
+        if fact is not None and fact.fact_type != "other":
+            self._record_event(fact.fact_type, fact.to_dict())
         path = self._normalize_path(event.arguments.get("path"))
         nodes: list[EvidenceNode] = []
         edges: list[EvidenceEdge] = []
@@ -133,9 +146,11 @@ class EvidenceGraphCapability:
                     step_number=event.step_number,
                     succeeded=True,
                     workspace_version=workspace_version(self._workspace_root),
+                    phase=phase,
                 )
         elif event.tool_name in WRITE_ACTIONS:
             if event.has_effect and not event.no_change:
+                prior_checks = bool(self.graph.current_verifications())
                 self.graph.change_revision += 1
                 before_version = self._write_versions.pop(event.step_number, "")
                 basis_kind = self._write_basis_kinds.pop(event.step_number, "read")
@@ -157,9 +172,15 @@ class EvidenceGraphCapability:
                         requires_read_basis=basis_kind == "read",
                         basis_kind=basis_kind,
                         change_revision=self.graph.change_revision,
+                        phase=phase,
                     )
                     nodes.extend(added_nodes)
                     edges.extend(added_edges)
+                if prior_checks:
+                    self._record_event(
+                        "verification_invalidated",
+                        {"step_number": event.step_number, "workspace_version": after_version},
+                    )
             else:
                 self._write_versions.pop(event.step_number, None)
                 self._write_basis_kinds.pop(event.step_number, None)
@@ -210,6 +231,8 @@ class EvidenceGraphCapability:
                 failure_kind=failure_kind,
                 blocking=blocking,
                 change_revision=self.graph.change_revision,
+                phase=phase,
+                scope_level=str(verification["scope_level"]),
             )
         if nodes or edges:
             self._record(nodes, edges)
@@ -227,17 +250,51 @@ class EvidenceGraphCapability:
         issues = list(decision.issues)
         warnings = list(decision.warnings)
         should_block = self.enforcement == "strict" and decision.decision == "block"
+        pause_unverified = False
+        completion_signature = self._completion_signature(decision)
+        if (
+            self.enforcement == "strict"
+            and decision.decision == "warn"
+            and self._requires_verification()
+            and completion_signature != self._last_unverified_pause_signature
+        ):
+            should_block = True
+            pause_unverified = True
         if self.enforcement == "warn":
             should_block = any(item["status"] == "contradicted" for item in issues)
         nodes, edges = self.graph.add_conclusion(
             text=event.completion_text,
             step_number=event.step_number,
             accepted=not should_block,
+            evidence_status=(
+                "unverified"
+                if not should_block and decision.decision == "warn"
+                else decision.verification_state
+            ),
         )
         self._record(nodes, edges)
         self._update_metadata(event.metadata, decision=decision)
         if not should_block:
             event.metadata["evidence_verification_state"] = decision.verification_state
+            if decision.decision == "warn" and self._requires_verification():
+                event.metadata["evidence_unverified_completion_count"] = (
+                    int(event.metadata.get("evidence_unverified_completion_count", 0)) + 1
+                )
+                event.metadata["evidence_completion_status"] = "unverified"
+            else:
+                event.metadata["evidence_completion_status"] = decision.verification_state
+            if self._last_unverified_pause_signature and decision.verification_state == "tested":
+                event.metadata["evidence_recovered_after_pause"] = (
+                    int(event.metadata.get("evidence_recovered_after_pause", 0)) + 1
+                )
+            self._record_event(
+                "completion_accepted",
+                {
+                    "step_number": event.step_number,
+                    "verification_state": decision.verification_state,
+                    "status": event.metadata["evidence_completion_status"],
+                },
+            )
             return None
         event.metadata["evidence_completion_block_count"] = (
             int(event.metadata.get("evidence_completion_block_count", 0)) + 1
@@ -249,7 +306,30 @@ class EvidenceGraphCapability:
             event.metadata["evidence_contradiction_block_count"] = (
                 int(event.metadata.get("evidence_contradiction_block_count", 0)) + 1
             )
-        signature = self._completion_signature(decision)
+        signature = completion_signature
+        if pause_unverified:
+            self._last_unverified_pause_signature = signature
+            event.metadata["evidence_completion_pause_count"] = (
+                int(event.metadata.get("evidence_completion_pause_count", 0)) + 1
+            )
+            event.metadata["evidence_intervention_prompt_count"] = (
+                int(event.metadata.get("evidence_intervention_prompt_count", 0)) + 1
+            )
+            reason = (
+                "Completion paused once: code or configuration changed, but the current "
+                "workspace has no successful verification. Run a relevant check if available; "
+                "otherwise you may finish again and the result will be recorded as unverified."
+            )
+            self._record_event(
+                "completion_paused",
+                {
+                    "step_number": event.step_number,
+                    "reason": reason,
+                    "verification_state": decision.verification_state,
+                    "signature": signature[:16],
+                },
+            )
+            return {"block": True, "reason": reason}
         repeated = signature == self._last_contradiction_signature
         if not repeated:
             self._last_contradiction_signature = signature
@@ -289,6 +369,9 @@ class EvidenceGraphCapability:
         )
         return {"block": True, "reason": reason}
 
+    def _requires_verification(self) -> bool:
+        return any(_path_requires_verification(path) for path in self.graph.changed_paths())
+
     def _blocking_verification(
         self,
         verification: Mapping[str, Any],
@@ -298,7 +381,7 @@ class EvidenceGraphCapability:
     ) -> tuple[bool, str]:
         outcome = str(verification.get("outcome", "unknown"))
         failure_kind = str(verification.get("failure_kind", ""))
-        scope = tuple(str(item) for item in verification.get("scope") or ())
+        scope_level = str(verification.get("scope_level", "related"))
 
         if _current_change_has_syntax_error(self.graph, details):
             return True, "syntax_error"
@@ -308,9 +391,7 @@ class EvidenceGraphCapability:
             or failure_kind != "assertion_failure"
         ):
             return False, failure_kind
-        if tool == "run_shell":
-            return True, failure_kind
-        if _is_targeted_test_scope(scope) or _has_prior_passing_scope(self.graph, scope):
+        if scope_level == "direct":
             return True, failure_kind
         return False, "suite_failure"
 
@@ -505,6 +586,7 @@ def _verification_result(event: AfterToolResultEvent) -> dict[str, Any]:
             "outcome": str(raw.get("outcome", "unknown")),
             "failure_kind": str(raw.get("failure_kind", "")),
             "scope": list(raw.get("scope") or (event.result.check_scope if event.result else ())),
+            "scope_level": str(raw.get("scope_level", "related")),
         }
 
     passed = (
@@ -515,6 +597,7 @@ def _verification_result(event: AfterToolResultEvent) -> dict[str, Any]:
         "outcome": "passed" if passed else "unknown",
         "failure_kind": "" if passed else str(event.result.error_code if event.result else ""),
         "scope": list(event.result.check_scope if event.result else ()),
+        "scope_level": "related",
     }
 
 
@@ -563,3 +646,24 @@ def _current_change_has_syntax_error(graph: EvidenceGraph, details: str) -> bool
         path and (path.lower() in normalized or Path(path).name.lower() in normalized)
         for path in current_paths
     )
+
+
+def _path_requires_verification(path: str) -> bool:
+    """Classify files whose behavior can change; docs and metadata remain advisory."""
+    normalized = path.replace("\\", "/").lower()
+    name = Path(normalized).name
+    if Path(normalized).suffix in {
+        ".md", ".rst", ".txt", ".adoc", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+    }:
+        return False
+    if name in {
+        "pyproject.toml", "setup.cfg", "setup.py", "tox.ini", "package.json",
+        "dockerfile", "makefile", "requirements.txt",
+    }:
+        return True
+    return Path(normalized).suffix in {
+        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go",
+        ".rs", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
+        ".swift", ".scala", ".sh", ".ps1", ".toml", ".yaml", ".yml", ".json",
+        ".ini", ".cfg", ".xml",
+    }

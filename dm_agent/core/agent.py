@@ -982,6 +982,7 @@ class ReactAgent:
                 tool_succeeded=invocation.tool_succeeded,
                 metadata=metadata,
                 runtime_step=step_num,
+                fact=invocation.fact,
             )
 
             # 将工具执行结果添加到历史记录
@@ -1056,6 +1057,7 @@ class ReactAgent:
         tool_succeeded: bool,
         metadata: dict[str, Any],
         runtime_step: int,
+        fact: Any = None,
     ) -> None:
         """Project one runtime outcome onto plan phases and preserve an audit trail."""
         if not plan or not self.planner:
@@ -1079,6 +1081,7 @@ class ReactAgent:
             no_progress=no_progress,
             tool_succeeded=tool_succeeded,
             step_number=runtime_step,
+            fact=fact,
         )
         for change in changes:
             metadata["plan_progress_event_count"] = int(

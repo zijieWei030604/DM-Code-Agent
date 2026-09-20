@@ -228,8 +228,9 @@ def test_container_execution_backend_preserves_tool_contract_and_classifies_test
         "failed": 1,
         "errors": 0,
         "skipped": 0,
-        "failure_kind": "assertion_failure",
-    }
+            "failure_kind": "assertion_failure",
+            "scope_level": "related",
+        }
     assert tool.input_schema is schema
     assert tool.read_only is True
 

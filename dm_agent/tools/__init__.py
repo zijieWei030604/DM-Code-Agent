@@ -124,6 +124,11 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "command": _STR,
             "purpose": {"type": "string", "enum": ["execution", "verification"]},
+            "verification_scope": {
+                "type": "string",
+                "enum": ["direct", "related", "broad"],
+            },
+            "expected_exit_code": {"type": "integer"},
         },
         ("command",),
     ),

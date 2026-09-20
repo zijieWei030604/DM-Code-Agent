@@ -12,6 +12,7 @@ from dm_agent.tools.code_index_tools import dependency_graph, inspect_change_imp
 from dm_agent.tools.execution_tools import (
     _classify_declared_shell_verification,
     _classify_pytest_result,
+    _validated_shell_scope,
     available_linters,
     run_linter,
     run_python,
@@ -93,7 +94,19 @@ def test_run_shell_records_verification_only_when_declared():
 
     assert "verification" not in ordinary.metadata
     assert verified.metadata["verification"]["outcome"] == "passed"
+    assert verified.metadata["verification"]["scope_level"] == "related"
     assert verified.check_scope
+
+
+def test_shell_direct_scope_requires_a_narrow_non_xfail_command():
+    assert (
+        _validated_shell_scope(
+            "pytest tests/test_service.py::test_update", "direct"
+        )
+        == "direct"
+    )
+    assert _validated_shell_scope("pytest tests/test_service.py", "direct") == "related"
+    assert _validated_shell_scope("pytest --runxfail test_xf.py", "direct") == "related"
 
 
 def test_declared_shell_verification_requires_real_process_result():

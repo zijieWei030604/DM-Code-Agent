@@ -9,6 +9,8 @@ from typing import Any, Literal
 
 from dm_agent.tools.base import ToolResult
 
+from .execution_facts import ExecutionFact
+
 EventName = Literal[
     "before_tool_call",
     "after_tool_result",
@@ -55,6 +57,7 @@ class AfterToolResultEvent:
     no_change: bool = False
     no_change_reason: str = ""
     result: ToolResult | None = None
+    execution_fact: ExecutionFact | None = None
 
     @property
     def has_effect(self) -> bool:

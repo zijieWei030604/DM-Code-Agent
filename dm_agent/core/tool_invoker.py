@@ -11,12 +11,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tools.file_tools import edit_file as builtin_edit_file
 
 from .events import AfterToolResultEvent, BeforeToolCallEvent, EventBus, HookErrorHandler
+from .execution_facts import ExecutionFact, build_execution_fact
 from .guards import (
     WRITE_ACTIONS,
     is_identity_content_edit,
@@ -25,6 +27,7 @@ from .guards import (
 from .observation import ObservationBounder, is_failure_observation
 from .persistence import RunPersistence
 from .run_state import RunContext
+from .workspace_version import workspace_version
 
 
 @dataclass
@@ -45,6 +48,7 @@ class ToolInvocation:
     tool_succeeded: bool = False
     no_change: bool = False
     result: ToolResult | None = None
+    fact: ExecutionFact | None = None
 
 
 def coerce_task_complete_arguments(action_input: Any) -> dict[str, Any]:
@@ -200,6 +204,15 @@ class ToolInvoker:
             and identity_edit_noop
             and not observation_reports_missing_path(bounded_observation)
         )
+        fact = build_execution_fact(
+            action,
+            result,
+            bounded_observation,
+            step_number=context.step_number,
+            tool_succeeded=tool_succeeded,
+            no_progress=confirmed_no_change,
+            workspace_version=workspace_version(Path.cwd()),
+        )
         after_event = AfterToolResultEvent(
             tool_name=action,
             arguments=action_input,
@@ -211,6 +224,7 @@ class ToolInvoker:
             no_change_reason="identical_content" if confirmed_no_change else "",
             metadata=metadata,
             result=result,
+            execution_fact=fact,
         )
         observation = self.event_bus.emit_after_tool_result(after_event, on_error=self.on_error)
         if journal:
@@ -222,4 +236,5 @@ class ToolInvoker:
             tool_succeeded=tool_succeeded,
             no_change=after_event.no_change,
             result=result,
+            fact=fact,
         )

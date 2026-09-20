@@ -89,6 +89,9 @@ def _test_result(
                 "errors": 1 if outcome == "error" else 0,
                 "skipped": 0,
                 "failure_kind": "" if passed else failure_kind,
+                "scope_level": (
+                    "direct" if scope and all("::" in item for item in scope) else "related"
+                ),
             }
         },
     )
@@ -126,6 +129,69 @@ def test_evidence_graph_builds_a_verified_chain_and_round_trips() -> None:
     assert restored.audit() == graph.audit()
     assert restored.prompt_summary(max_chars=200).startswith("[Task Evidence]")
     assert len(restored.prompt_summary(max_chars=200)) <= 200
+
+
+def test_runtime_fact_links_to_the_matching_plan_phase() -> None:
+    graph = EvidenceGraph("Inspect before changing")
+    graph.sync_plan(
+        [
+            {"step_number": 1, "phase": "locate", "goal": "Locate implementation"},
+            {"step_number": 2, "phase": "inspect", "goal": "Inspect implementation"},
+        ]
+    )
+
+    nodes, edges = graph.add_observation(
+        tool="read_file",
+        path="service.py",
+        step_number=1,
+        succeeded=True,
+        phase="inspect",
+    )
+
+    inspect_plan = next(
+        node
+        for node in graph.nodes.values()
+        if node.kind == "plan_step" and node.metadata.get("phase") == "inspect"
+    )
+    assert any(
+        edge.source_id == inspect_plan.node_id
+        and edge.target_id == nodes[0].node_id
+        and edge.confidence == "deterministic"
+        for edge in edges
+    )
+
+
+def test_latest_verification_supersedes_an_older_result_for_the_same_scope() -> None:
+    graph = EvidenceGraph("Fix service")
+    graph.workspace_version = "v1"
+    graph.add_verification(
+        tool="run_tests",
+        step_number=1,
+        passed=False,
+        workspace_version="v1",
+        check='{"verbose": false}',
+        scope=("tests/test_service.py",),
+        outcome="failed",
+        failure_kind="assertion_failure",
+        blocking=False,
+        scope_level="related",
+    )
+    graph.add_verification(
+        tool="run_tests",
+        step_number=2,
+        passed=True,
+        workspace_version="v1",
+        check='{"verbose": true}',
+        scope=("tests/test_service.py",),
+        outcome="passed",
+        blocking=False,
+        scope_level="related",
+    )
+
+    current = graph.current_verifications()
+    assert len(current) == 1
+    assert current[0].step_number == 2
+    assert current[0].metadata["passed"] is True
 
 
 def test_legacy_edge_confidence_is_migrated_to_the_three_source_levels() -> None:
@@ -558,7 +624,9 @@ def test_evidence_capability_never_injects_status_and_rejects_repeated_contradic
             "run-1",
             False,
             metadata,
-            result=_test_result(outcome="failed", scope=("tests/test_users.py",)),
+            result=_test_result(
+                outcome="failed", scope=("tests/test_users.py::test_update",)
+            ),
         )
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 3, "run-1", metadata)
@@ -591,7 +659,9 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
             "run-1",
             False,
             metadata,
-            result=_test_result(outcome="failed", scope=("tests/test_users.py",)),
+            result=_test_result(
+                outcome="failed", scope=("tests/test_users.py::test_update",)
+            ),
         )
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
@@ -681,7 +751,7 @@ def test_declared_shell_verification_can_mark_current_workspace_tested() -> None
     assert metadata["evidence_verification_state"] == "tested"
 
 
-def test_declared_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -> None:
+def test_direct_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -> None:
     bus = EventBus()
     capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")
     capability.install(CapabilityContext(bus, lambda phase: None))
@@ -696,7 +766,12 @@ def test_declared_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -
     )
     assert not capability.graph.current_verifications()
 
-    declared = {**ordinary, "purpose": "verification"}
+    declared = {
+        "command": "pytest tests/test_service.py::test_update",
+        "purpose": "verification",
+        "verification_scope": "direct",
+        "expected_exit_code": 0,
+    }
     bus.emit_before_tool_call(BeforeToolCallEvent("run_shell", declared, 2, "run-1", metadata))
     bus.emit_after_tool_result(
         AfterToolResultEvent(
@@ -719,6 +794,7 @@ def test_declared_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -
                         "outcome": "failed",
                         "failure_kind": "assertion_failure",
                         "scope": [declared["command"]],
+                        "scope_level": "direct",
                     }
                 },
             ),
@@ -733,6 +809,51 @@ def test_declared_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -
     assert "Latest failed verification" in block["reason"]
     assert "AssertionError" in block["reason"]
     assert metadata["evidence_verification_state"] == "contradicted"
+
+
+def test_related_shell_failure_is_recorded_without_blocking_completion() -> None:
+    bus = EventBus()
+    capability = EvidenceGraphCapability()
+    capability.install(CapabilityContext(bus, lambda phase: None))
+    metadata: dict[str, Any] = {}
+    arguments = {"command": "pytest --runxfail test_xf.py", "purpose": "verification"}
+    bus.emit_run_start(RunStartEvent("Fix xfail reporting", 1, "run-1", metadata=metadata))
+    bus.emit_before_tool_call(BeforeToolCallEvent("run_shell", arguments, 1, "run-1", metadata))
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_shell",
+            arguments,
+            "AssertionError\nreturncode: 1",
+            1,
+            "run-1",
+            False,
+            metadata,
+            result=ToolResult(
+                "failed",
+                "AssertionError\nreturncode: 1",
+                error_code="assertion_failure",
+                exit_code=1,
+                check_scope=(arguments["command"],),
+                metadata={
+                    "verification": {
+                        "execution_status": "completed",
+                        "outcome": "failed",
+                        "failure_kind": "assertion_failure",
+                        "scope": [arguments["command"]],
+                        "scope_level": "related",
+                    }
+                },
+            ),
+        )
+    )
+
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix xfail reporting", "finish", "done", [], 2, "run-1", metadata)
+    )
+
+    assert block is None
+    assert metadata["evidence_completion_decision"] == "warn"
+    assert metadata["evidence_verification_state"] == "unavailable"
 
 
 def test_full_suite_failure_is_a_warning_not_a_completion_block() -> None:
@@ -782,7 +903,9 @@ def test_new_edit_makes_prior_confirmed_failure_stale_and_allows_unverified_fini
             "run-1",
             False,
             metadata,
-            result=_test_result(outcome="failed"),
+            result=_test_result(
+                outcome="failed", scope=("tests/test_service.py::test_update",)
+            ),
         )
     )
     first = bus.emit_before_finish(
@@ -806,11 +929,17 @@ def test_new_edit_makes_prior_confirmed_failure_stale_and_allows_unverified_fini
         )
     )
 
-    block = bus.emit_before_finish(
+    first_unverified = bus.emit_before_finish(
         BeforeFinishEvent("Fix service", "finish", "done", [], 4, "run-1", metadata)
     )
+    block = bus.emit_before_finish(
+        BeforeFinishEvent("Fix service", "finish", "done", [], 5, "run-1", metadata)
+    )
+    assert first_unverified is not None
     assert block is None
     assert metadata["evidence_verification_state"] == "not_run"
+    assert metadata["evidence_completion_pause_count"] == 1
+    assert metadata["evidence_completion_status"] == "unverified"
 
 
 def test_syntax_error_in_current_changed_file_blocks_completion(tmp_path, monkeypatch) -> None:
@@ -866,7 +995,9 @@ def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
     monkeypatch.chdir(tmp_path)
 
     def failed_test(arguments: dict[str, Any]) -> ToolResult:
-        return _test_result(outcome="failed", scope=("tests/test_service.py",))
+        return _test_result(
+            outcome="failed", scope=("tests/test_service.py::test_update",)
+        )
 
     agent = ReactAgent(
         _ScriptedClient(
@@ -910,6 +1041,7 @@ def test_react_agent_allows_unchecked_finish_with_explicit_status(tmp_path, monk
                 _action("read_file", {"path": "service.py"}),
                 _action("edit_file", {"path": "service.py"}),
                 _action("finish", {"answer": "done"}),
+                _action("finish", {"answer": "done without local verification"}),
             ]
         ),
         [
@@ -921,12 +1053,14 @@ def test_react_agent_allows_unchecked_finish_with_explicit_status(tmp_path, monk
         capabilities=[EvidenceGraphCapability()],
     )
 
-    result = agent.run("Update service.py", max_steps=3)
+    result = agent.run("Update service.py", max_steps=4)
 
     assert result["metadata"]["status"] == "success"
     assert result["metadata"]["evidence_completion_decision"] == "warn"
     assert result["metadata"]["evidence_verification_state"] == "not_run"
-    assert result["metadata"]["evidence_completion_block_count"] == 0
+    assert result["metadata"]["evidence_completion_block_count"] == 1
+    assert result["metadata"]["evidence_completion_pause_count"] == 1
+    assert result["metadata"]["evidence_completion_status"] == "unverified"
     assert result["steps"][-1]["observation"] == "<finished>"
     assert result["metadata"]["completion_summary"].endswith("本轮未运行本地验证。")
 

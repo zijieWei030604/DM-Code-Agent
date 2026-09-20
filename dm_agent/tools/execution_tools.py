@@ -114,6 +114,12 @@ def run_shell_result(arguments: dict[str, Any]) -> ToolResult:
     purpose = arguments.get("purpose", "execution")
     if purpose not in {"execution", "verification"}:
         raise ValueError("purpose 必须是 'execution' 或 'verification'。")
+    requested_scope = arguments.get("verification_scope", "related")
+    if requested_scope not in {"direct", "related", "broad"}:
+        raise ValueError("verification_scope 必须是 'direct'、'related' 或 'broad'。")
+    expected_exit_code = arguments.get("expected_exit_code", 0)
+    if not isinstance(expected_exit_code, int) or isinstance(expected_exit_code, bool):
+        raise ValueError("expected_exit_code 必须是整数。")
     result = subprocess.run(
         command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
@@ -128,7 +134,14 @@ def run_shell_result(arguments: dict[str, Any]) -> ToolResult:
     check_scope: tuple[str, ...] = ()
     error_code = ""
     if purpose == "verification":
-        verification = _classify_declared_shell_verification(result.returncode, output, command)
+        scope_level = _validated_shell_scope(command, str(requested_scope))
+        verification = _classify_declared_shell_verification(
+            result.returncode,
+            output,
+            command,
+            scope_level=scope_level,
+            expected_exit_code=expected_exit_code,
+        )
         metadata["verification"] = verification
         check_scope = (command,)
         error_code = str(verification["failure_kind"])
@@ -143,9 +156,14 @@ def run_shell_result(arguments: dict[str, Any]) -> ToolResult:
 
 
 def _classify_declared_shell_verification(
-    exit_code: int, output: str, command: str
+    exit_code: int,
+    output: str,
+    command: str,
+    *,
+    scope_level: str = "related",
+    expected_exit_code: int = 0,
 ) -> dict[str, Any]:
-    if exit_code == 0:
+    if exit_code == expected_exit_code:
         execution_status, outcome, failure_kind = "completed", "passed", ""
     elif "SyntaxError" in output or "IndentationError" in output:
         execution_status, outcome, failure_kind = "completed", "error", "syntax_error"
@@ -153,13 +171,33 @@ def _classify_declared_shell_verification(
         execution_status, outcome, failure_kind = "completed", "failed", "assertion_failure"
     else:
         execution_status, outcome, failure_kind = "unavailable", "unknown", "unknown_result"
-    return _verification_metadata(
+    verification = _verification_metadata(
         execution_status=execution_status,
         outcome=outcome,
         framework="shell",
         scope=[command],
         failure_kind=failure_kind,
     )
+    verification.update(
+        {
+            "scope_level": scope_level,
+            "expected_exit_code": expected_exit_code,
+            "actual_exit_code": exit_code,
+        }
+    )
+    return verification
+
+
+def _validated_shell_scope(command: str, requested_scope: str) -> str:
+    """Accept direct shell evidence only when the command is narrow and unambiguous."""
+    lowered = command.lower()
+    if requested_scope != "direct":
+        return requested_scope
+    if "--runxfail" in lowered or "xfail" in lowered:
+        return "related"
+    if "pytest" in lowered and "::" not in command:
+        return "related"
+    return "direct"
 
 
 def run_tests(arguments: dict[str, Any]) -> str:
@@ -401,7 +439,16 @@ def _verification_metadata(
         "errors": int(values.get("errors", 0)),
         "skipped": int(values.get("skipped", 0)),
         "failure_kind": failure_kind,
+        "scope_level": _test_scope_level(scope) if framework in {"pytest", "unittest"} else "related",
     }
+
+
+def _test_scope_level(scope: list[str]) -> str:
+    if scope and all("::" in item for item in scope):
+        return "direct"
+    if scope and all(Path(item.split("::", 1)[0]).suffix.lower() == ".py" for item in scope):
+        return "related"
+    return "broad"
 
 
 def run_linter(arguments: dict[str, Any]) -> str:
