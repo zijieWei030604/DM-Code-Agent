@@ -41,7 +41,7 @@ from dm_agent.tracing import TraceWriter
 from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
 
-from .container_tools import ContainerExecutionBackend
+from .container_tools import ContainerExecutionBackend, bind_host_workspace_paths
 from .dataset import image_name
 
 IMAGE_PULL_TIMEOUT_SECONDS = 3600
@@ -530,7 +530,8 @@ def predict_one(
             )
 
         client = build_client(provider, model, timeout)
-        tools = execution_backend.replace_execution_tools(default_tools(include_mcp=False))
+        tools = bind_host_workspace_paths(default_tools(include_mcp=False))
+        tools = execution_backend.replace_execution_tools(tools)
         capabilities: list[Any] = []
         if enable_semantic_workspace or enable_repo_map or enable_verified_edits:
             workspace_engine = SemanticWorkspaceEngine(workspace, database_path=semantic_database)

@@ -43,7 +43,10 @@ from .persistence import (
     steps_from_checkpoint,
     warn_on_config_mismatch,
 )
-from .plan_progress import PlanProgressTracker, summarize_plan
+from .plan_progress import (
+    PlanProgressTracker,
+    summarize_plan,
+)
 from .planner import AdaptiveReplanPolicy, PlanStep, TaskPlanner
 from .prompting import activate_skills, build_user_prompt
 from .replan import FailureContext, ReplanCoordinator
@@ -443,6 +446,7 @@ class ReactAgent:
         if checkpoint_path is not None:
             self._persistence.prepare_session_checkpoint(checkpoint_path)
         self._edit_guard.reset()
+        self._plan_progress.begin(Path.cwd())
         run_token = getattr(self.trace_writer, "run_id", "") or uuid.uuid4().hex[:12]
         retry_baseline = getattr(self.client, "total_respond_retries", 0)
         self._context_window.reset()
@@ -1003,6 +1007,13 @@ class ReactAgent:
                         action=action,
                         step_number=step_num,
                         error_kind=error_kind or None,
+                        tool_status=(invocation.result.status if invocation.result else ""),
+                        verification=(
+                            invocation.result.metadata.get("verification")
+                            if invocation.result
+                            and isinstance(invocation.result.metadata, dict)
+                            else None
+                        ),
                     ),
                 )
 

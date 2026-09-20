@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from pathlib import Path
+from typing import Any
 
 from dm_agent.tools.base import ToolResult
 
 from .planner import PlanStep
-
+from .workspace_version import workspace_version
 
 LOCATE_TOOLS = frozenset({"search_code", "search_symbol", "find_files", "list_directory"})
 INSPECT_TOOLS = frozenset(
@@ -51,6 +54,15 @@ class PlanProgressChange:
 class PlanProgressTracker:
     """Maintain plan status from structured tool outcomes, independent of EvidenceGraph."""
 
+    def __init__(self) -> None:
+        self._workspace_root: Path | None = None
+        self._baseline_workspace_version = ""
+
+    def begin(self, workspace_root: Path) -> None:
+        """Capture the run baseline used to distinguish durable edits from reverted ones."""
+        self._workspace_root = workspace_root.resolve()
+        self._baseline_workspace_version = workspace_version(self._workspace_root)
+
     def observe(
         self,
         plan: list[PlanStep],
@@ -79,6 +91,10 @@ class PlanProgressTracker:
         changes: list[PlanProgressChange] = []
         if evidence == "workspace_changed":
             changes.extend(self._invalidate_validation(plan, action, step_number))
+            if not self._has_net_workspace_change():
+                successful = False
+                reason = "workspace returned to the run baseline"
+                changes.extend(self._invalidate_change(plan, action, step_number, reason))
 
         target = _target_step(plan, evidence)
         if target is None:
@@ -101,6 +117,38 @@ class PlanProgressTracker:
                     evidence=evidence,
                     action=action,
                     reason=reason,
+                )
+            )
+        return changes
+
+    def _has_net_workspace_change(self) -> bool:
+        if self._workspace_root is None or not self._baseline_workspace_version:
+            return True
+        return workspace_version(self._workspace_root) != self._baseline_workspace_version
+
+    @staticmethod
+    def _invalidate_change(
+        plan: Iterable[PlanStep], action: str, runtime_step: int, reason: str
+    ) -> list[PlanProgressChange]:
+        changes: list[PlanProgressChange] = []
+        for step in plan:
+            if step.phase != "change" or step.status != "satisfied":
+                continue
+            previous = step.status
+            step.set_status(
+                "in_progress",
+                reason=reason,
+                evidence_ref=f"runtime:{runtime_step}:{action}:change_reverted",
+            )
+            changes.append(
+                PlanProgressChange(
+                    step.step_number,
+                    step.phase,
+                    previous,
+                    step.status,
+                    "workspace_changed",
+                    action,
+                    reason,
                 )
             )
         return changes
@@ -172,10 +220,33 @@ def _classify_event(
         outcome = _verification_outcome(result)
         return "verification_passed", outcome == "passed", f"verification outcome: {outcome}"
     if action in LOCATE_TOOLS:
+        candidates = _candidate_count(action, observation)
+        if candidates == 0:
+            return "candidate_observed", False, "repository search returned no candidates"
+        if candidates is not None:
+            return (
+                "candidate_observed",
+                succeeded,
+                f"repository search returned {candidates} candidate(s)",
+            )
         return "candidate_observed", succeeded, "repository candidate search completed"
     if action in INSPECT_TOOLS:
         return "source_observed", succeeded, "source evidence was inspected"
     return None, False, ""
+
+
+def _candidate_count(action: str, observation: str) -> int | None:
+    if action in {"search_code", "search_symbol", "find_files"}:
+        try:
+            payload = json.loads(observation)
+        except (TypeError, ValueError):
+            return None
+        count = payload.get("match_count") if isinstance(payload, Mapping) else None
+        return count if isinstance(count, int) and not isinstance(count, bool) else None
+    if action == "list_directory":
+        value = observation.strip()
+        return 0 if value == "<空>" else len(value.splitlines()) if value else 0
+    return None
 
 
 def _purpose(result: ToolResult | None) -> str:

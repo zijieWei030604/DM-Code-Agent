@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from .planner import PlanStep, ReplanSignal, TaskPlanner
 
@@ -29,6 +29,8 @@ class FailureContext:
     action: str = ""
     step_number: int | None = None
     error_kind: str | None = None
+    tool_status: str = ""
+    verification: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -85,19 +87,42 @@ class ReplanCoordinator:
         default_budget: int,
     ) -> ReplanOutcome:
         """按当前策略决定是否重规划，返回新计划（或原计划）与要追加的历史提示。"""
-        # Pass the full projected state. The planner needs attempted phases as well as
-        # satisfied ones to avoid regenerating the same failed route.
+        disposition = failure_disposition(failure)
+        metadata.setdefault("failure_disposition_counts", {})[disposition] = int(
+            metadata.setdefault("failure_disposition_counts", {}).get(disposition, 0)
+        ) + 1
+        repeated_failure, repeated_payload = self.record_failure_signature(failure, metadata)
+        # Default mode is deliberately conservative: the ReAct loop handles local tool
+        # recovery, while the planner is reserved for direct evidence that the current
+        # patch is wrong. Repeated generic failures become an adaptive-policy concern.
+        if not self.adaptive and disposition != "contradicted":
+            metadata["replan_skipped_count"] += 1
+            metadata["replan_suppressed_count"] = int(
+                metadata.get("replan_suppressed_count", 0)
+            ) + 1
+            self._record_trigger(
+                failure,
+                disposition=disposition,
+                should_replan=False,
+                repeated_failure=repeated_failure,
+                repeated_payload=repeated_payload,
+            )
+            return ReplanOutcome(plan=plan)
+
         completed_steps = list(plan)
         signal: ReplanSignal | None = None
         decision = None
         if self.adaptive:
-            signal, decision = self._decide_adaptive(failure, metadata)
+            signal, decision = self._decide_adaptive(
+                failure, metadata, repeated_failure=repeated_failure,
+                repeated_failure_payload=repeated_payload,
+            )
             if not decision.should_replan:
                 metadata["replan_skipped_count"] += 1
                 if decision.strategy == "replan_budget_exhausted":
                     metadata["replan_maxed_count"] += 1
                 return ReplanOutcome(plan=plan)
-        elif self._default_budget_exhausted(failure, metadata, default_budget=default_budget):
+        elif self._default_budget_exhausted(failure, metadata, default_budget=1):
             return ReplanOutcome(plan=plan)
 
         try:
@@ -107,6 +132,7 @@ class ReplanCoordinator:
                     completed_steps,
                     failure.observation,
                     error_signal=signal,
+                    disposition=disposition,
                 )
                 if self.planner
                 else []
@@ -119,6 +145,14 @@ class ReplanCoordinator:
             return ReplanOutcome(plan=plan)
 
         metadata["replan_count"] += 1
+        metadata["plan_revision_count"] = int(metadata.get("plan_revision_count", 0)) + 1
+        self._record_trigger(
+            failure,
+            disposition=disposition,
+            should_replan=True,
+            repeated_failure=repeated_failure,
+            repeated_payload=repeated_payload,
+        )
         if self.trace_writer:
             self.trace_writer.record_replan(
                 reason=failure.observation,
@@ -130,6 +164,7 @@ class ReplanCoordinator:
             plan=new_plan,
             history_note=(
                 "Recovery: execution plan was regenerated after failure.\n"
+                f"Failure classification: {disposition}.\n"
                 f"Failure observation: {failure.observation}\n"
                 "Updated remaining plan:\n"
                 + "\n".join(
@@ -142,12 +177,14 @@ class ReplanCoordinator:
         )
 
     def _decide_adaptive(
-        self, failure: FailureContext, metadata: dict[str, Any]
+        self,
+        failure: FailureContext,
+        metadata: dict[str, Any],
+        *,
+        repeated_failure: bool,
+        repeated_failure_payload: dict[str, Any] | None,
     ) -> tuple[ReplanSignal, Any]:
         """adaptive 路径：分类失败信号、查重复失败、落决策与 trace。"""
-        repeated_failure, repeated_failure_payload = self.record_failure_signature(
-            failure, metadata
-        )
         signal = self.policy.classify(
             failure.observation,
             action=failure.action,
@@ -176,6 +213,29 @@ class ReplanCoordinator:
                 payload["repeated_failure_details"] = repeated_failure_payload
             self.trace_writer.record("replan_decision", payload)
         return signal, decision
+
+    def _record_trigger(
+        self,
+        failure: FailureContext,
+        *,
+        disposition: str,
+        should_replan: bool,
+        repeated_failure: bool,
+        repeated_payload: dict[str, Any] | None,
+    ) -> None:
+        if not self.trace_writer:
+            return
+        payload: dict[str, Any] = {
+            "step_number": failure.step_number,
+            "action": failure.action,
+            "disposition": disposition,
+            "should_replan": should_replan,
+            "scope": "phase_update" if should_replan else "none",
+            "repeated_failure": repeated_failure,
+        }
+        if repeated_payload:
+            payload["repeated_failure_details"] = repeated_payload
+        self.trace_writer.record("replan_trigger", payload)
 
     def _default_budget_exhausted(
         self, failure: FailureContext, metadata: dict[str, Any], *, default_budget: int
@@ -227,3 +287,34 @@ class ReplanCoordinator:
         metadata["repeated_failure_count"] = int(metadata.get("repeated_failure_count", 0)) + 1
         metadata.setdefault("repeated_failures", []).append(payload)
         return True, payload
+
+
+def failure_disposition(failure: FailureContext) -> str:
+    """Classify whether a failure disproves the patch or only blocks verification."""
+    verification = failure.verification
+    if isinstance(verification, Mapping):
+        execution = str(verification.get("execution_status") or "")
+        outcome = str(verification.get("outcome") or "")
+        kind = str(verification.get("failure_kind") or failure.error_kind or "")
+        scope = tuple(str(item) for item in verification.get("scope") or ())
+        if execution in {"invalid", "unavailable"} or kind in {
+            "invalid_target",
+            "unknown_result",
+            "command_unavailable",
+            "dependency_unavailable",
+            "timeout",
+        }:
+            return "unavailable"
+        if outcome in {"failed", "error"}:
+            if kind == "assertion_failure" and _targeted_scope(scope):
+                return "contradicted"
+            return "inconclusive"
+    if failure.error_kind in {"invalid_arguments", "parse_error", "unknown_tool"}:
+        return "tool_failure"
+    return "tool_failure"
+
+
+def _targeted_scope(scope: tuple[str, ...]) -> bool:
+    if not scope:
+        return False
+    return all("::" in item or item.replace("\\", "/").endswith(".py") for item in scope)

@@ -4,8 +4,8 @@ import pytest
 
 from dm_agent.clients.base_client import LLMError
 from dm_agent.core.agent import ReactAgent
-from dm_agent.core.planner import AdaptiveReplanPolicy, TaskPlanner
-from dm_agent.tools.base import Tool
+from dm_agent.core.planner import PHASE_GOALS, AdaptiveReplanPolicy, TaskPlanner
+from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tracing import TraceWriter, load_trace_events
 
 
@@ -46,19 +46,19 @@ def test_task_planner_uses_strict_schema_when_client_supports_it():
 
     schema = client.requests[0][1]["json_schema"]
     step_schema = schema["properties"]["plan"]["items"]
+    assert "goal" not in step_schema["properties"]
     assert step_schema["properties"]["phase"]["enum"] == [
         "locate",
         "inspect",
         "change",
         "validate",
-        "complete",
     ]
     assert step_schema["properties"]["preferred_tools"]["items"]["enum"] == [
         "read_file",
-        "task_complete",
     ]
     assert step_schema["additionalProperties"] is False
     assert [step.action for step in plan] == ["read_file"]
+    assert plan[0].goal == PHASE_GOALS["inspect"]
 
 
 def test_task_planner_keeps_prompt_json_fallback_for_other_clients():
@@ -116,10 +116,10 @@ def test_task_planner_parses_json_inside_text():
     planner = TaskPlanner(client, tools)
     plan = planner.plan("inspect a file")
 
-    assert [step.action for step in plan] == ["read_file", "task_complete"]
+    assert [step.action for step in plan] == ["read_file"]
     assert planner.get_next_step().action == "read_file"
     planner.mark_completed(1, "ok")
-    assert planner.get_next_step().action == "task_complete"
+    assert planner.get_next_step() is None
 
 
 def test_react_agent_can_finish_without_tool_call():
@@ -519,7 +519,7 @@ def test_react_agent_repairs_common_json_drift():
     assert result["metadata"]["parse_repair_count"] == 1
 
 
-def test_react_agent_replans_after_tool_failure():
+def test_react_agent_suppresses_first_generic_tool_failure():
     client = FakeRespondClient(
         [
             json.dumps(
@@ -535,13 +535,6 @@ def test_react_agent_replans_after_tool_failure():
                     "thought": "Try the failing tool.",
                     "action": "explode",
                     "action_input": {},
-                }
-            ),
-            json.dumps(
-                {
-                    "plan": [
-                        {"step": 1, "action": "task_complete", "reason": "recover"},
-                    ]
                 }
             ),
             json.dumps(
@@ -567,7 +560,75 @@ def test_react_agent_replans_after_tool_failure():
 
     assert result["final_answer"] == "recovered"
     assert result["metadata"]["tool_error_count"] == 1
-    assert result["metadata"]["replan_count"] == 1
+    assert result["metadata"]["replan_count"] == 0
+    assert result["metadata"]["replan_suppressed_count"] == 1
+
+
+def test_react_agent_keeps_plan_progress_out_of_model_messages():
+    client = FakeRespondClient(
+        [
+            json.dumps(
+                {
+                    "plan": [
+                        {
+                            "step": 1,
+                            "phase": "locate",
+                            "goal": "find implementation",
+                            "preferred_tools": ["search_code"],
+                            "completion_evidence": "candidate_observed",
+                        },
+                        {
+                            "step": 2,
+                            "phase": "complete",
+                            "goal": "finish",
+                            "preferred_tools": ["task_complete"],
+                            "completion_evidence": "completion_accepted",
+                        },
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "thought": "Locate the implementation.",
+                    "action": "search_code",
+                    "action_input": {"query": "Target"},
+                }
+            ),
+            json.dumps(
+                {
+                    "thought": "The requested lookup is complete.",
+                    "action": "task_complete",
+                    "action_input": {"message": "done"},
+                }
+            ),
+        ]
+    )
+    agent = ReactAgent(
+        client,
+        [
+            Tool(
+                "search_code",
+                "Search",
+                lambda _arguments: ToolResult(
+                    "success",
+                    json.dumps({"match_count": 1, "matches": [{"path": "target.py"}]}),
+                ),
+            ),
+            Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done")),
+        ],
+        enable_planning=True,
+        enable_compression=False,
+    )
+
+    result = agent.run("locate the target")
+
+    assert result["final_answer"] == "done"
+    second_agent_request = client.requests[2][0]
+    contents = [message["content"] for message in second_agent_request]
+    tool_index = next(index for index, content in enumerate(contents) if "执行工具 search_code" in content)
+    assert tool_index >= 0
+    assert not any(content.startswith("[plan]") for content in contents)
+    assert result["metadata"]["plan_progress"]["satisfied"] == 1
 
 
 def test_task_planner_replan_carries_completed_progress():
@@ -584,9 +645,12 @@ def test_task_planner_replan_carries_completed_progress():
             ),
             json.dumps(
                 {
-                    "plan": [
-                        {"step": 1, "action": "run_tests", "reason": "verify differently"},
-                        {"step": 2, "action": "task_complete", "reason": "finish"},
+                    "updates": [
+                        {
+                            "phase": "validate",
+                            "goal": "verify differently",
+                            "preferred_tools": ["run_tests"],
+                        }
                     ]
                 }
             ),
@@ -602,22 +666,22 @@ def test_task_planner_replan_carries_completed_progress():
     plan = planner.plan("fix a bug")
     planner.mark_completed(1, "read ok")
 
-    completed = [step for step in plan if step.completed]
-    new_plan = planner.replan("fix a bug", completed, "edit went sideways")
+    new_plan = planner.replan("fix a bug", plan, "edit went sideways")
 
-    assert [step.action for step in new_plan] == ["read_file", "run_tests", "task_complete"]
+    assert [step.action for step in new_plan] == ["read_file", "edit_file", "run_tests"]
     assert [step.step_number for step in new_plan] == [1, 2, 3]
     assert new_plan[0].completed is True
     assert new_plan[1].completed is False
-    assert planner.get_next_step().action == "run_tests"
+    assert new_plan[2].goal == PHASE_GOALS["validate"]
+    assert planner.get_next_step().action == "edit_file"
     # Progress display keeps completed work visible after the replan.
     assert "1/3" in planner.get_progress()
 
 
-def test_react_agent_default_replan_path_has_budget(tmp_path):
+def test_react_agent_default_mode_does_not_replan_repeated_generic_failures(tmp_path):
     trace_path = tmp_path / "budget.jsonl"
-    # Initial plan + first agent action, then one replan per failure until the
-    # default budget (patched to 1) is exhausted, then a final completion.
+    # Generic tool recovery belongs to the ReAct loop unless adaptive replanning
+    # is explicitly enabled.
     client = FakeRespondClient(
         [
             json.dumps(
@@ -629,7 +693,6 @@ def test_react_agent_default_replan_path_has_budget(tmp_path):
                 }
             ),
             json.dumps({"thought": "Try once.", "action": "explode", "action_input": {}}),
-            json.dumps({"plan": [{"step": 1, "action": "explode", "reason": "retry"}]}),
             json.dumps({"thought": "Try twice.", "action": "explode", "action_input": {}}),
             json.dumps(
                 {
@@ -651,20 +714,18 @@ def test_react_agent_default_replan_path_has_budget(tmp_path):
         enable_compression=False,
         trace_writer=writer,
     )
-    agent.DEFAULT_REPLAN_BUDGET = 1
-
     result = agent.run("stay within default replan budget")
     writer.close()
 
     assert result["final_answer"] == "stopped within budget"
-    assert result["metadata"]["replan_count"] == 1
-    assert result["metadata"]["replan_budget_exhausted_count"] == 1
-    decisions = [
+    assert result["metadata"]["replan_count"] == 0
+    assert result["metadata"]["replan_suppressed_count"] == 2
+    triggers = [
         event["payload"]
         for event in load_trace_events(trace_path)
-        if event["event"] == "replan_decision"
+        if event["event"] == "replan_trigger"
     ]
-    assert decisions[-1]["strategy"] == "replan_budget_exhausted"
+    assert [item["should_replan"] for item in triggers] == [False, False]
 
 
 def test_adaptive_replan_policy_classifies_failure_signals():
@@ -788,15 +849,19 @@ def test_react_agent_adaptive_replan_handles_parse_error():
             json.dumps(
                 {
                     "plan": [
-                        {"step": 1, "action": "task_complete", "reason": "finish"},
+                        {"step": 1, "action": "read_file", "reason": "inspect"},
                     ]
                 }
             ),
             "not json",
             json.dumps(
                 {
-                    "plan": [
-                        {"step": 1, "action": "task_complete", "reason": "repair format"},
+                    "updates": [
+                        {
+                            "phase": "complete",
+                            "goal": "return a valid completion response",
+                            "preferred_tools": ["task_complete"],
+                        }
                     ]
                 }
             ),
@@ -811,7 +876,10 @@ def test_react_agent_adaptive_replan_handles_parse_error():
     )
     agent = ReactAgent(
         client,
-        [Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done"))],
+        [
+            Tool("read_file", "Read", lambda _arguments: "content"),
+            Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done")),
+        ],
         enable_planning=True,
         enable_compression=False,
         enable_adaptive_replanning=True,
@@ -832,18 +900,11 @@ def test_react_agent_default_replan_handles_parse_error():
             json.dumps(
                 {
                     "plan": [
-                        {"step": 1, "action": "task_complete", "reason": "finish"},
+                        {"step": 1, "action": "read_file", "reason": "inspect"},
                     ]
                 }
             ),
             "not json",
-            json.dumps(
-                {
-                    "plan": [
-                        {"step": 1, "action": "task_complete", "reason": "repair format"},
-                    ]
-                }
-            ),
             json.dumps(
                 {
                     "thought": "Use strict JSON.",
@@ -855,7 +916,10 @@ def test_react_agent_default_replan_handles_parse_error():
     )
     agent = ReactAgent(
         client,
-        [Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done"))],
+        [
+            Tool("read_file", "Read", lambda _arguments: "content"),
+            Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done")),
+        ],
         enable_planning=True,
         enable_compression=False,
     )
@@ -864,7 +928,8 @@ def test_react_agent_default_replan_handles_parse_error():
 
     assert result["final_answer"] == "format repaired"
     assert result["metadata"]["parse_error_count"] == 1
-    assert result["metadata"]["replan_count"] == 1
+    assert result["metadata"]["replan_count"] == 0
+    assert result["metadata"]["replan_suppressed_count"] == 1
     assert result["metadata"]["replan_decision_count"] == 0
 
 

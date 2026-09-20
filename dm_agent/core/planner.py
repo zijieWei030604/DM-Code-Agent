@@ -71,14 +71,19 @@ class PlanStep:
         self.completed = self.status == "satisfied"
 
 
-PLAN_PHASES = ("locate", "inspect", "change", "validate", "complete")
+PLAN_PHASES = ("locate", "inspect", "change", "validate")
 PLAN_STATUSES = ("pending", "in_progress", "satisfied")
+PHASE_GOALS = {
+    "locate": "定位与问题行为直接相关的实现",
+    "inspect": "阅读相关实现并确认根因与兼容约束",
+    "change": "根据已确认的根因完成最小修改",
+    "validate": "验证目标行为并检查已有功能是否回归",
+}
 COMPLETION_EVIDENCE = (
     "candidate_observed",
     "source_observed",
     "workspace_changed",
     "verification_passed",
-    "completion_accepted",
 )
 
 
@@ -88,7 +93,6 @@ def _evidence_for_phase(phase: str) -> str:
         "inspect": "source_observed",
         "change": "workspace_changed",
         "validate": "verification_passed",
-        "complete": "completion_accepted",
     }.get(phase, "source_observed")
 
 
@@ -273,7 +277,9 @@ class TaskPlanner:
         self.current_plan: list[PlanStep] = []  # 当前计划列表
 
     def _plan_schema(self) -> dict[str, Any]:
-        actions = list(dict.fromkeys([tool.name for tool in self.tools] + ["task_complete"]))
+        actions = list(
+            dict.fromkeys(tool.name for tool in self.tools if tool.name != "task_complete")
+        )
         return {
             "type": "object",
             "properties": {
@@ -286,7 +292,6 @@ class TaskPlanner:
                         "properties": {
                             "step": {"type": "integer", "minimum": 1},
                             "phase": {"type": "string", "enum": list(PLAN_PHASES)},
-                            "goal": {"type": "string", "minLength": 1},
                             "preferred_tools": {
                                 "type": "array",
                                 "minItems": 1,
@@ -301,7 +306,6 @@ class TaskPlanner:
                         "required": [
                             "step",
                             "phase",
-                            "goal",
                             "preferred_tools",
                             "completion_evidence",
                         ],
@@ -310,6 +314,37 @@ class TaskPlanner:
                 }
             },
             "required": ["plan"],
+            "additionalProperties": False,
+        }
+
+    def _replan_schema(self) -> dict[str, Any]:
+        actions = list(
+            dict.fromkeys(tool.name for tool in self.tools if tool.name != "task_complete")
+        )
+        return {
+            "type": "object",
+            "properties": {
+                "updates": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "phase": {"type": "string", "enum": list(PLAN_PHASES)},
+                            "preferred_tools": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 4,
+                                "items": {"type": "string", "enum": actions},
+                            },
+                        },
+                        "required": ["phase", "preferred_tools"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["updates"],
             "additionalProperties": False,
         }
 
@@ -322,17 +357,21 @@ class TaskPlanner:
         items = plan_data.get("plan")
         if not isinstance(items, list) or not 1 <= len(items) <= 8:
             raise ValueError("plan 必须包含 1-8 个步骤")
-        available = {tool.name for tool in self.tools} | {"task_complete"}
+        available = {tool.name for tool in self.tools if tool.name != "task_complete"}
+        normalized_items: list[dict[str, Any]] = []
         for item in items:
             if not isinstance(item, dict):
                 raise ValueError("plan step 必须是 JSON object")
             if not isinstance(item.get("step"), int) or int(item["step"]) < 1:
                 raise ValueError("plan step 必须是正整数")
             self._normalize_plan_item(item)
+            # Completion is a ReAct control action, not a planner phase. Accept
+            # old planner output without carrying that item into the live plan.
+            if item["phase"] == "complete":
+                continue
             if item["phase"] not in PLAN_PHASES:
                 raise ValueError(f"plan 使用了未知阶段：{item['phase']}")
-            if not isinstance(item.get("goal"), str) or not item["goal"].strip():
-                raise ValueError("plan goal 必须是非空字符串")
+            item["goal"] = PHASE_GOALS[item["phase"]]
             if not item["preferred_tools"] or any(
                 tool not in available for tool in item["preferred_tools"]
             ):
@@ -340,7 +379,53 @@ class TaskPlanner:
             expected = _evidence_for_phase(item["phase"])
             if item["completion_evidence"] != expected:
                 item["completion_evidence"] = expected
+            normalized_items.append(item)
+        if not normalized_items:
+            raise ValueError("plan 必须至少包含一个工作阶段")
+        for index, item in enumerate(normalized_items, start=1):
+            item["step"] = index
+        plan_data["plan"] = normalized_items
         return plan_data
+
+    def _request_replan(self, messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+        options: dict[str, Any] = {"temperature": 0.2}
+        if getattr(self.client, "supports_json_schema", False):
+            options["json_schema"] = self._replan_schema()
+        response = self.client.respond(messages, **options)
+        data = self._parse_plan_response(response)
+        updates = data.get("updates")
+        if not isinstance(updates, list) and isinstance(data.get("plan"), list):
+            updates = []
+            for raw in data["plan"]:
+                if not isinstance(raw, dict):
+                    continue
+                self._normalize_plan_item(raw)
+                updates.append(
+                    {
+                        "phase": raw["phase"],
+                        "preferred_tools": raw["preferred_tools"],
+                    }
+                )
+        if not isinstance(updates, list) or not 1 <= len(updates) <= 3:
+            raise ValueError("replan updates 必须包含 1-3 个阶段修订")
+        available = {tool.name for tool in self.tools if tool.name != "task_complete"}
+        seen: set[str] = set()
+        normalized_updates: list[dict[str, Any]] = []
+        for update in updates:
+            if not isinstance(update, dict):
+                raise ValueError("replan update 必须是 JSON object")
+            phase = str(update.get("phase") or "")
+            tools = update.get("preferred_tools")
+            if phase == "complete":
+                continue
+            if phase not in PLAN_PHASES or phase in seen:
+                raise ValueError(f"replan phase 非法或重复：{phase}")
+            if not isinstance(tools, list) or not tools or any(tool not in available for tool in tools):
+                raise ValueError("replan preferred_tools 包含未知工具")
+            update["goal"] = PHASE_GOALS[phase]
+            seen.add(phase)
+            normalized_updates.append(update)
+        return normalized_updates
 
     @staticmethod
     def _normalize_plan_item(item: dict[str, Any]) -> None:
@@ -388,14 +473,15 @@ class TaskPlanner:
 可用工具：
 {tool_descriptions}
 
-请生成一个结构化的阶段计划，包含 3-5 个步骤。阶段只能从
-locate、inspect、change、validate、complete 中选择，可按任务省略不需要的阶段。
-计划描述目标和完成证据，不把执行过程锁死为固定工具脚本；preferred_tools 仅是建议。
+请生成一个结构化的阶段计划，包含 2-4 个步骤。阶段只能从
+locate、inspect、change、validate 中选择，可按任务省略不需要的阶段。
+阶段目标由 Runtime 固定定义。你只选择必要阶段和建议工具；preferred_tools 仅是建议。
+不要输出具体文件、类、函数、根因或修复方式。
 
 返回 JSON 格式：
 {{
   "plan": [
-    {{"step": 1, "phase": "locate", "goal": "定位相关实现", "preferred_tools": ["search_code"], "completion_evidence": "candidate_observed"}},
+    {{"step": 1, "phase": "locate", "preferred_tools": ["search_code"], "completion_evidence": "candidate_observed"}},
     ...
   ]
 }}
@@ -403,7 +489,7 @@ locate、inspect、change、validate、complete 中选择，可按任务省略�
 注意：
 - preferred_tools 必须来自可用工具列表
 - completion_evidence 必须与阶段对应
-- 最后一步必须是 complete，建议工具为 task_complete
+- 不要规划 complete 或 task_complete；是否结束由执行 Agent 根据实际结果自行决定
 - 保持计划简洁高效，避免不必要的步骤
 """
         # 发送请求并获得client端的响应
@@ -422,8 +508,8 @@ locate、inspect、change、validate、complete 中选择，可按任务省略�
                         completion_evidence=item["completion_evidence"],
                     )
                 )
-            self.current_plan = steps
-            return steps
+            self.current_plan = _deduplicate_phase_plan(steps)
+            return self.current_plan
         except Exception as e:
             # 如果解析失败，返回空计划（回退到逐步执行模式）
             print(f"警告：计划生成失败 - {e}，将使用逐步执行模式")
@@ -551,6 +637,7 @@ locate、inspect、change、validate、complete 中选择，可按任务省略�
         error: str | None = None,
         *,
         error_signal: Any = None,
+        disposition: str = "contradicted",
     ) -> list[PlanStep]:
         """
         遇到问题时重新规划
@@ -605,11 +692,12 @@ locate、inspect、change、validate、complete 中选择，可按任务省略�
 策略提示：
 {strategy_guidance}
 
-请根据真实进度生成新的阶段计划，保留已经满足的事实，不机械重复失败路线。
+请只调整现有阶段的建议工具。不要创建新阶段、不要输出具体实现方案，
+最多返回 3 个阶段修订。失败分类：{disposition}。
 返回 JSON 格式：
 {{
-  "plan": [
-    {{"step": 1, "phase": "inspect", "goal": "确认失败原因", "preferred_tools": ["read_file"], "completion_evidence": "source_observed"}},
+  "updates": [
+    {{"phase": "validate", "preferred_tools": ["run_tests"]}},
     ...
   ]
 }}
@@ -617,23 +705,35 @@ locate、inspect、change、validate、complete 中选择，可按任务省略�
         # 流程类似plan()
         messages = [{"role": "user", "content": prompt}]
         try:
-            plan_data = self._request_plan(messages)
-            # 保留已完成步骤的进度，新步骤编号顺延——重规划不再把已完成
-            # 工作显示为待办，进度统计跨 replan 连续。
-            carried = [step for step in completed_steps if step.status == "satisfied"]
-            next_number = max((step.step_number for step in carried), default=0)
-            steps: list[PlanStep] = []
-            for offset, item in enumerate(plan_data.get("plan", []), start=1):
-                steps.append(
-                    PlanStep(
-                        step_number=next_number + offset,
+            updates = self._request_replan(messages)
+            by_phase = {step.phase: step for step in completed_steps}
+            for item in updates:
+                step = by_phase.get(item["phase"])
+                if step is None:
+                    step = PlanStep(
+                        step_number=len(completed_steps) + 1,
                         phase=item["phase"],
-                        goal=item["goal"],
+                        goal=item["goal"].strip(),
                         preferred_tools=tuple(item["preferred_tools"]),
-                        completion_evidence=item["completion_evidence"],
+                        completion_evidence=_evidence_for_phase(item["phase"]),
                     )
-                )
-            self.current_plan = carried + steps
+                    completed_steps.append(step)
+                    by_phase[step.phase] = step
+                    continue
+                step.goal = item["goal"].strip()
+                step.reason = step.goal
+                step.preferred_tools = tuple(item["preferred_tools"])
+                step.action = step.preferred_tools[0]
+                if step.status == "satisfied" and disposition == "contradicted" and step.phase in {
+                    "inspect",
+                    "change",
+                    "validate",
+                }:
+                    step.set_status("in_progress", reason="reopened by explicit contradiction")
+            order = {phase: index for index, phase in enumerate(PLAN_PHASES)}
+            self.current_plan = sorted(completed_steps, key=lambda step: order[step.phase])
+            for index, step in enumerate(self.current_plan, start=1):
+                step.step_number = index
             return self.current_plan
         except Exception as e:
             print(f"警告：重新规划失败 - {e}")
@@ -706,3 +806,16 @@ def _strategy_guidance(signal: ReplanSignal) -> str:
         signal.kind,
         "Continue with the failure context, but keep the new plan short and directly verifiable.",
     )
+
+
+def _deduplicate_phase_plan(steps: list[PlanStep]) -> list[PlanStep]:
+    """Keep one stable step identity per phase and preserve the declared order."""
+    result: list[PlanStep] = []
+    seen: set[str] = set()
+    for step in steps:
+        if step.phase in seen:
+            continue
+        seen.add(step.phase)
+        step.step_number = len(result) + 1
+        result.append(step)
+    return result

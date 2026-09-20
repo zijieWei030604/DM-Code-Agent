@@ -21,7 +21,7 @@ from dm_agent.core.events import (
     RunStartEvent,
 )
 from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
-from dm_agent.tools.base import Tool
+from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tools.file_tools import create_file, edit_file, read_file
 from dm_agent.tracing import TraceWriter, load_trace_events
 from dm_agent.verification import VerificationPolicy
@@ -100,6 +100,154 @@ def test_container_execution_backend_replaces_only_execution_tools(monkeypatch):
     assert "conda activate testbed" in calls[0][-1]
     assert backend.stats.calls == 1
     assert backend.stats.failures == 0
+
+
+def test_host_workspace_paths_translate_testbed_alias_without_mutating_input():
+    from swebench_verified.container_tools import bind_host_workspace_paths
+
+    received: list[dict[str, Any]] = []
+
+    def capture(arguments):
+        received.append(arguments)
+        return ToolResult("success", "ok", changed_files=(arguments["path"],))
+
+    original_arguments = {"path": "/testbed/pkg/module.py", "line_start": 3}
+    tool = bind_host_workspace_paths(
+        [Tool("read_file", "read", capture, result_runner=capture)]
+    )[0]
+
+    result = tool.result_runner(original_arguments)
+
+    assert result.changed_files == ("pkg/module.py",)
+    assert received == [{"path": "pkg/module.py", "line_start": 3}]
+    assert original_arguments["path"] == "/testbed/pkg/module.py"
+
+
+def test_host_workspace_paths_translate_root_and_path_lists():
+    from swebench_verified.container_tools import bind_host_workspace_paths
+
+    received: list[dict[str, Any]] = []
+
+    def capture(arguments):
+        received.append(arguments)
+        return ToolResult("success", "ok")
+
+    tool = bind_host_workspace_paths(
+        [Tool("inspect_change_impact", "impact", capture, result_runner=capture)]
+    )[0]
+
+    assert tool.result_runner(
+        {
+            "root": "/testbed",
+            "paths": ["/testbed/a.py", "relative/b.py"],
+        }
+    ).message == "ok"
+    assert received == [{"root": ".", "paths": ["a.py", "relative/b.py"]}]
+
+
+def test_host_workspace_paths_reject_testbed_escape():
+    from swebench_verified.container_tools import bind_host_workspace_paths
+
+    tool = bind_host_workspace_paths(
+        [Tool("read_file", "read", lambda _arguments: "unexpected")]
+    )[0]
+
+    with pytest.raises(ValueError, match="不能越出任务工作区"):
+        tool.execute({"path": "/testbed/../outside.py"})
+
+
+def test_host_workspace_paths_do_not_rewrite_container_execution_arguments():
+    from swebench_verified.container_tools import bind_host_workspace_paths
+
+    received: list[dict[str, Any]] = []
+    original = Tool(
+        "run_python",
+        "python",
+        lambda arguments: received.append(arguments) or "ok",
+    )
+    tool = bind_host_workspace_paths([original])[0]
+
+    assert tool is original
+    assert tool.execute({"path": "/testbed/script.py"}) == "ok"
+    assert received == [{"path": "/testbed/script.py"}]
+
+
+def test_host_workspace_paths_preserve_builtin_runner_identity():
+    from swebench_verified.container_tools import bind_host_workspace_paths
+
+    original = Tool(
+        "edit_file",
+        "edit",
+        edit_file,
+        result_runner=lambda _arguments: ToolResult("success", "ok"),
+    )
+
+    bound = bind_host_workspace_paths([original])[0]
+
+    assert bound.runner is edit_file
+    assert bound.result_runner is not original.result_runner
+
+
+def test_container_execution_backend_preserves_tool_contract_and_classifies_tests(monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+    schema = {"type": "object", "properties": {"targets": {"type": "array"}}}
+    original = Tool(
+        "run_tests",
+        "tests",
+        lambda _args: "host",
+        read_only=True,
+        input_schema=schema,
+    )
+    tool = backend.replace_execution_tools([original])[0]
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="================ 1 failed, 2 passed in 0.10s ================\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
+
+    result = tool.result_runner({"targets": ["tests/test_service.py"]})
+
+    assert isinstance(result, ToolResult)
+    assert result.status == "failed"
+    assert result.error_code == "assertion_failure"
+    assert result.check_scope == ("tests/test_service.py",)
+    assert result.metadata["verification"] == {
+        "execution_status": "completed",
+        "outcome": "failed",
+        "framework": "pytest",
+        "scope": ["tests/test_service.py"],
+        "collected": 3,
+        "passed": 2,
+        "failed": 1,
+        "errors": 0,
+        "skipped": 0,
+        "failure_kind": "assertion_failure",
+    }
+    assert tool.input_schema is schema
+    assert tool.read_only is True
+
+
+def test_container_execution_backend_marks_unavailable_pytest_result(monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(command, 3, stdout="", stderr="INTERNALERROR")
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
+    result = backend.run_tests_result({"test_path": "tests"})
+
+    assert result.status == "failed"
+    assert result.metadata["verification"]["execution_status"] == "unavailable"
+    assert result.metadata["verification"]["failure_kind"] == "pytest_internal_error"
 
 
 def test_container_execution_backend_runs_validation_in_task_container(monkeypatch):

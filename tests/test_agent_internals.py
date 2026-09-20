@@ -12,7 +12,7 @@ from dm_agent.core.agent import ReactAgent
 from dm_agent.core.context_window import should_log_memory_status
 from dm_agent.core.planner import PlanStep
 from dm_agent.core.prompting import build_user_prompt
-from dm_agent.tools.base import Tool
+from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tracing import TraceWriter, load_trace_events
 
 
@@ -166,9 +166,27 @@ def _replan_agent(replan_impl):
             ]
         }
     )
-    client = FakeRespondClient([plan_response, _action("explode", {})])
+    client = FakeRespondClient(
+        [plan_response, _action("explode", {}), _action("explode", {})]
+    )
+    def failed_test(_arguments):
+        return ToolResult(
+            "failed",
+            "1 failed",
+            error_code="assertion_failure",
+            check_scope=("tests/test_service.py",),
+            metadata={
+                "verification": {
+                    "execution_status": "completed",
+                    "outcome": "failed",
+                    "failure_kind": "assertion_failure",
+                    "scope": ["tests/test_service.py"],
+                }
+            },
+        )
+
     tools = [
-        Tool("explode", "Fail", lambda arguments: (_ for _ in ()).throw(RuntimeError("boom"))),
+        Tool("explode", "Fail", lambda arguments: "1 failed", result_runner=failed_test),
         Tool("task_complete", "Finish", lambda arguments: arguments.get("message", "done")),
     ]
     agent = ReactAgent(client, tools, enable_planning=True, enable_compression=False)
@@ -183,7 +201,7 @@ def test_replan_exception_is_recorded_without_breaking_the_run():
 
     agent = _replan_agent(boom)
 
-    result = agent.run("survive a replan failure", max_steps=1)
+    result = agent.run("survive a replan failure", max_steps=2)
 
     assert result["metadata"]["status"] == "max_steps_exceeded"
     assert result["metadata"]["failure_reason"] == "Replan failed: planner down"
@@ -193,11 +211,11 @@ def test_replan_exception_is_recorded_without_breaking_the_run():
 def test_empty_replan_keeps_the_previous_plan():
     agent = _replan_agent(lambda *args, **kwargs: [])
 
-    result = agent.run("keep the plan when replan returns nothing", max_steps=1)
+    result = agent.run("keep the plan when replan returns nothing", max_steps=2)
 
     assert result["metadata"]["replan_count"] == 0
-    # 预算未耗尽，说明 replan 确实被调用过，只是返回了空计划。
-    assert result["metadata"]["replan_skipped_count"] == 0
+    # The targeted contradiction reached the planner, which returned no update.
+    assert result["metadata"]["replan_suppressed_count"] == 0
     assert result["metadata"]["replan_budget_exhausted_count"] == 0
 
 
