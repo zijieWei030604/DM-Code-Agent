@@ -102,6 +102,57 @@ def test_container_execution_backend_replaces_only_execution_tools(monkeypatch):
     assert backend.stats.failures == 0
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        r"cd /d E:\DevCache\repo && git diff",
+        'cd "E:/DevCache/repo" && git status',
+        r"git -C 'E:\DevCache\repo' diff",
+    ],
+)
+def test_container_shell_rejects_windows_host_navigation(command, monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("rejected commands must not reach Docker")
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", unexpected_run)
+
+    result = backend.run_shell_result({"command": command})
+
+    assert result.status == "failed"
+    assert result.error_code == "host_path_in_container"
+    assert "/testbed" in result.message
+    assert backend.stats.calls == 0
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git diff",
+        "cd tests && pytest -q",
+        r"printf 'C:\temp is example text'",
+    ],
+)
+def test_container_shell_allows_relative_commands_and_path_text(command, monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+
+    def fake_run(argv, **_kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
+
+    result = backend.run_shell_result({"command": command})
+
+    assert result.status == "success"
+    assert result.message == "ok\nreturncode: 0"
+    assert backend.stats.calls == 1
+
+
 def test_host_workspace_paths_translate_testbed_alias_without_mutating_input():
     from swebench_verified.container_tools import bind_host_workspace_paths
 
@@ -564,6 +615,7 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
         timeout=30,
         trace_dir=None,
         keep_workspace=True,
+        enable_planning=False,
         enable_adaptive_replanning=True,
         max_replans=2,
     )
@@ -573,6 +625,7 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
     assert record["dm_replans"] == 2
     assert record["dm_replan_decisions"] == 3
     assert record["dm_replan_strategy"] == "simplify_plan_skip_failed_tool"
+    assert record["dm_planning_enabled"] is False
     assert record["dm_adaptive_replanning_enabled"] is True
     assert record["dm_max_replans"] == 2
     assert record["dm_parse_errors"] == 3
@@ -591,6 +644,7 @@ def test_predict_one_exports_empty_patch_diagnostics(monkeypatch, tmp_path):
     assert record["dm_edit_run_end_salvaged"] is True
     capabilities = _FakeAgent.last_kwargs["capabilities"]
     assert capabilities == []
+    assert _FakeAgent.last_kwargs["enable_planning"] is False
 
 
 def test_predict_one_marks_diagnostics_unmeasured_after_agent_exception(monkeypatch, tmp_path):

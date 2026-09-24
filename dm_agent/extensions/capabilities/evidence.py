@@ -55,8 +55,10 @@ class EvidenceGraphCapability:
         self._verification_versions: dict[int, str] = {}
         self._write_versions: dict[int, str] = {}
         self._write_basis_kinds: dict[int, str] = {}
+        self._initial_workspace_version = ""
         self._last_contradiction_signature = ""
         self._last_unverified_pause_signature = ""
+        self._last_no_net_change_signature = ""
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -84,6 +86,8 @@ class EvidenceGraphCapability:
             "graph": self.graph.to_dict(),
             "last_contradiction_signature": self._last_contradiction_signature,
             "last_unverified_pause_signature": self._last_unverified_pause_signature,
+            "initial_workspace_version": self._initial_workspace_version,
+            "last_no_net_change_signature": self._last_no_net_change_signature,
         }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
@@ -95,16 +99,22 @@ class EvidenceGraphCapability:
         self._last_unverified_pause_signature = str(
             state.get("last_unverified_pause_signature", "")
         )
+        self._initial_workspace_version = str(state.get("initial_workspace_version", ""))
+        self._last_no_net_change_signature = str(
+            state.get("last_no_net_change_signature", "")
+        )
 
     def _on_run_start(self, event: RunStartEvent) -> None:
         nodes, edges = self.graph.start(event.task)
         self._workspace_root = Path.cwd()
         self.graph.workspace_version = workspace_version(self._workspace_root)
+        self._initial_workspace_version = self.graph.workspace_version
         self._verification_versions.clear()
         self._write_versions.clear()
         self._write_basis_kinds.clear()
         self._last_contradiction_signature = ""
         self._last_unverified_pause_signature = ""
+        self._last_no_net_change_signature = ""
         self._record(nodes, edges)
         event.metadata.update(
             {
@@ -112,6 +122,7 @@ class EvidenceGraphCapability:
                 "evidence_contradiction_block_count": 0,
                 "evidence_completion_block_count": 0,
                 "evidence_completion_pause_count": 0,
+                "evidence_no_net_change_block_count": 0,
                 "evidence_unverified_completion_count": 0,
                 "evidence_recovered_after_pause": 0,
                 "evidence_intervention_prompt_count": 0,
@@ -247,6 +258,47 @@ class EvidenceGraphCapability:
                 event.metadata.get("edit_transaction_status", "")
             ).startswith("committed"),
         )
+        no_net_change_signature = self._no_net_change_signature()
+        if (
+            decision.decision != "block"
+            and no_net_change_signature
+            and no_net_change_signature != self._last_no_net_change_signature
+        ):
+            self._last_no_net_change_signature = no_net_change_signature
+            reason = (
+                "Completion paused once: code or configuration was edited during this run, "
+                "but no net workspace change remains. Re-check the requested behavior and "
+                "leave the intended change in the workspace, or finish again only if no "
+                "change is genuinely required."
+            )
+            nodes, edges = self.graph.add_conclusion(
+                text=event.completion_text,
+                step_number=event.step_number,
+                accepted=False,
+                evidence_status="no_net_change",
+            )
+            self._record(nodes, edges)
+            event.metadata["evidence_completion_block_count"] = (
+                int(event.metadata.get("evidence_completion_block_count", 0)) + 1
+            )
+            event.metadata["evidence_no_net_change_block_count"] = (
+                int(event.metadata.get("evidence_no_net_change_block_count", 0)) + 1
+            )
+            event.metadata["evidence_intervention_prompt_count"] = (
+                int(event.metadata.get("evidence_intervention_prompt_count", 0)) + 1
+            )
+            event.metadata["evidence_completion_status"] = "no_net_change"
+            self._update_metadata(event.metadata)
+            self._record_event(
+                "evidence_no_net_change_blocked",
+                {
+                    "step_number": event.step_number,
+                    "reason": reason,
+                    "change_revision": self.graph.change_revision,
+                    "workspace_version": self.graph.workspace_version,
+                },
+            )
+            return {"block": True, "reason": reason}
         issues = list(decision.issues)
         warnings = list(decision.warnings)
         should_block = self.enforcement == "strict" and decision.decision == "block"
@@ -368,6 +420,24 @@ class EvidenceGraphCapability:
             },
         )
         return {"block": True, "reason": reason}
+
+    def _no_net_change_signature(self) -> str:
+        changed_paths = [
+            path for path in self.graph.changed_paths() if _path_requires_verification(path)
+        ]
+        if (
+            not self._initial_workspace_version
+            or not changed_paths
+            or self.graph.workspace_version != self._initial_workspace_version
+        ):
+            return ""
+        payload = {
+            "initial_workspace_version": self._initial_workspace_version,
+            "workspace_version": self.graph.workspace_version,
+            "change_revision": self.graph.change_revision,
+            "changed_paths": sorted(changed_paths),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
     def _requires_verification(self) -> bool:
         return any(_path_requires_verification(path) for path in self.graph.changed_paths())

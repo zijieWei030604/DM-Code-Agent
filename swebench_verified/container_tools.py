@@ -7,6 +7,7 @@ runtime and dependencies.
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 from collections.abc import Callable
@@ -35,6 +36,9 @@ _CONTAINER_WORKSPACE = "/testbed"
 _HOST_PATH_KEYS = frozenset({"path", "root"})
 _HOST_PATH_LIST_KEYS = frozenset({"paths"})
 _CONTAINER_EXECUTION_TOOLS = frozenset({"run_shell", "run_python", "run_tests"})
+_WINDOWS_HOST_PATH_COMMAND = re.compile(
+    r"(?i)(?:^|[;&|]\s*)(?:cd(?:\s+/d)?|git\s+-C)\s+[\"']?[a-z]:[\\/]"
+)
 
 
 def _host_workspace_path(value: str) -> str:
@@ -66,6 +70,11 @@ def _translate_host_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
                 for item in value
             ]
     return translated
+
+
+def _uses_windows_host_path(command: str) -> bool:
+    """Detect host-only navigation in a shell that always runs inside Linux."""
+    return bool(_WINDOWS_HOST_PATH_COMMAND.search(command))
 
 
 def _wrap_host_runner(
@@ -179,6 +188,15 @@ class ContainerExecutionBackend:
         purpose = arguments.get("purpose", "execution")
         if purpose not in {"execution", "verification"}:
             raise ValueError("purpose 必须是 'execution' 或 'verification'。")
+        if _uses_windows_host_path(command):
+            return ToolResult(
+                "failed",
+                "Shell command rejected: run_shell executes inside the Linux task container "
+                "with /testbed already selected as the repository root. Do not use a Windows "
+                "host path or `cd /d`; use repository-relative paths, or run commands such as "
+                "`git diff` directly.",
+                error_code="host_path_in_container",
+            )
         result, output = self._run_completed(command)
         metadata: dict[str, Any] = {}
         check_scope: tuple[str, ...] = ()

@@ -6,7 +6,7 @@ from dm_agent.core.evidence import EvidenceGraph
 from dm_agent.core.observation import ObservationBounder
 from dm_agent.core.persistence import RunPersistence
 from dm_agent.core.run_state import RunContext
-from dm_agent.core.tool_invoker import ToolInvoker
+from dm_agent.core.tool_invoker import ToolInvoker, render_tool_observation
 from dm_agent.core.workspace_version import workspace_version
 from dm_agent.tools import _builtin_tools
 from dm_agent.tools.base import Tool, ToolResult
@@ -136,6 +136,53 @@ def test_structured_status_does_not_depend_on_output_words():
         context=context,
     )
     assert passed.tool_succeeded
+
+
+@pytest.mark.parametrize(
+    ("verification", "expected"),
+    [
+        (
+            {"execution_status": "completed", "outcome": "failed", "scope_level": "direct"},
+            "strong contradictory evidence",
+        ),
+        (
+            {"execution_status": "completed", "outcome": "failed", "scope_level": "related"},
+            "does not prove the current change is incorrect",
+        ),
+        (
+            {"execution_status": "completed", "outcome": "failed", "scope_level": "broad"},
+            "broad regression signal",
+        ),
+        (
+            {"execution_status": "unavailable", "outcome": "unknown", "scope_level": "related"},
+            "establishes neither correctness nor incorrectness",
+        ),
+    ],
+)
+def test_failed_verification_observation_explains_evidence_strength(verification, expected):
+    observation = render_tool_observation(
+        ToolResult("failed", "1 failed\nreturncode: 1", metadata={"verification": verification})
+    )
+
+    assert "1 failed\nreturncode: 1" in observation
+    assert f"scope: {verification['scope_level']}" in observation
+    assert expected in observation
+
+
+def test_passed_verification_observation_is_not_annotated():
+    result = ToolResult(
+        "success",
+        "3 passed\nreturncode: 0",
+        metadata={
+            "verification": {
+                "execution_status": "completed",
+                "outcome": "passed",
+                "scope_level": "direct",
+            }
+        },
+    )
+
+    assert render_tool_observation(result) == result.message
 
 
 def test_builtin_tools_all_expose_structured_result_runners():

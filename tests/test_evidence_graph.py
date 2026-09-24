@@ -676,6 +676,72 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
     assert metadata["evidence_terminal_rejection_count"] == 1
 
 
+def test_completion_pauses_once_when_historical_writes_leave_no_net_code_change(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "service.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    bus = EventBus()
+    trace = _Trace()
+    capability = EvidenceGraphCapability()
+    capability.install(CapabilityContext(bus, lambda phase: None, trace))
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("Fix service", 1, "run-1", metadata=metadata))
+
+    for step_number, content in ((1, "value = 2\n"), (2, "value = 1\n")):
+        arguments = {"path": "service.py"}
+        bus.emit_before_tool_call(
+            BeforeToolCallEvent("edit_file", arguments, step_number, "run-1", metadata)
+        )
+        target.write_text(content, encoding="utf-8")
+        bus.emit_after_tool_result(
+            AfterToolResultEvent(
+                "edit_file",
+                arguments,
+                "updated",
+                step_number,
+                "run-1",
+                True,
+                metadata,
+                result=ToolResult(
+                    "success", "updated", changed_files=(str(target),)
+                ),
+            )
+        )
+
+    test_arguments = {"targets": ["tests/test_service.py"]}
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("run_tests", test_arguments, 3, "run-1", metadata)
+    )
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "run_tests",
+            test_arguments,
+            "1 passed",
+            3,
+            "run-1",
+            True,
+            metadata,
+            result=_test_result(outcome="passed"),
+        )
+    )
+
+    finish = BeforeFinishEvent("Fix service", "finish", "done", [], 4, "run-1", metadata)
+    first = bus.emit_before_finish(finish)
+    second = bus.emit_before_finish(finish)
+
+    assert first is not None and "no net workspace change remains" in first["reason"]
+    assert second is None
+    assert metadata["evidence_no_net_change_block_count"] == 1
+    assert metadata["evidence_completion_block_count"] == 1
+    assert any(
+        event["event"] == "evidence_no_net_change_blocked" for event in trace.events
+    )
+    conclusions = [node for node in capability.graph.nodes.values() if node.kind == "conclusion"]
+    assert [node.metadata["accepted"] for node in conclusions[-2:]] == [False, True]
+
+
 def test_invalid_test_invocation_warns_without_blocking_completion() -> None:
     bus = EventBus()
     capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")

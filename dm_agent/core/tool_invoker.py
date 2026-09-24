@@ -71,6 +71,43 @@ def validate_tool_arguments(action_input: Any) -> tuple[str, str] | None:
     return None
 
 
+def render_tool_observation(result: ToolResult) -> str:
+    """Render one tool result for the model without hiding structured verification context."""
+    message = result.message
+    verification = result.metadata.get("verification")
+    if not isinstance(verification, dict) or verification.get("outcome") == "passed":
+        return message
+
+    execution_status = str(verification.get("execution_status") or "unknown")
+    scope_level = str(verification.get("scope_level") or "related")
+    if execution_status in {"invalid", "unavailable"}:
+        interpretation = (
+            "The check did not execute reliably, so it establishes neither correctness "
+            "nor incorrectness of the current change."
+        )
+    elif scope_level == "direct":
+        interpretation = (
+            "This check directly exercises the requested behavior; its failure is strong "
+            "contradictory evidence that must be examined."
+        )
+    elif scope_level == "broad":
+        interpretation = (
+            "This is a broad regression signal; inspect whether the failure is relevant "
+            "before attributing it to the current change."
+        )
+    else:
+        interpretation = (
+            "This is a related risk signal, but this result alone does not prove the "
+            "current change is incorrect."
+        )
+    suffix = (
+        "[verification assessment]\n"
+        f"scope: {scope_level}\n"
+        f"interpretation: {interpretation}"
+    )
+    return f"{message}\n\n{suffix}" if message else suffix
+
+
 class ToolInvoker:
     """按固定次序把一次工具调用跑完，并把过程记进 metadata。"""
 
@@ -173,7 +210,7 @@ class ToolInvoker:
                 else tool.execute(action_input)
             )
             result = output if isinstance(output, ToolResult) else None
-            raw_observation = result.message if result is not None else str(output)
+            raw_observation = render_tool_observation(result) if result is not None else str(output)
         except Exception as exc:
             metadata["tool_error_count"] += 1
             metadata["failure_reason"] = str(exc)
