@@ -109,7 +109,7 @@ def parse_args(argv: Any) -> argparse.Namespace:
         "--context-token-budget",
         type=int,
         default=saved_config.get("context_token_budget", 24000),
-        help="对话历史的估算 token 预算，超限提前触发本地压缩；0 表示只按消息节奏压缩（默认：24000）。",
+        help="请求的估算 token 总预算，接近上限触发 LCM 摘要；0 禁用自动压缩（默认：24000）。",
     )
     parser.add_argument(
         "--disable-edit-guard",
@@ -144,6 +144,13 @@ def parse_args(argv: Any) -> argparse.Namespace:
         action="store_true",
         default=saved_config.get("enable_evidence_graph", False),
         help="启用低干预决策证据图：关联计划、观察、修改、验证与结论。",
+    )
+    parser.add_argument(
+        "--disable-repeat-call-redirect",
+        dest="enable_repeat_call_redirect",
+        action="store_false",
+        default=saved_config.get("enable_repeat_call_redirect", True),
+        help="关闭连续无进展工具调用的请求前提醒（默认开启）。",
     )
     parser.add_argument(
         "--llm-max-retries",

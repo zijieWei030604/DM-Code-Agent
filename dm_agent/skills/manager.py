@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .base import BaseSkill, ConfigSkill
+from .packages import MarkdownSkill
 from .selector import SkillSelector
 
 if TYPE_CHECKING:
@@ -28,9 +29,22 @@ class SkillManager:
         enable_llm_fallback: bool = False,
         llm_client: BaseLLMClient | None = None,
         extension_registry: ExtensionRegistry | None = None,
+        user_directory: str | Path | None = None,
+        project_directory: str | Path | None = None,
     ) -> None:
         self.skills: dict[str, BaseSkill] = {}
         self.active_skills: list[str] = []
+        self.sources: dict[str, str] = {}
+        self.user_directory = (
+            Path(user_directory)
+            if user_directory is not None
+            else Path.home() / ".dm_agent" / "skills"
+        )
+        self.project_directory = (
+            Path(project_directory)
+            if project_directory is not None
+            else Path.cwd() / ".dm_agent" / "skills"
+        )
         self._extension_registry = extension_registry
         self._selector = SkillSelector(
             max_active_skills=max_active_skills,
@@ -54,6 +68,7 @@ class SkillManager:
         for skill in registry.get_skills():
             meta = skill.get_metadata()
             self.skills[meta.name] = skill
+            self.sources[meta.name] = "builtin"
             count += 1
         return count
 
@@ -70,6 +85,7 @@ class SkillManager:
                 skill = ConfigSkill.from_file(json_file)
                 meta = skill.get_metadata()
                 self.skills[meta.name] = skill
+                self.sources[meta.name] = str(json_file.resolve())
                 count += 1
             except Exception as e:
                 print(f"⚠ 加载自定义技能 {json_file.name} 失败：{e}")
@@ -77,9 +93,31 @@ class SkillManager:
 
     def load_all(self) -> int:
         """加载全部技能（内置 + 自定义），返回总数。"""
-        builtin_count = self.load_builtin_skills()
-        custom_count = self.load_custom_skills()
-        return builtin_count + custom_count
+        self.deactivate_all()
+        self.skills.clear()
+        self.sources.clear()
+        self.load_builtin_skills()
+        self.load_custom_skills()
+        for directory in (
+            Path(__file__).parent / "packages",
+            self.user_directory,
+            self.project_directory,
+        ):
+            self.load_packages(directory)
+        return len(self.skills)
+
+    def load_packages(self, directory: Path) -> int:
+        count = 0
+        for path in sorted(directory.glob("*/SKILL.md")):
+            try:
+                skill = MarkdownSkill(path)
+                name = skill.get_metadata().name
+                self.skills[name] = skill
+                self.sources[name] = str(path.resolve())
+                count += 1
+            except (OSError, ValueError, TypeError) as exc:
+                print(f"Cannot load skill {path}: {exc}")
+        return count
 
     # ------------------------------------------------------------------
     # 选择与激活

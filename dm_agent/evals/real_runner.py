@@ -83,6 +83,12 @@ class UsageTrackingClient:
         complete = getattr(self.client, "complete_with_retry", self.client.complete)
         return complete(messages, **extra)
 
+    def complete_summary(
+        self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        # LCM records summary usage separately from ordinary Agent requests.
+        return self.client.complete_summary(messages, max_tokens=max_tokens, timeout=timeout)
+
     def extract_text(self, data: dict[str, Any]) -> str:
         text = self.client.extract_text(data)
         self.last_response_mode = str(getattr(self.client, "last_response_mode", ""))

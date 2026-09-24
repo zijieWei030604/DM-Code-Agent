@@ -207,6 +207,7 @@ def main(argv: Any = None) -> int:
         enable_repo_map=args.enable_repo_map,
         enable_verified_edits=args.enable_verified_edits,
         enable_evidence_graph=args.enable_evidence_graph,
+        enable_repeat_call_redirect=args.enable_repeat_call_redirect,
         llm_max_retries=args.llm_max_retries,
         enable_adaptive_replanning=args.enable_adaptive_replanning,
         max_replans=args.max_replans,

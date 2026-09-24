@@ -54,6 +54,19 @@ class OpenAIClient(BaseLLMClient):
             self.supports_json_schema = False
         self.client = OpenAI(**client_options)
 
+    def complete_summary(
+        self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "input": messages,
+            "max_output_tokens": max_tokens,
+        }
+        response = self.client.with_options(timeout=timeout, max_retries=0).responses.create(
+            **request
+        )
+        return {"response": response}
+
     def complete(
         self,
         messages: list[dict[str, str]],

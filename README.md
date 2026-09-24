@@ -81,10 +81,12 @@ dm-agent-trace analyze-dir sessions/             # 批量聚合统计
 
 ### 📉 上下文折叠带净收益护栏，压亏了就整体回滚
 
-折叠是**本地确定性**的（Mem0 风格原子记忆），不额外烧一次 LLM 调用。更关键的是它会算账：
-`estimated_tokens_after < estimated_tokens_before` 才提交，**无收益的候选完整回滚**
-（memory、cadence、摘要状态全部还原）。已证明正收益的折叠会跨请求、跨 run 粘性复用，
-trace 里明写 `phase=sticky_reuse`，不把复用计成一次新压缩。
+默认压缩已切换为 **LCM 分层摘要**：SQLite 保留历史原文，独立、无工具的 LLM 请求
+生成摘要，近期完整调用与结果继续保留。仅在估算 token 净收益为正时提交摘要及来源关系，
+无收益或失败候选不替换历史；仍超预算则以 `context_overflow` 停止。
+摘要可跨请求和新格式 Checkpoint 复用，摘要调用用量单独记录。
+`lcm_grep`、`lcm_describe`、`lcm_expand` 支持搜索、查看及分页展开历史。
+详见 [LCM 存储、恢复与隐私边界](docs/lcm-migration-plan.md)。旧版压缩评测数字不代表新版效果。
 
 ### 🖥️ 浏览器里对话，浏览器里审计
 

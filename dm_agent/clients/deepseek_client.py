@@ -99,6 +99,23 @@ class DeepSeekClient(BaseLLMClient):
         url = f"{self.base_url}/{self.endpoint.lstrip('/')}"
         return self._post_with_retry(url, payload)
 
+    def complete_summary(
+        self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        response = self.session.post(
+            f"{self.base_url}/{self.endpoint.lstrip('/')}",
+            json={
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+                "temperature": 0,
+            },
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        data: dict[str, Any] = response.json()
+        return data
+
     def _complete_structured_response(
         self,
         messages: list[dict[str, str]],

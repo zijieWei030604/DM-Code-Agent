@@ -650,20 +650,25 @@ def test_token_budget_forces_early_compression(tmp_path, monkeypatch):
         tools,
         enable_planning=False,
         enable_compression=True,
-        context_token_budget=120,
+        context_token_budget=350,
+        system_prompt="Use tools then finish.",
         max_observation_chars=0,
     )
     assert agent.compressor is not None
-    # Shrink the verbatim window so old messages become compressible quickly;
-    # cadence stays high so only the token budget can trigger compression.
-    agent.compressor.keep_recent = 1
-    agent.compressor.compress_every = 50
+    from dataclasses import replace
+
+    client.complete_summary = lambda messages, **extra: {"text": "Historical dumps completed."}
+    client.extract_text = lambda data: data["text"]
+    _ = agent.compressor.store
+    agent.compressor.compactor.policy = replace(agent.compressor.compactor.policy, keep_recent=2)
+    agent._context_window.output_token_reserve = 0
+    agent._context_window.safety_margin_tokens = 0
 
     result = agent.run("dump repeatedly", max_steps=8)
 
     assert result["metadata"]["status"] == "success"
     assert result["metadata"]["budget_compression_count"] >= 1
-    assert agent.compressor.last_trigger in {"token_budget", ""}
+    assert agent.compressor.compactor.calls
 
 
 def test_edit_creates_backup_of_original_file(tmp_path, monkeypatch):

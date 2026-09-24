@@ -299,6 +299,7 @@ class TraceWriter:
         payload: dict[str, Any],
         *,
         sanitize: bool | None = None,
+        durable: bool = False,
     ) -> str:
         """追加一条会话条目，返回它的 entry id。
 
@@ -321,6 +322,8 @@ class TraceWriter:
         }
         self._handle.write(json.dumps(envelope, ensure_ascii=False, sort_keys=True) + "\n")
         self._handle.flush()
+        if durable:
+            os.fsync(self._handle.fileno())
         self._last_entry_id = entry_id
         if self.auto_close:
             self.close()
@@ -354,6 +357,21 @@ class SessionWriter:
 
     def __bool__(self) -> bool:
         return bool(self._sinks)
+
+    def store_lcm_artifact(self, content: str) -> dict[str, Any] | None:
+        """Persist redacted tool output only in the Trace sink, before truncation."""
+        writer = self._sinks.get("trace")
+        if writer is None:
+            return None
+        content = redact_text(content)
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        entry_id = writer.record(
+            "lcm_artifact",
+            {"content": content, "sha256": digest},
+            sanitize=False,
+            durable=True,
+        )
+        return {"path": str(writer.path.resolve()), "entry_id": entry_id, "sha256": digest}
 
     @property
     def run_id(self) -> str:
@@ -498,6 +516,28 @@ def _local_message_id(entry_ids: list[str], index: int) -> str:
     if 0 <= index < len(entry_ids):
         return entry_ids[index]
     return ""
+
+
+def redact_text(text: str) -> str:
+    """Shared disk-persistence redaction for Trace and local context storage."""
+    return _sanitize_text(text)
+
+
+def read_lcm_artifact(reference: dict[str, Any]) -> str:
+    """Resolve only references supplied by the trusted, branch-filtered store."""
+    with Path(reference["path"]).open(encoding="utf-8") as handle:
+        for line in handle:
+            entry = json.loads(line)
+            if entry.get("id") != reference["entry_id"]:
+                continue
+            payload = entry.get("payload", {})
+            content = payload.get("content")
+            if entry.get("event") != "lcm_artifact" or not isinstance(content, str):
+                raise ValueError("Reference does not identify a tool-output artifact")
+            if hashlib.sha256(content.encode("utf-8")).hexdigest() != reference["sha256"]:
+                raise ValueError("Trace artifact integrity check failed")
+            return content
+    raise ValueError("Trace artifact is missing; no replacement content was inferred")
 
 
 def _sanitize(value: Any) -> Any:

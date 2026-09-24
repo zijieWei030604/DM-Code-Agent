@@ -166,9 +166,8 @@ def _replan_agent(replan_impl):
             ]
         }
     )
-    client = FakeRespondClient(
-        [plan_response, _action("explode", {}), _action("explode", {})]
-    )
+    client = FakeRespondClient([plan_response, _action("explode", {}), _action("explode", {})])
+
     def failed_test(_arguments):
         return ToolResult(
             "failed",
@@ -228,13 +227,10 @@ def _budget_agent(responses, **kwargs):
     kwargs.setdefault("context_token_budget", 10)
     agent = ReactAgent(FakeRespondClient(responses), _tools(), **kwargs)
     assert agent.compressor is not None
-    # 拉高压缩节奏阈值，只留 token 预算这一条触发路径。
-    agent.compressor.compress_every = 100
-    agent.compressor.keep_recent = 1
     return agent
 
 
-def test_token_budget_compression_is_traced(tmp_path):
+def test_impossible_context_budget_is_traced_and_stops(tmp_path):
     trace_path = tmp_path / "budget.jsonl"
     writer = TraceWriter(trace_path)
     agent = _budget_agent(
@@ -250,10 +246,10 @@ def test_token_budget_compression_is_traced(tmp_path):
         for event in load_trace_events(trace_path)
         if event["event"] == "context_budget"
     ]
-    assert "forced_compress" in phases
-    assert "post_compress_still_over" in phases
-    assert result["metadata"]["budget_compression_count"] == 1
-    assert result["metadata"]["memory_compression_count"] == 1
+    assert "overflow_stopped" in phases
+    assert result["metadata"]["status"] == "context_overflow"
+    assert result["metadata"]["budget_compression_count"] == 0
+    assert result["metadata"]["memory_compression_count"] == 0
 
 
 def test_memory_status_log_throttle_branches():

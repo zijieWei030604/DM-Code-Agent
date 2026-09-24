@@ -1,5 +1,9 @@
 # Skill 系统接入指南
 
+> 当前 Agent 已使用[渐进式 Skill 加载](progressive-skills.md)：任务开始只展示目录和推荐，
+> 通过 `load_skill` / `load_skill_resource` 按需加载。以下自动注入示例属于旧版行为；
+> Python/JSON 的定义接口仍兼容，但不会自动将全文注入 system prompt。
+
 本文档介绍 DM-Code-Agent 的可插拔 Skill（专家能力）系统。Skill 系统允许 Agent 根据任务自动激活相关的领域专家能力，每个 Skill 包含专用的 system prompt 补充和专用工具。
 
 ---

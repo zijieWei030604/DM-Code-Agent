@@ -19,6 +19,7 @@ from dm_agent.core.capabilities import AgentCapability
 from dm_agent.core.checkpoint import RunCheckpoint
 from dm_agent.extensions.capabilities import (
     EvidenceGraphCapability,
+    RepeatCallRedirectCapability,
     SemanticWorkspaceCapability,
     VerifiedEditCapability,
 )
@@ -119,6 +120,8 @@ def create_agent(
         )
     if config.enable_evidence_graph:
         capabilities.append(EvidenceGraphCapability())
+    if config.enable_repeat_call_redirect:
+        capabilities.append(RepeatCallRedirectCapability())
     return ReactAgent(
         client,
         tools,

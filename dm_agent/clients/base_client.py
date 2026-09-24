@@ -154,6 +154,12 @@ class BaseLLMClient(ABC):
         data = self.complete_with_retry(messages, **extra)
         return self.extract_text(data)
 
+    def complete_summary(
+        self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        """One tool-free summary request. Providers override transport-level limits."""
+        raise NotImplementedError("Provider must implement bounded, tool-free summary requests")
+
     def close(self) -> None:
         """Release provider resources; stateless clients may keep the no-op default."""
         return None

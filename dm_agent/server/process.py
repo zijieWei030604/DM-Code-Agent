@@ -91,9 +91,9 @@ class RunSpec:
         if len(self.model) > 200 or any(ord(char) < 32 for char in self.model):
             raise SpecError("模型名不合法。")
         for key, value in self.options.items():
-            # enable_edit_guard 是反向开关（--disable-edit-guard），不在 BOOL_FLAGS 里，
+            # 这两个能力是反向开关（--disable-*），不在 BOOL_FLAGS 里，
             # 但校验规则与布尔开关完全相同。
-            if key in BOOL_FLAGS or key == "enable_edit_guard":
+            if key in BOOL_FLAGS or key in {"enable_edit_guard", "enable_repeat_call_redirect"}:
                 if not isinstance(value, bool):
                     raise SpecError(f"{key} 必须是布尔值。")
             elif key in NUMBER_FLAGS:
@@ -124,6 +124,8 @@ def _base_argv(spec: RunSpec, *, trace_path: Path) -> list[str]:
     # 反向开关：守卫默认开，只有显式关掉时才加 --disable-edit-guard。
     if spec.options.get("enable_edit_guard") is False:
         argv.append("--disable-edit-guard")
+    if spec.options.get("enable_repeat_call_redirect") is False:
+        argv.append("--disable-repeat-call-redirect")
 
     for key, (flag, _low, _high) in NUMBER_FLAGS.items():
         value = spec.options.get(key)

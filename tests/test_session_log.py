@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -29,6 +30,12 @@ class FakeRespondClient:
         self.responses = list(responses)
         self.model = "fake-model"
         self.requests = []
+
+    def complete_summary(self, messages, **extra):
+        return {"summary": "Historical echo operations completed.", "usage": {"input_tokens": 100}}
+
+    def extract_text(self, data):
+        return data["summary"]
 
     def respond(self, messages, **extra):
         self.requests.append([dict(message) for message in messages])
@@ -372,7 +379,7 @@ def test_compaction_describes_the_folded_range_without_dropping_messages():
 
 def _compaction_run(trace_path, *, enable_compression):
     """跑同一份脚本任务；只有压缩开关不同。"""
-    responses = [_action("echo", {"text": f"turn {index}"}) for index in range(12)]
+    responses = [_action("echo", {"text": f"turn {index} " + "x" * 600}) for index in range(12)]
     responses.append(_action("finish", {"answer": "done"}))
     writer = TraceWriter(trace_path)
     agent = ReactAgent(
@@ -380,10 +387,19 @@ def _compaction_run(trace_path, *, enable_compression):
         _tools(),
         enable_planning=False,
         enable_compression=enable_compression,
-        context_token_budget=60,
+        context_token_budget=1400,
+        system_prompt="Use the echo tool, then finish.",
         trace_writer=writer,
     )
+    agent._context_window.output_token_reserve = 0
+    agent._context_window.safety_margin_tokens = 0
+    if agent.compressor:
+        _ = agent.compressor.store
+        agent.compressor.compactor.policy = replace(
+            agent.compressor.compactor.policy, keep_recent=2
+        )
     result = agent.run("echo many times then finish", max_steps=20)
+    agent.close()
     writer.close()
     return result
 
@@ -480,7 +496,7 @@ def test_session_checkpoint_appends_one_entry_per_step(tmp_path):
 
 
 def _checkpoint_compaction_run(checkpoint_path, *, trace_path=None):
-    responses = [_action("echo", {"text": f"turn {index}"}) for index in range(12)]
+    responses = [_action("echo", {"text": f"turn {index} " + "x" * 600}) for index in range(12)]
     responses.append(_action("finish", {"answer": "done"}))
     writer = TraceWriter(trace_path) if trace_path is not None else None
     agent = ReactAgent(
@@ -488,14 +504,20 @@ def _checkpoint_compaction_run(checkpoint_path, *, trace_path=None):
         _tools(),
         enable_planning=False,
         enable_compression=True,
-        context_token_budget=60,
+        context_token_budget=1400,
+        system_prompt="Use the echo tool, then finish.",
         trace_writer=writer,
     )
+    agent._context_window.output_token_reserve = 0
+    agent._context_window.safety_margin_tokens = 0
+    _ = agent.compressor.store
+    agent.compressor.compactor.policy = replace(agent.compressor.compactor.policy, keep_recent=2)
     result = agent.run(
         "echo many times with a complete checkpoint session",
         max_steps=20,
         checkpoint_path=checkpoint_path,
     )
+    agent.close()
     if writer is not None:
         writer.close()
     return result

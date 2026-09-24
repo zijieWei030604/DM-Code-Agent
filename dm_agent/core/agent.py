@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 import uuid
@@ -11,7 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from dm_agent.clients.base_client import BaseLLMClient
-from dm_agent.memory.context_compressor import ContextCompressor
+from dm_agent.memory.lcm.compaction import ContextOverflow
 from dm_agent.memory.repo_map import RepoMapResult, RepositoryMap
 from dm_agent.prompts import build_code_agent_prompt
 from dm_agent.tools.base import Tool
@@ -21,9 +20,7 @@ from dm_agent.tracing.writer import SessionWriter
 from .capabilities import AgentCapability, CapabilityContext
 from .checkpoint import RunCheckpoint
 from .completion import CompletionGate, build_run_result, format_final_answer
-from .context_window import ContextWindow
 from .events import (
-    AfterToolResultEvent,
     EventBus,
     HookFailure,
     LLMRequestClient,
@@ -31,7 +28,9 @@ from .events import (
     RunStartEvent,
 )
 from .evidence import plan_snapshot
-from .guards import READ_ACTIONS, WRITE_ACTIONS, ReadBeforeEditGuard
+from .guards import ReadBeforeEditGuard
+from .lcm_context_window import LCMContextWindow
+from .lcm_memory import LCMMemory
 from .observation import ObservationBounder, is_failure_observation
 from .persistence import (
     RunPersistence,
@@ -48,7 +47,7 @@ from .plan_progress import (
     summarize_plan,
 )
 from .planner import AdaptiveReplanPolicy, PlanStep, TaskPlanner
-from .prompting import activate_skills, build_user_prompt
+from .prompting import build_user_prompt
 from .replan import FailureContext, ReplanCoordinator
 from .response_parser import normalize_action, parse_agent_response
 from .run_state import RunContext, Step, initial_run_metadata
@@ -176,21 +175,27 @@ class ReactAgent:
         self.planner = TaskPlanner(client_for("planner"), tools) if enable_planning else None
         self._plan_progress = PlanProgressTracker()
 
-        # 上下文压缩器：默认先充分利用现代 LLM 上下文，长会话再分批压缩。
-        # token 预算超限时也会提前触发压缩（0 表示只按消息节奏压缩）。
+        # LCM owns history storage and tool-free summary calls; zero disables compaction.
         self.enable_compression = enable_compression
         self.context_token_budget = max(0, int(context_token_budget))
         self.compressor = (
-            ContextCompressor(
-                client_for("compression"),
-                compress_every=20,
-                keep_recent=8,
+            LCMMemory(
+                client,
                 token_budget=self.context_token_budget,
+                trace_writer=self.trace_writer,
             )
             if enable_compression
             else None
         )
-        self._context_window = ContextWindow(
+        if self.compressor:
+            memory_tools = self.compressor.tools()
+            self.tools.update({tool.name: tool for tool in memory_tools})
+            self.tools_list = [*tools, *memory_tools]
+            if system_prompt is None:
+                self.system_prompt = build_code_agent_prompt(
+                    self.tools_list, native_tool_calling=self.native_tool_calling
+                )
+        self._context_window = LCMContextWindow(
             compressor=self.compressor,
             enabled=enable_compression,
             trace_writer=self.trace_writer,
@@ -198,7 +203,9 @@ class ReactAgent:
         # 单条工具观察的字符上限；0 表示不截断。
         self.max_observation_chars = max(0, int(max_observation_chars))
         self._observation_bounder = ObservationBounder(
-            max_chars=self.max_observation_chars, trace_writer=self.trace_writer
+            max_chars=self.max_observation_chars,
+            trace_writer=self.trace_writer,
+            preserve_output=self.compressor.preserve_output if self.compressor else None,
         )
         self._persistence = RunPersistence(trace_writer=self.trace_writer)
         self._tool_invoker = ToolInvoker(
@@ -253,13 +260,6 @@ class ReactAgent:
             self._edit_guard.after_tool_result,
             name="builtin.read_before_edit_ledger",
         )
-        if self.compressor:
-            self.event_bus.on(
-                "after_tool_result",
-                self._remember_tool_evidence,
-                name="builtin.evidence_memory",
-                kind="observer",
-            )
 
     def run(
         self,
@@ -314,44 +314,6 @@ class ReactAgent:
         if self.trace_writer:
             self.trace_writer.record("hook_error", failure.to_trace_payload())
 
-    def _remember_tool_evidence(self, event: AfterToolResultEvent) -> None:
-        """Capture bounded tool facts separately from model-derived memories."""
-        compressor = self.compressor
-        if compressor is None or not event.tool_succeeded:
-            return
-        result = event.result
-        path = event.arguments.get("path")
-        files = list(result.changed_files if result else ())
-        if isinstance(path, str) and path and path not in files:
-            files.append(path)
-        is_verification = event.tool_name in {"run_tests", "run_linter", "run_python"}
-        if event.tool_name not in READ_ACTIONS | WRITE_ACTIONS and not is_verification:
-            return
-
-        version = self._evidence_version(files)
-        if event.tool_name in WRITE_ACTIONS:
-            compressor.memory.invalidate_files(files, workspace_version=version)
-        compressor.record_tool_evidence(
-            f"{event.tool_name} succeeded: {' '.join(event.observation.split())[:500]}",
-            files=files,
-            source_event_id=f"{event.run_id}:{event.step_number}",
-            workspace_version=version,
-            check_scope=result.check_scope if result else (),
-            confidence=0.95 if is_verification else 0.85,
-        )
-
-    @staticmethod
-    def _evidence_version(files: Sequence[str]) -> str:
-        digest = hashlib.sha256()
-        for name in sorted(set(files)):
-            path = Path(name)
-            digest.update(name.encode("utf-8", errors="replace"))
-            try:
-                digest.update(path.read_bytes())
-            except OSError:
-                digest.update(b"<missing>")
-        return digest.hexdigest()[:16] if files else ""
-
     def _append_history(
         self,
         role: str,
@@ -372,6 +334,9 @@ class ReactAgent:
         self.conversation_history.append(
             {"role": role, "content": content if context_content is None else context_content}
         )
+        if self.compressor:
+            self.compressor.adopt(self.conversation_history[:-1])
+            self.compressor.append(role, content, kind=kind, context_content=context_content)
         entry_id = ""
         if self.trace_writer:
             entry_id = self.trace_writer.record_message(
@@ -471,13 +436,6 @@ class ReactAgent:
             }
         )
         self._run_context.begin(run_id=run_token, metadata=metadata)
-        if self.compressor:
-            project_id = hashlib.sha256(str(Path.cwd().resolve()).encode("utf-8")).hexdigest()[:16]
-            self.compressor.set_scope(
-                agent_id="dm-code-agent",
-                project_id=project_id,
-                session_id=run_token,
-            )
         start_event = RunStartEvent(
             task=task,
             attempt=attempt,
@@ -618,12 +576,27 @@ class ReactAgent:
                 if self.native_tool_calling
                 else []
             )
-            messages_to_send = self._context_window.build_messages(
-                self.system_prompt,
-                self.conversation_history,
-                context=self._run_context,
-                tool_definitions=tool_definitions,
-            )
+            try:
+                messages_to_send = self._context_window.build_messages(
+                    self.system_prompt,
+                    self.conversation_history,
+                    context=self._run_context,
+                    tool_definitions=tool_definitions,
+                )
+            except ContextOverflow as exc:
+                metadata["status"] = "context_overflow"
+                metadata["failure_reason"] = str(exc)
+                metadata["duration_seconds"] = time.perf_counter() - started_at
+                if self.trace_writer:
+                    self.trace_writer.record(
+                        "context_budget",
+                        {
+                            "phase": "overflow_stopped",
+                            "step_number": step_num,
+                            "reason": str(exc),
+                        },
+                    )
+                return finish_result("")
 
             # 获取 AI 响应
             request_messages = messages_to_send
@@ -638,10 +611,7 @@ class ReactAgent:
                     getattr(self._request_client, "last_response_mode", "")
                     or ("json_fallback" if self.native_tool_calling else "prompt_json")
                 )
-                if (
-                    self.native_tool_calling
-                    and response_mode != "native_tool_call"
-                ):
+                if self.native_tool_calling and response_mode != "native_tool_call":
                     metadata["native_tool_call_missing_count"] += 1
                     try:
                         parse_agent_response(raw)
@@ -687,9 +657,7 @@ class ReactAgent:
                             )
                         retry_options = {**request_options, "tool_choice": "required"}
                         try:
-                            raw = self._request_client.respond(
-                                request_messages, **retry_options
-                            )
+                            raw = self._request_client.respond(request_messages, **retry_options)
                         except Exception as exc:
                             if not _required_tool_choice_unsupported(exc):
                                 raise
@@ -704,9 +672,7 @@ class ReactAgent:
                                         "reason": str(exc),
                                     },
                                 )
-                            raw = self._request_client.respond(
-                                request_messages, **request_options
-                            )
+                            raw = self._request_client.respond(request_messages, **request_options)
             except Exception as exc:
                 if self.trace_writer:
                     self.trace_writer.record(
@@ -1011,8 +977,7 @@ class ReactAgent:
                         tool_status=(invocation.result.status if invocation.result else ""),
                         verification=(
                             invocation.result.metadata.get("verification")
-                            if invocation.result
-                            and isinstance(invocation.result.metadata, dict)
+                            if invocation.result and isinstance(invocation.result.metadata, dict)
                             else None
                         ),
                     ),
@@ -1063,15 +1028,12 @@ class ReactAgent:
         if not plan or not self.planner:
             return
         preferred = {
-            tool
-            for step in plan
-            if step.status != "satisfied"
-            for tool in step.preferred_tools
+            tool for step in plan if step.status != "satisfied" for tool in step.preferred_tools
         }
         if action not in preferred and action not in {"finish", "task_complete"}:
-            metadata["plan_tool_deviation_count"] = int(
-                metadata.get("plan_tool_deviation_count", 0)
-            ) + 1
+            metadata["plan_tool_deviation_count"] = (
+                int(metadata.get("plan_tool_deviation_count", 0)) + 1
+            )
         changes = self._plan_progress.observe(
             plan,
             action=action,
@@ -1084,9 +1046,9 @@ class ReactAgent:
             fact=fact,
         )
         for change in changes:
-            metadata["plan_progress_event_count"] = int(
-                metadata.get("plan_progress_event_count", 0)
-            ) + 1
+            metadata["plan_progress_event_count"] = (
+                int(metadata.get("plan_progress_event_count", 0)) + 1
+            )
             if self.trace_writer:
                 self.trace_writer.record("plan_progress", change.to_dict())
         metadata["plan_progress"] = summarize_plan(plan)
@@ -1103,12 +1065,16 @@ class ReactAgent:
         self.system_prompt = self._base_system_prompt
         self.tools = dict(self._base_tools)
 
-        activation = activate_skills(manager, task)
-        if activation.prompt_addition:
-            self.system_prompt += activation.prompt_addition
-        for tool in activation.tools:
-            self.tools[tool.name] = tool
-        return activation.selected
+        from dm_agent.skills.runtime import prepare_skills
+
+        activated: list[str] = []
+
+        def record(kind: str, payload: dict[str, Any]) -> None:
+            if self.trace_writer:
+                self.trace_writer.record(kind, payload)
+
+        self.system_prompt += prepare_skills(manager, task, self.tools, record, activated)
+        return activated
 
     def _config_snapshot(self, *, max_steps: int | None = None) -> dict[str, Any]:
         """当前生效的配置快照：既用于落盘，也用于 resume 时的一致性比对。"""
@@ -1238,7 +1204,7 @@ class ReactAgent:
         if self._closed:
             return
         self._closed = True
-        resources = [self._repo_map, *reversed(self._owned_resources), self.client]
+        resources = [self.compressor, self._repo_map, *reversed(self._owned_resources), self.client]
         seen: set[int] = set()
         for resource in resources:
             if resource is None or id(resource) in seen:

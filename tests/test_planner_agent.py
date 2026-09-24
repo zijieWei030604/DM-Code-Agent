@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -13,6 +14,12 @@ class FakeRespondClient:
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests = []
+
+    def complete_summary(self, messages, **extra):
+        return {"text": "Historical tool observations retained."}
+
+    def extract_text(self, data):
+        return data["text"]
 
     def respond(self, messages, **extra):
         self.requests.append((messages, extra))
@@ -193,9 +200,7 @@ def test_react_agent_retries_missing_native_call_without_polluting_history():
             self.last_tool_call_count = 0 if len(self.requests) == 1 else 1
             return response
 
-    response = json.dumps(
-        {"thought": "", "action": "finish", "action_input": {"answer": "done"}}
-    )
+    response = json.dumps({"thought": "", "action": "finish", "action_input": {"answer": "done"}})
     client = MissingThenNativeClient(["plain text", response])
     agent = ReactAgent(
         client,
@@ -237,9 +242,7 @@ def test_react_agent_downgrades_only_explicit_required_tool_choice_rejection():
             return self.responses.pop(0)
 
     invalid = "plain text"
-    response = json.dumps(
-        {"thought": "", "action": "finish", "action_input": {"answer": "done"}}
-    )
+    response = json.dumps({"thought": "", "action": "finish", "action_input": {"answer": "done"}})
     client = RequiredUnsupportedClient([invalid, response])
     agent = ReactAgent(
         client,
@@ -266,17 +269,13 @@ def test_react_agent_bounds_native_retries_across_the_run():
         def respond(self, messages, **extra):
             response = super().respond(messages, **extra)
             self.last_response_mode = (
-                "native_tool_call"
-                if extra.get("tool_choice") == "required"
-                else "json_fallback"
+                "native_tool_call" if extra.get("tool_choice") == "required" else "json_fallback"
             )
             self.last_tool_call_count = 1 if self.last_response_mode == "native_tool_call" else 0
             return response
 
     noop = json.dumps({"thought": "", "action": "noop", "action_input": {}})
-    finish = json.dumps(
-        {"thought": "", "action": "finish", "action_input": {"answer": "done"}}
-    )
+    finish = json.dumps({"thought": "", "action": "finish", "action_input": {"answer": "done"}})
     client = RepeatedMissingClient(
         ["plain text", noop, "plain text", noop, "plain text", noop, finish]
     )
@@ -432,8 +431,12 @@ def test_react_agent_reset_conversation_clears_context_memory():
     ]
 
     assert agent.compressor is not None
-    agent.compressor.keep_recent = 1
-    agent.compressor.compress(agent.conversation_history)
+    memory = agent.compressor
+    memory.adopt(agent.conversation_history)
+    node = memory.store.add_summary(
+        memory.branch, "Historical facts.", memory.history_ids[:4], metadata={"depth": 0}
+    )
+    memory.frontier = [node, *memory.history_ids[4:]]
 
     assert agent.get_context_stats()["conversation_messages"] == 7
     assert agent.get_context_stats()["memory_items"] > 0
@@ -469,15 +472,19 @@ def test_react_agent_throttles_memory_status_output(capsys):
     agent = ReactAgent(
         FakeRespondClient(responses),
         [
-            Tool("echo", "Echo text", lambda arguments: f"echo:{arguments['text']}"),
+            Tool("echo", "Echo text", lambda arguments: f"echo:{arguments['text']} " + "x" * 600),
             Tool("task_complete", "Finish", lambda arguments: "finished"),
         ],
         enable_planning=False,
         enable_compression=True,
+        system_prompt="Use tools and finish.",
+        context_token_budget=600,
     )
     assert agent.compressor is not None
-    agent.compressor.compress_every = 1
-    agent.compressor.keep_recent = 1
+    _ = agent.compressor.store
+    agent.compressor.compactor.policy = replace(agent.compressor.compactor.policy, keep_recent=2)
+    agent._context_window.output_token_reserve = 0
+    agent._context_window.safety_margin_tokens = 0
 
     result = agent.run("exercise memory output", max_steps=10)
     output = capsys.readouterr().out
@@ -625,7 +632,9 @@ def test_react_agent_keeps_plan_progress_out_of_model_messages():
     assert result["final_answer"] == "done"
     second_agent_request = client.requests[2][0]
     contents = [message["content"] for message in second_agent_request]
-    tool_index = next(index for index, content in enumerate(contents) if "执行工具 search_code" in content)
+    tool_index = next(
+        index for index, content in enumerate(contents) if "执行工具 search_code" in content
+    )
     assert tool_index >= 0
     assert not any(content.startswith("[plan]") for content in contents)
     assert result["metadata"]["plan_progress"]["satisfied"] == 1

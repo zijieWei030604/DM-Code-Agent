@@ -17,6 +17,7 @@ read_file 判成失败，白烧一次重规划。``is_failure_observation`` 因�
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from typing import Any
 
 from dm_agent.memory.context_budget import truncate_observation
@@ -125,9 +126,16 @@ def is_failure_observation(observation: str, *, action: str | None = None) -> bo
 class ObservationBounder:
     """按字符上限截断观察，并把截断事实记进 metadata 与 trace。"""
 
-    def __init__(self, *, max_chars: int, trace_writer: Any | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        max_chars: int,
+        trace_writer: Any | None = None,
+        preserve_output: Callable[[str, str], str] | None = None,
+    ) -> None:
         self.max_chars = max_chars
         self.trace_writer = trace_writer
+        self.preserve_output = preserve_output
 
     def bound(
         self,
@@ -159,4 +167,6 @@ class ObservationBounder:
                         "original_lines": result.original_lines,
                     },
                 )
+        if result.truncated and self.preserve_output is not None:
+            return self.preserve_output(str(observation), result.text)
         return result.text

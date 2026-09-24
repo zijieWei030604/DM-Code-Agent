@@ -132,6 +132,15 @@ CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
         "label": "Decision Evidence Graph",
         "help": "关联任务、计划、观察、修改、验证与结论，并输出可审计覆盖状态。",
     },
+    {
+        "flag": "--disable-repeat-call-redirect",
+        "key": "enable_repeat_call_redirect",
+        "kind": "bool",
+        "default": True,
+        "category": "behavior",
+        "label": "Repeat Call Redirect",
+        "help": "检测连续相同且无进展的工具调用，并在下一次请求前提示模型换路线。",
+    },
 )
 
 

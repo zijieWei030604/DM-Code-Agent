@@ -85,6 +85,37 @@ def test_usage_tracking_client_routes_through_retry_layer() -> None:
     assert wrapper.usage.request_count == 1
 
 
+def test_usage_tracking_client_forwards_summary_without_agent_calls() -> None:
+    class SummaryClient(FlakyClient):
+        def complete_summary(self, messages, *, max_tokens, timeout=60.0):
+            self.summary_request = (messages, max_tokens, timeout)
+            return {"text": "summary", "usage": {"total_tokens": 23}}
+
+    inner = SummaryClient(failures=0, retryable=False)
+    wrapper = UsageTrackingClient(inner)
+    messages = [{"role": "user", "content": "Summarize history"}]
+
+    data = wrapper.complete_summary(messages, max_tokens=77, timeout=12)
+
+    assert inner.summary_request == (messages, 77, 12)
+    assert wrapper.extract_text(data) == "summary"
+    assert data["usage"]["total_tokens"] == 23
+    assert inner.calls == 0
+    assert wrapper.usage.request_count == 0
+
+
+def test_usage_tracking_client_propagates_summary_errors() -> None:
+    class SummaryClient(FlakyClient):
+        def complete_summary(self, messages, *, max_tokens, timeout=60.0):
+            raise TimeoutError("summary timed out")
+
+    inner = SummaryClient(failures=0, retryable=False)
+    wrapper = UsageTrackingClient(inner)
+    with pytest.raises(TimeoutError, match="summary timed out"):
+        wrapper.complete_summary([], max_tokens=77)
+    assert inner.calls == 0
+
+
 def test_classify_retryable_exception_by_status_and_text() -> None:
     class WithStatus(Exception):
         status_code = 503

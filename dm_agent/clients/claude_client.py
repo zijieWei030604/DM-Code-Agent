@@ -43,6 +43,21 @@ class ClaudeClient(BaseLLMClient):
         # 官方 SDK 不需要手动设置 base_url
         self.client = anthropic.Anthropic(api_key=self.api_key)
 
+    def complete_summary(
+        self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+            "system": "\n".join(m["content"] for m in messages if m["role"] == "system"),
+            "messages": [m for m in messages if m["role"] != "system"],
+        }
+        response = self.client.with_options(timeout=timeout, max_retries=0).messages.create(
+            **request
+        )
+        return {"response": response}
+
     def complete(
         self,
         messages: list[dict[str, str]],

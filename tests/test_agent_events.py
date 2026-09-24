@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from dm_agent.core import EventBus, ReactAgent
 from dm_agent.core.events import AfterToolResultEvent
-from dm_agent.memory.context_compressor import Compaction, Mem0StyleMemory
 from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tracing import TraceWriter, load_trace_events
 
@@ -15,6 +15,12 @@ class FakeRespondClient:
     def __init__(self, responses):
         self.responses = list(responses)
         self.requests = []
+
+    def complete_summary(self, messages, **extra):
+        return {"text": "Retained historical facts."}
+
+    def extract_text(self, data):
+        return data["text"]
 
     def respond(self, messages, **extra):
         self.requests.append((messages, extra))
@@ -387,13 +393,11 @@ def test_on_run_end_retry_discards_sticky_compaction_from_failed_attempt():
         if event.attempt != 1:
             return None
         assert agent.compressor is not None
-        agent.compressor.accept_beneficial_compaction(
-            Compaction(
-                first_kept_index=1,
-                folded_indexes=(0,),
-                summary="<agent_memory>failed-attempt-only</agent_memory>",
-            )
+        memory = agent.compressor
+        node = memory.store.add_summary(
+            memory.branch, "failed-attempt-only", memory.history_ids[:1], metadata={"depth": 0}
         )
+        memory.frontier = [node, *memory.history_ids[1:]]
         return {"retry": True}
 
     bus.on("on_run_end", retry_with_failed_sticky, name="retry_with_failed_sticky")
@@ -405,25 +409,6 @@ def test_on_run_end_retry_discards_sticky_compaction_from_failed_attempt():
 
 
 def test_on_run_end_retry_restores_full_compressor_state_after_real_compaction():
-    class TrackingMemory(Mem0StyleMemory):
-        def __init__(self):
-            super().__init__()
-            self.render_count = 0
-
-        def render(self, query, **kwargs):
-            self.render_count += 1
-            return super().render(query, **kwargs)
-
-        def capture_rollback_state(self):
-            return {
-                "base": super().capture_rollback_state(),
-                "render_count": self.render_count,
-            }
-
-        def restore_rollback_state(self, state):
-            super().restore_rollback_state(state["base"])
-            self.render_count = state["render_count"]
-
     bus = EventBus()
     client = FakeRespondClient([_action("finish", "first"), _action("finish", "second")])
     agent = ReactAgent(
@@ -432,13 +417,14 @@ def test_on_run_end_retry_restores_full_compressor_state_after_real_compaction()
         enable_planning=False,
         enable_compression=True,
         event_bus=bus,
+        system_prompt="Complete the task.",
+        context_token_budget=500,
     )
     assert agent.compressor is not None
-    memory = TrackingMemory()
-    agent.compressor.memory = memory
-    agent.compressor.compress_every = 1
-    agent.compressor.keep_recent = 1
-    agent.compressor.token_budget = 0
+    _ = agent.compressor.store
+    agent.compressor.compactor.policy = replace(agent.compressor.compactor.policy, keep_recent=2)
+    agent._context_window.output_token_reserve = 0
+    agent._context_window.safety_margin_tokens = 0
     agent.conversation_history = [
         {
             "role": "user" if index % 2 == 0 else "assistant",
@@ -457,10 +443,12 @@ def test_on_run_end_retry_restores_full_compressor_state_after_real_compaction()
     first_request = client.requests[0][0]
     second_request = client.requests[1][0]
     assert result["final_answer"] == "second"
-    assert first_request == second_request
-    assert any(message["content"].startswith("<agent_memory>") for message in first_request[1:])
-    assert agent.compressor.export_state()["compression_count"] == 1
-    assert memory.render_count == 1
+    assert first_request[2:] == second_request[2:]
+    assert first_request[1]["content"].startswith("<historical_summary")
+    assert second_request[1]["content"].startswith("<historical_summary")
+    assert "first" not in str(second_request)
+    assert agent.compressor.memory_count == 1
+    assert len(agent.compressor.compactor.calls) == 1
 
 
 def test_run_hook_exception_is_isolated_and_traced(tmp_path):
@@ -493,7 +481,7 @@ def test_run_hook_exception_is_isolated_and_traced(tmp_path):
     assert hook_errors[0]["payload"]["hook"] == "on_run_end"
 
 
-def test_successful_tool_result_becomes_versioned_evidence_memory(tmp_path, monkeypatch):
+def test_tool_result_is_stored_with_its_runtime_call_not_heuristic_memory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
     client = FakeRespondClient(
@@ -520,8 +508,10 @@ def test_successful_tool_result_becomes_versioned_evidence_memory(tmp_path, monk
     agent.run("inspect app.py", max_steps=2)
 
     assert agent.compressor is not None
-    evidence = [item for item in agent.compressor.memory.items if item.source == "evidence"]
+    memory = agent.compressor
+    evidence = [memory.store.get(memory.branch, item) for item in memory.history_ids]
+    evidence = [item for item in evidence if item["metadata"]["kind"] == "tool_result"]
     assert len(evidence) == 1
-    assert evidence[0].metadata["files"] == ["app.py"]
-    assert evidence[0].workspace_version
-    assert evidence[0].source_event_id.endswith(":1")
+    assert "VALUE = 1" in evidence[0]["body"]
+    assert "app.py" in evidence[0]["body"]
+    assert evidence[0]["metadata"]["result_ids"]

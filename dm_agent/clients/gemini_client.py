@@ -40,6 +40,20 @@ class GeminiClient(BaseLLMClient):
         # 创建 genai 客户端实例
         self.client = genai.Client(api_key=self.api_key)
 
+    def complete_summary(
+        self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
+    ) -> dict[str, Any]:
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=self._convert_messages_to_contents(messages),
+            config={
+                "max_output_tokens": max_tokens,
+                "temperature": 0,
+                "http_options": {"timeout": int(timeout * 1000), "retry_options": {"attempts": 1}},
+            },
+        )
+        return {"response": response}
+
     def complete(
         self,
         messages: list[dict[str, str]],

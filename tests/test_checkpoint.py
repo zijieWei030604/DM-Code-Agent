@@ -16,10 +16,9 @@ from dm_agent.core.checkpoint import (
 from dm_agent.core.persistence import metadata_from_checkpoint
 from dm_agent.core.run_state import RunContext
 from dm_agent.memory import ContextCompressor
-from dm_agent.memory.context_budget import estimate_messages_tokens
-from dm_agent.memory.context_compressor import Compaction, apply_compaction
+from dm_agent.memory.context_compressor import Compaction
 from dm_agent.tools.base import Tool
-from dm_agent.tracing import TraceWriter, load_trace_events, rebuild_context
+from dm_agent.tracing import TraceWriter, load_trace_events
 
 
 class FakeRespondClient:
@@ -229,13 +228,11 @@ def test_resume_restores_compressor_memory(tmp_path):
         enable_compression=True,
     )
     assert agent.compressor is not None
-    agent.compressor.compress_every = 1
-    agent.compressor.keep_recent = 1
 
     agent.run("build up memory", max_steps=3, checkpoint_path=checkpoint_path)
     checkpoint = load_checkpoint(checkpoint_path)
     assert checkpoint.compressor_state is not None
-    saved_items = len(checkpoint.compressor_state["memory"]["items"])
+    saved_items = len(checkpoint.compressor_state["history_ids"])
     assert saved_items > 0
 
     resumed_agent = ReactAgent(
@@ -247,10 +244,11 @@ def test_resume_restores_compressor_memory(tmp_path):
     resumed_agent.run(checkpoint.task, max_steps=5, resume_state=checkpoint)
 
     assert resumed_agent.compressor is not None
-    assert resumed_agent.compressor.memory_count == saved_items
+    assert len(resumed_agent.compressor.history_ids) == saved_items + 2
+    assert resumed_agent.compressor.branch != checkpoint.compressor_state["branch"]
 
 
-def test_resume_restores_sticky_compaction_and_reuses_it_for_the_next_request(tmp_path):
+def test_resume_rejects_legacy_atomic_memory_checkpoint(tmp_path):
     trace_path = tmp_path / "sticky-trace.jsonl"
     history = [
         {
@@ -288,23 +286,10 @@ def test_resume_restores_sticky_compaction_and_reuses_it_for_the_next_request(tm
         trace_writer=writer,
     )
 
-    agent.run(loaded.task, max_steps=2, resume_state=loaded)
+    with pytest.raises(ValueError, match="Legacy atomic-memory"):
+        agent.run(loaded.task, max_steps=2, resume_state=loaded)
     writer.close()
-
-    assert agent.compressor is not None
-    assert agent.compressor.last_beneficial_compaction == sticky
-    assert client.requests[0][1:] == apply_compaction(history, sticky)
-    events = load_trace_events(trace_path)
-    compaction = next(event for event in events if event["event"] == "compaction")
-    payload = compaction["payload"]
-    assert payload["phase"] == "sticky_reuse"
-    assert payload["trigger"] == "sticky_reuse"
-    assert payload["estimated_tokens_before"] == estimate_messages_tokens(history)
-    assert payload["estimated_tokens_after"] == estimate_messages_tokens(
-        apply_compaction(history, sticky)
-    )
-    assert payload["memory_items"] == agent.compressor.memory_count
-    assert rebuild_context(events, until_entry_id=compaction["id"]) == client.requests[0][1:]
+    assert client.requests == []
 
 
 def test_resume_without_compressor_state_clears_existing_compressor_state():
@@ -321,19 +306,14 @@ def test_resume_without_compressor_state_clears_existing_compressor_state():
         enable_compression=True,
     )
     assert agent.compressor is not None
-    agent.compressor.memory.add("stale memory")
-    agent.compressor.accept_beneficial_compaction(
-        Compaction(
-            first_kept_index=1,
-            folded_indexes=(0,),
-            summary="<agent_memory>stale</agent_memory>",
-        )
-    )
+    agent.compressor.append("user", "stale memory", kind="task")
+    stale_branch = agent.compressor.branch
 
     agent.run(checkpoint.task, max_steps=1, resume_state=checkpoint)
 
     assert agent.compressor.memory_count == 0
-    assert agent.compressor.last_beneficial_compaction is None
+    assert agent.compressor.branch != stale_branch
+    assert agent.compressor.store.search(agent.compressor.branch, "stale memory") == []
 
 
 def test_resume_restores_plan(tmp_path):
