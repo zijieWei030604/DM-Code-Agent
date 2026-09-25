@@ -10,31 +10,40 @@ from dm_agent.core.evidence import EvidenceGraph
 
 def rebuild_evidence_graph(events: Sequence[Mapping[str, Any]]) -> EvidenceGraph:
     """Rebuild the latest evidence graph from append-only trace events."""
-    nodes = []
-    edges = []
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, Any]] = []
     task = ""
+    snapshot_version = ""
     for event in events:
         name = event.get("event")
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
             continue
-        if name == "run_start":
+        if name == "evidence_graph_started":
+            nodes = []
+            edges = []
+            snapshot_version = str(payload.get("workspace_version", ""))
+            task = str(payload.get("task", ""))
+        elif name == "evidence_snapshot":
+            nodes = list(payload.get("nodes", []))
+            edges = list(payload.get("edges", []))
+            task = str(payload.get("task", ""))
+            snapshot_version = str(payload.get("workspace_version", ""))
+        elif name == "run_start":
             task = str(payload.get("task", task))
         elif name == "evidence_node":
             nodes.append(dict(payload))
+            if payload.get("kind") in {"change", "verification", "conclusion"}:
+                metadata = payload.get("metadata", {})
+                version = metadata.get("after_version") or metadata.get("workspace_version")
+                if version:
+                    snapshot_version = str(version)
+        elif name == "evidence_check_unavailable" and payload.get("workspace_version"):
+            snapshot_version = str(payload["workspace_version"])
         elif name == "evidence_edge":
             edges.append(dict(payload))
     graph = EvidenceGraph.from_dict({"task": task, "nodes": nodes, "edges": edges})
-    versioned = [
-        node
-        for node in graph.nodes.values()
-        if node.kind in {"change", "verification"} and node.step_number is not None
-    ]
-    if versioned:
-        latest = max(versioned, key=lambda node: node.step_number or 0)
-        graph.workspace_version = str(
-            latest.metadata.get("after_version") or latest.metadata.get("workspace_version") or ""
-        )
+    graph.workspace_version = snapshot_version
     return graph
 
 

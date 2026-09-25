@@ -216,6 +216,12 @@ def _analysis_for_trace(*, verified: bool) -> dict[str, Any]:
             "replanned_after_failure": False,
             "recovered": False,
         },
+        "planning": {
+            "mode": "",
+            "update_count": 0,
+            "latest": {},
+            "status_source": "model_reported",
+        },
         "verification": {
             "actions": ([{"step_number": 1, "action": "run_tests"}] if verified else []),
             "count": 1 if verified else 0,

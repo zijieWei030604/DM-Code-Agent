@@ -27,7 +27,6 @@ from .events import (
     RunEndEvent,
     RunStartEvent,
 )
-from .evidence import plan_snapshot
 from .guards import ReadBeforeEditGuard
 from .lcm_context_window import LCMContextWindow
 from .lcm_memory import LCMMemory
@@ -37,20 +36,14 @@ from .persistence import (
     agent_config_snapshot,
     json_safe_metadata,
     metadata_from_checkpoint,
-    plan_from_checkpoint,
-    plan_to_checkpoint,
     steps_from_checkpoint,
     warn_on_config_mismatch,
 )
-from .plan_progress import (
-    PlanProgressTracker,
-    summarize_plan,
-)
-from .planner import AdaptiveReplanPolicy, PlanStep, TaskPlanner
+from .planner import AdaptiveReplanPolicy
 from .prompting import build_user_prompt
-from .replan import FailureContext, ReplanCoordinator
 from .response_parser import normalize_action, parse_agent_response
 from .run_state import RunContext, Step, initial_run_metadata
+from .task_plan import TaskPlan
 from .tool_invoker import ToolInvoker
 
 __all__ = ["ReactAgent", "Step"]
@@ -90,15 +83,12 @@ class ReactAgent:
     - ``core.response_parser``：容错解析模型响应
     - ``core.tool_invoker``：工具调用链（校验 → 钩子 → 备份 → 执行 → 截断）
     - ``core.completion``：完成判定与结果格式化
-    - ``core.replan``：失败后的重规划与失败签名
+    - ``core.task_plan``：模型通过工具维护的任务清单
     - ``core.persistence``：checkpoint 存取与写前备份
 
     可选能力（熔断等）不住在这里，而是通过 ``core.events``
     的生命周期钩子接入，见 ``core.capabilities``。
     """
-
-    # 非 adaptive 默认路径的 replan 成本护栏（max_replans>=0 时以其为准）。
-    DEFAULT_REPLAN_BUDGET = 5
 
     def __init__(
         self,
@@ -159,7 +149,7 @@ class ReactAgent:
         self._completion_gate = CompletionGate(self.event_bus, on_error=self._record_hook_error)
 
         self.tools = {tool.name: tool for tool in tools}
-        self.tools_list = tools  # 保留工具列表用于规划器
+        self.tools_list = tools
         self.max_steps = max_steps
         self.temperature = temperature
         self.native_tool_calling = bool(getattr(client, "supports_tool_calling", False))
@@ -170,10 +160,13 @@ class ReactAgent:
         # 多轮对话历史记录
         self.conversation_history: list[dict[str, str]] = []
 
-        # 规划器
+        # Task-scoped checklist, updated by the same ReAct loop.
         self.enable_planning = enable_planning
-        self.planner = TaskPlanner(client_for("planner"), tools) if enable_planning else None
-        self._plan_progress = PlanProgressTracker()
+        self.task_plan = TaskPlan(self.trace_writer)
+        if enable_planning:
+            if "update_plan" in self.tools:
+                raise ValueError("update_plan is reserved for the task checklist.")
+            self.tools["update_plan"] = self.task_plan.tool()
 
         # LCM owns history storage and tool-free summary calls; zero disables compaction.
         self.enable_compression = enable_compression
@@ -190,7 +183,7 @@ class ReactAgent:
         if self.compressor:
             memory_tools = self.compressor.tools()
             self.tools.update({tool.name: tool for tool in memory_tools})
-            self.tools_list = [*tools, *memory_tools]
+            self.tools_list = list(self.tools.values())
             if system_prompt is None:
                 self.system_prompt = build_code_agent_prompt(
                     self.tools_list, native_tool_calling=self.native_tool_calling
@@ -225,17 +218,25 @@ class ReactAgent:
         self._repo_map = (repository_map or RepositoryMap()) if enable_repo_map else None
         # 技能管理器
         self.skill_manager = skill_manager
+        self.tools_list = list(self.tools.values())
+        if enable_planning:
+            self.system_prompt += (
+                "\nUse update_plan for complex tasks when useful. Update progress yourself; "
+                "tool success does not automatically complete a goal. Plan completion does "
+                "not establish correctness. Follow actual observations and update the plan "
+                "when the route changes. Previous tasks' plans are historical only.\n"
+            )
+            if not self.native_tool_calling and (system_prompt is not None or not self.compressor):
+                self.system_prompt += json.dumps(
+                    self.task_plan.tool().function_definition(), ensure_ascii=False
+                )
         self._base_system_prompt = self.system_prompt
         self._base_tools = dict(self.tools)
-        self.enable_adaptive_replanning = enable_adaptive_replanning
-        self.replan_policy = replan_policy or AdaptiveReplanPolicy()
-        self.max_replans = max_replans
-        self._replan_coordinator = ReplanCoordinator(
-            planner=self.planner,
-            policy=self.replan_policy,
-            trace_writer=self.trace_writer,
-            adaptive=enable_adaptive_replanning,
-            max_replans=max_replans,
+        # Legacy constructor arguments remain accepted, but never start another LLM loop.
+        self.enable_adaptive_replanning = False
+        self.max_replans = 0
+        self._legacy_replan_options = (
+            enable_adaptive_replanning or replan_policy is not None or max_replans != -1
         )
 
         # 可选能力装配：注册顺序即钩子执行顺序，能力先于内核内置守卫注册。
@@ -278,7 +279,7 @@ class ReactAgent:
             raise ValueError("任务必须是非空字符串。")
         if (
             checkpoint_path is not None or resume_state is not None
-        ) and self.event_bus.has_handlers("on_run_end"):
+        ) and self.event_bus.has_retry_handlers():
             raise ValueError("checkpoint/resume 暂不支持与 on_run_end 重试同时使用。")
 
         initial_history = [dict(message) for message in self.conversation_history]
@@ -411,7 +412,7 @@ class ReactAgent:
         if checkpoint_path is not None:
             self._persistence.prepare_session_checkpoint(checkpoint_path)
         self._edit_guard.reset()
-        self._plan_progress.begin(Path.cwd())
+        self.task_plan.reset()
         run_token = getattr(self.trace_writer, "run_id", "") or uuid.uuid4().hex[:12]
         retry_baseline = getattr(self.client, "total_respond_retries", 0)
         self._context_window.reset()
@@ -426,6 +427,8 @@ class ReactAgent:
         )
         metadata.update(
             {
+                "planning_mode": "model_checklist" if self.enable_planning else "disabled",
+                "legacy_replan_options_ignored": self._legacy_replan_options,
                 "repo_map_enabled": self.enable_repo_map,
                 "repo_map_files": 0,
                 "repo_map_chars": 0,
@@ -445,10 +448,9 @@ class ReactAgent:
         prompt_suffix = self.event_bus.emit_run_start(start_event, on_error=self._record_hook_error)
 
         # resume 必须先恢复持久化状态，再落 trace 的 run_start。
-        plan: list[PlanStep] = []
         resume_from = 0
         if resume_state is not None:
-            plan, resume_from = self._restore_from_checkpoint(resume_state, steps, metadata)
+            resume_from = self._restore_from_checkpoint(resume_state, steps, metadata)
 
         if self.trace_writer:
             self.trace_writer.start_run(
@@ -457,6 +459,10 @@ class ReactAgent:
                     "max_steps": limit,
                     "temperature": self.temperature,
                     "planning_enabled": self.enable_planning,
+                    "planning_mode": "model_checklist" if self.enable_planning else "disabled",
+                    "plan": self.task_plan.items,
+                    "plan_scope": self.task_plan.scope,
+                    "plan_revision": self.task_plan.revision,
                     "compression_enabled": self.enable_compression,
                     "max_observation_chars": self.max_observation_chars,
                     "context_token_budget": self.context_token_budget,
@@ -474,6 +480,10 @@ class ReactAgent:
             )
 
         def finish_result(final_answer: str) -> dict[str, Any]:
+            metadata["plan_revision"] = self.task_plan.revision
+            metadata["plan_scope"] = self.task_plan.scope
+            metadata["plan"] = self.task_plan.items
+            metadata["plan_status_source"] = "model_reported"
             metadata["llm_retry_count"] = (
                 getattr(self.client, "total_respond_retries", 0) - retry_baseline
             )
@@ -519,7 +529,7 @@ class ReactAgent:
                         },
                     )
 
-        # 第一步：生成计划（如果启用）；resume 时改为恢复既有状态
+        # Resume restores the checklist; new tasks let ReAct plan through update_plan.
         if resume_state is not None:
             self._adopt_existing_history(kind="resumed")
             if self.trace_writer:
@@ -530,27 +540,10 @@ class ReactAgent:
             print(f"[resume] 已恢复 checkpoint，从第 {resume_from + 1} 步继续执行")
         else:
             self._adopt_existing_history(kind="carried")
-            if self.enable_planning and self.planner:
-                try:
-                    planning_task = task
-                    if repo_map_result.content:
-                        planning_task += "\n\n" + repo_map_result.content
-                    plan = self.planner.plan(planning_task)
-                    metadata["initial_plan_steps"] = len(plan)
-                    if self.trace_writer:
-                        self.trace_writer.record_plan(plan)
-                    if plan:
-                        plan_text = self.planner.get_progress()
-                        print(f"\n[plan] 生成的执行计划：\n{plan_text}")
-                except Exception as e:
-                    if self.trace_writer:
-                        self.trace_writer.record_plan_error(str(e))
-                    print(f"[warn] 计划生成失败：{e}，将使用常规模式执行")
-
             # 添加新任务到对话历史
             task_prompt: str = build_user_prompt(
                 task,
-                plan,
+                [],
                 repository_map=repo_map_result.content,
                 native_tool_calling=self.native_tool_calling,
             )
@@ -567,7 +560,6 @@ class ReactAgent:
                     step_count=step_num - 1,
                     steps=steps,
                     metadata=metadata,
-                    plan=plan,
                     limit=limit,
                 )
             # 第二步：整理旧上下文为本地记忆（如果需要）
@@ -578,7 +570,7 @@ class ReactAgent:
             )
             try:
                 messages_to_send = self._context_window.build_messages(
-                    self.system_prompt,
+                    self.system_prompt + (self.task_plan.context() if self.enable_planning else ""),
                     self.conversation_history,
                     context=self._run_context,
                     tool_definitions=tool_definitions,
@@ -752,18 +744,6 @@ class ReactAgent:
                 # 将错误观察添加到历史记录
                 self._note_observation(observation)
                 self._publish_step(step, step_num)
-                if plan and self.planner:
-                    plan = self._replan_after_failure(
-                        task,
-                        plan,
-                        metadata,
-                        FailureContext(
-                            observation=observation,
-                            action="error",
-                            step_number=step_num,
-                            error_kind="parse_error",
-                        ),
-                    )
                 continue
             self._append_history("assistant", raw, kind="model_response")
             parsed = parsed_response.data
@@ -806,17 +786,6 @@ class ReactAgent:
                 steps.append(step)
 
                 if accepted:
-                    self._update_plan_progress(
-                        plan,
-                        action=action,
-                        result=None,
-                        observation=final,
-                        accepted_completion=True,
-                        no_progress=False,
-                        tool_succeeded=True,
-                        metadata=metadata,
-                        runtime_step=step_num,
-                    )
                     metadata["status"] = "success"
                     metadata["failure_reason"] = ""
                     metadata["duration_seconds"] = time.perf_counter() - started_at
@@ -833,18 +802,6 @@ class ReactAgent:
                     metadata["failure_reason"] = observation
                     metadata["duration_seconds"] = time.perf_counter() - started_at
                     return finish_result("")
-                if plan and self.planner:
-                    plan = self._replan_after_failure(
-                        task,
-                        plan,
-                        metadata,
-                        FailureContext(
-                            observation=observation,
-                            action=action,
-                            step_number=step_num,
-                            error_kind="critic_rejected",
-                        ),
-                    )
                 continue
 
             # 检查工具
@@ -876,18 +833,6 @@ class ReactAgent:
                         failed=True,
                     )
                     self.trace_writer.record_step(step_number=step_num, step=step)
-                if plan and self.planner:
-                    plan = self._replan_after_failure(
-                        task,
-                        plan,
-                        metadata,
-                        FailureContext(
-                            observation=observation,
-                            action=action,
-                            step_number=step_num,
-                            error_kind="unknown_tool",
-                        ),
-                    )
                 continue
 
             invocation = self._tool_invoker.invoke(
@@ -898,11 +843,6 @@ class ReactAgent:
             )
             action_input = invocation.arguments
             observation = invocation.observation
-            error_kind = invocation.error_kind
-            # ``no_change`` 是显式的“预期效果未发生”信号，不是“工具只读”。
-            no_progress = (
-                invocation.blocked or invocation.no_change or not invocation.tool_succeeded
-            )
             invocation_failed = (
                 invocation.result.status == "failed"
                 if invocation.result is not None
@@ -918,7 +858,6 @@ class ReactAgent:
                     context=self._run_context,
                 )
                 if not accepted:
-                    error_kind = "critic_rejected"
                     invocation_failed = True
 
             step = Step(
@@ -938,19 +877,6 @@ class ReactAgent:
                     failed=invocation_failed,
                 )
 
-            self._update_plan_progress(
-                plan,
-                action=action,
-                result=invocation.result,
-                observation=observation,
-                accepted_completion=accepted,
-                no_progress=no_progress,
-                tool_succeeded=invocation.tool_succeeded,
-                metadata=metadata,
-                runtime_step=step_num,
-                fact=invocation.fact,
-            )
-
             # 将工具执行结果添加到历史记录
             tool_info = f"执行工具 {action}，输入：{json.dumps(action_input, ensure_ascii=False)}\n观察：{observation}"
             self._append_history("user", tool_info, kind="tool_result")
@@ -963,25 +889,6 @@ class ReactAgent:
                 metadata["failure_reason"] = observation
                 metadata["duration_seconds"] = time.perf_counter() - started_at
                 return finish_result("")
-
-            if invocation_failed and plan and self.planner:
-                plan = self._replan_after_failure(
-                    task,
-                    plan,
-                    metadata,
-                    FailureContext(
-                        observation=observation,
-                        action=action,
-                        step_number=step_num,
-                        error_kind=error_kind or None,
-                        tool_status=(invocation.result.status if invocation.result else ""),
-                        verification=(
-                            invocation.result.metadata.get("verification")
-                            if invocation.result and isinstance(invocation.result.metadata, dict)
-                            else None
-                        ),
-                    ),
-                )
 
             # 检查是否调用了 task_complete 工具
             if (
@@ -1005,53 +912,9 @@ class ReactAgent:
                 step_count=limit,
                 steps=steps,
                 metadata=metadata,
-                plan=plan,
                 limit=limit,
             )
         return finish_result("Reached step limit without completion.")
-
-    def _update_plan_progress(
-        self,
-        plan: list[PlanStep],
-        *,
-        action: str,
-        result: Any,
-        observation: str,
-        accepted_completion: bool,
-        no_progress: bool,
-        tool_succeeded: bool,
-        metadata: dict[str, Any],
-        runtime_step: int,
-        fact: Any = None,
-    ) -> None:
-        """Project one runtime outcome onto plan phases and preserve an audit trail."""
-        if not plan or not self.planner:
-            return
-        preferred = {
-            tool for step in plan if step.status != "satisfied" for tool in step.preferred_tools
-        }
-        if action not in preferred and action not in {"finish", "task_complete"}:
-            metadata["plan_tool_deviation_count"] = (
-                int(metadata.get("plan_tool_deviation_count", 0)) + 1
-            )
-        changes = self._plan_progress.observe(
-            plan,
-            action=action,
-            result=result,
-            observation=observation,
-            accepted_completion=accepted_completion,
-            no_progress=no_progress,
-            tool_succeeded=tool_succeeded,
-            step_number=runtime_step,
-            fact=fact,
-        )
-        for change in changes:
-            metadata["plan_progress_event_count"] = (
-                int(metadata.get("plan_progress_event_count", 0)) + 1
-            )
-            if self.trace_writer:
-                self.trace_writer.record("plan_progress", change.to_dict())
-        metadata["plan_progress"] = summarize_plan(plan)
 
     def _apply_skills_for_task(self, task: str) -> list[str]:
         """根据任务自动选择技能，并把增量合并进本轮的 prompt 与工具表。"""
@@ -1096,16 +959,17 @@ class ReactAgent:
         resume_state: RunCheckpoint,
         steps: list[Step],
         metadata: dict[str, Any],
-    ) -> tuple[list[PlanStep], int]:
-        """从 checkpoint 恢复对话/步骤/计划/记忆，返回 (plan, 已消耗步数)。"""
+    ) -> int:
+        """Restore checkpoint state and return the consumed step count."""
         resume_from = max(0, int(resume_state.step_count))
         self.conversation_history = [dict(message) for message in resume_state.conversation_history]
         steps.extend(steps_from_checkpoint(resume_state.steps))
         metadata.update(metadata_from_checkpoint(resume_state.metadata, resume_from=resume_from))
 
-        plan = plan_from_checkpoint(resume_state.plan)
-        if plan and self.planner:
-            self.planner.current_plan = plan
+        if resume_state.plan_state is not None:
+            self.task_plan.restore(resume_state.plan_state)
+        elif resume_state.plan:
+            raise ValueError("Legacy phase plans cannot be resumed as model-managed checklists.")
         if self.compressor:
             if resume_state.compressor_state is None:
                 # 老 checkpoint 没有压缩器字段；checkpoint 是权威状态，不能沿用当前
@@ -1115,7 +979,7 @@ class ReactAgent:
                 self.compressor.restore_state(resume_state.compressor_state)
         self._restore_capability_state(resume_state.capability_state)
         warn_on_config_mismatch(resume_state.agent_config, self._config_snapshot())
-        return plan, resume_from
+        return resume_from
 
     def _save_checkpoint_snapshot(
         self,
@@ -1125,7 +989,6 @@ class ReactAgent:
         step_count: int,
         steps: list[Step],
         metadata: dict[str, Any],
-        plan: list[PlanStep],
         limit: int,
     ) -> None:
         """把当前 run 的可恢复状态组装成快照并落盘。"""
@@ -1135,7 +998,8 @@ class ReactAgent:
             conversation_history=[dict(message) for message in self.conversation_history],
             steps=[dict(step.__dict__) for step in steps],
             metadata=json_safe_metadata({**metadata, "run_id": self._run_context.run_id}),
-            plan=plan_to_checkpoint(plan),
+            plan=self.task_plan.items,
+            plan_state=self.task_plan.snapshot(),
             compressor_state=self.compressor.export_state() if self.compressor else None,
             capability_state=self._export_capability_state(),
             agent_config=self._config_snapshot(max_steps=limit),
@@ -1145,8 +1009,11 @@ class ReactAgent:
 
     def _capability_run_state(self) -> dict[str, Any]:
         """Return a narrow read-only state view for optional capabilities."""
-        plan = self.planner.current_plan if self.planner else []
-        return {"plan": plan_snapshot(plan)}
+        return {
+            "plan": self.task_plan.items,
+            "plan_scope": self.task_plan.scope,
+            "plan_revision": self.task_plan.revision,
+        }
 
     def _export_capability_state(self) -> dict[str, Any]:
         state: dict[str, Any] = {}
@@ -1170,31 +1037,13 @@ class ReactAgent:
         """委托到 ``core.observation``，让内核外的能力复用同一份失败判定。"""
         return is_failure_observation(observation, action=action)
 
-    def _replan_after_failure(
-        self,
-        task: str,
-        plan: list[PlanStep],
-        metadata: dict[str, Any],
-        failure: FailureContext,
-    ) -> list[PlanStep]:
-        """失败后尝试重规划；新计划生效时把恢复提示追加进对话历史。"""
-        outcome = self._replan_coordinator.try_replan(
-            task,
-            plan,
-            failure,
-            metadata,
-            default_budget=self.DEFAULT_REPLAN_BUDGET,
-        )
-        if outcome.history_note:
-            self._append_history("user", outcome.history_note, kind="replan_note")
-        return outcome.plan
-
     def reset_conversation(self) -> None:
         """重置对话历史
 
         清空所有对话历史记录，为新任务做准备。
         """
         self.conversation_history = []
+        self.task_plan.reset()
         self._run_context.history_entry_ids.clear()
         if self.compressor:
             self.compressor.reset()

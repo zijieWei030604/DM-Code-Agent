@@ -59,6 +59,7 @@ class EvidenceGraphCapability:
         self._last_contradiction_signature = ""
         self._last_unverified_pause_signature = ""
         self._last_no_net_change_signature = ""
+        self._call_plans: dict[int, str] = {}
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -79,7 +80,9 @@ class EvidenceGraphCapability:
             name="evidence.before_finish",
             kind="policy",
         )
-        context.event_bus.on("on_run_end", self._on_run_end, name="evidence.run_end")
+        context.event_bus.on(
+            "on_run_end", self._on_run_end, name="evidence.run_end", kind="observer"
+        )
 
     def export_state(self) -> dict[str, Any]:
         return {
@@ -91,27 +94,33 @@ class EvidenceGraphCapability:
         }
 
     def restore_state(self, state: Mapping[str, Any]) -> None:
-        graph_state = state.get("graph") if isinstance(state.get("graph"), Mapping) else state
+        saved_graph = state.get("graph")
+        graph_state = saved_graph if isinstance(saved_graph, Mapping) else state
         self.graph = EvidenceGraph.from_dict(graph_state)
-        self._last_contradiction_signature = str(
-            state.get("last_contradiction_signature", "")
-        )
+        self._record_event("evidence_snapshot", self.graph.to_dict())
+        self._last_contradiction_signature = str(state.get("last_contradiction_signature", ""))
         self._last_unverified_pause_signature = str(
             state.get("last_unverified_pause_signature", "")
         )
         self._initial_workspace_version = str(state.get("initial_workspace_version", ""))
-        self._last_no_net_change_signature = str(
-            state.get("last_no_net_change_signature", "")
-        )
+        self._last_no_net_change_signature = str(state.get("last_no_net_change_signature", ""))
 
     def _on_run_start(self, event: RunStartEvent) -> None:
         nodes, edges = self.graph.start(event.task)
         self._workspace_root = Path.cwd()
         self.graph.workspace_version = workspace_version(self._workspace_root)
+        self._record_event(
+            "evidence_graph_started",
+            {
+                "task": event.task,
+                "workspace_version": self.graph.workspace_version,
+            },
+        )
         self._initial_workspace_version = self.graph.workspace_version
         self._verification_versions.clear()
         self._write_versions.clear()
         self._write_basis_kinds.clear()
+        self._call_plans.clear()
         self._last_contradiction_signature = ""
         self._last_unverified_pause_signature = ""
         self._last_no_net_change_signature = ""
@@ -134,6 +143,8 @@ class EvidenceGraphCapability:
         )
 
     def _before_tool_call(self, event: BeforeToolCallEvent) -> None:
+        self._sync_plan()
+        self._call_plans[event.step_number] = self.graph.current_plan_id
         if _is_verification_action(event.tool_name, event.arguments):
             self._verification_versions[event.step_number] = workspace_version(self._workspace_root)
         if event.tool_name in WRITE_ACTIONS:
@@ -142,6 +153,8 @@ class EvidenceGraphCapability:
 
     def _after_tool_result(self, event: AfterToolResultEvent) -> None:
         self._sync_plan()
+        # Associate with the plan revision at call START, including plan-changing tools.
+        self.graph.current_plan_id = self._call_plans.pop(event.step_number, "")
         fact = event.execution_fact
         phase = fact.phase if fact is not None else ""
         if fact is not None and fact.fact_type != "other":
@@ -150,15 +163,14 @@ class EvidenceGraphCapability:
         nodes: list[EvidenceNode] = []
         edges: list[EvidenceEdge] = []
         if event.tool_name in READ_ACTIONS:
-            if event.tool_succeeded:
-                nodes, edges = self.graph.add_observation(
-                    tool=event.tool_name,
-                    path=path,
-                    step_number=event.step_number,
-                    succeeded=True,
-                    workspace_version=workspace_version(self._workspace_root),
-                    phase=phase,
-                )
+            nodes, edges = self.graph.add_observation(
+                tool=event.tool_name,
+                path=path,
+                step_number=event.step_number,
+                succeeded=event.tool_succeeded,
+                workspace_version=workspace_version(self._workspace_root),
+                phase=phase,
+            )
         elif event.tool_name in WRITE_ACTIONS:
             if event.has_effect and not event.no_change:
                 prior_checks = bool(self.graph.current_verifications())
@@ -203,8 +215,18 @@ class EvidenceGraphCapability:
             if before != self.graph.workspace_version:
                 self._record_event(
                     "evidence_check_unavailable",
-                    {"tool": event.tool_name, "status": "workspace_changed_during_check"},
+                    {
+                        "tool": event.tool_name,
+                        "status": "workspace_changed_during_check",
+                        "workspace_version": self.graph.workspace_version,
+                    },
                 )
+                nodes, edges = self.graph.add_execution(
+                    tool=event.tool_name,
+                    step_number=event.step_number,
+                    succeeded=event.tool_succeeded,
+                )
+                self._record(nodes, edges)
                 return
             verification = _verification_result(event)
             passed = verification["outcome"] == "passed"
@@ -245,6 +267,12 @@ class EvidenceGraphCapability:
                 phase=phase,
                 scope_level=str(verification["scope_level"]),
             )
+        if not nodes:
+            nodes, edges = self.graph.add_execution(
+                tool=event.tool_name,
+                step_number=event.step_number,
+                succeeded=event.tool_succeeded,
+            )
         if nodes or edges:
             self._record(nodes, edges)
             self._update_metadata(event.metadata)
@@ -254,9 +282,9 @@ class EvidenceGraphCapability:
         self._sync_plan()
         decision = self.completion_policy.evaluate(
             self.graph,
-            verified_transaction=str(
-                event.metadata.get("edit_transaction_status", "")
-            ).startswith("committed"),
+            verified_transaction=str(event.metadata.get("edit_transaction_status", "")).startswith(
+                "committed"
+            ),
         )
         no_net_change_signature = self._no_net_change_signature()
         if (
@@ -390,13 +418,8 @@ class EvidenceGraphCapability:
                 int(event.metadata.get("evidence_intervention_prompt_count", 0)) + 1
             )
         else:
-            reason = (
-                "Completion rejected: the same explicit verification failure is still present."
-            )
-        terminal = (
-            self.repeated_contradiction == "critic_rejected"
-            and repeated
-        )
+            reason = "Completion rejected: the same explicit verification failure is still present."
+        terminal = self.repeated_contradiction == "critic_rejected" and repeated
         if terminal:
             event.metadata["evidence_terminal_completion_rejection"] = True
             event.metadata["evidence_terminal_rejection_count"] = (
@@ -489,9 +512,7 @@ class EvidenceGraphCapability:
         event.metadata.update(
             {
                 "evidence_completion_attempts": audit["completion_attempts"],
-                "evidence_rejected_completion_attempts": audit[
-                    "rejected_completion_attempts"
-                ],
+                "evidence_rejected_completion_attempts": audit["rejected_completion_attempts"],
             }
         )
         self._record_event("evidence_summary", audit)
@@ -506,7 +527,12 @@ class EvidenceGraphCapability:
         if not isinstance(raw_plan, list):
             return
         plan = [item for item in raw_plan if isinstance(item, Mapping)]
-        nodes, edges = self.graph.sync_plan(plan)
+        if "plan_scope" in state:
+            nodes, edges = self.graph.sync_checklist(
+                plan, scope=str(state["plan_scope"]), revision=int(state.get("plan_revision", 0))
+            )
+        else:
+            nodes, edges = self.graph.sync_plan(plan)
         self._record(nodes, edges)
 
     def _update_metadata(
@@ -587,8 +613,7 @@ def _completion_block_reason(issues: list[dict[str, str]]) -> str:
 def _verification_state(graph: EvidenceGraph) -> str:
     checks = graph.current_verifications()
     if any(
-        not bool(node.metadata.get("passed"))
-        and bool(node.metadata.get("blocking", False))
+        not bool(node.metadata.get("passed")) and bool(node.metadata.get("blocking", False))
         for node in checks
     ):
         return "contradicted"
@@ -604,8 +629,7 @@ def _completion_intervention_reason(graph: EvidenceGraph, issues: list[dict[str,
     failed_checks = [
         node
         for node in graph.current_verifications()
-        if not bool(node.metadata.get("passed"))
-        and bool(node.metadata.get("blocking", False))
+        if not bool(node.metadata.get("passed")) and bool(node.metadata.get("blocking", False))
     ]
     lines = ["Completion blocked by evidence policy."]
     if paths:
@@ -659,9 +683,7 @@ def _verification_result(event: AfterToolResultEvent) -> dict[str, Any]:
             "scope_level": str(raw.get("scope_level", "related")),
         }
 
-    passed = (
-        event.result.status == "success" if event.result is not None else event.tool_succeeded
-    )
+    passed = event.result.status == "success" if event.result is not None else event.tool_succeeded
     return {
         "execution_status": "completed" if passed else "unavailable",
         "outcome": "passed" if passed else "unknown",
@@ -723,17 +745,56 @@ def _path_requires_verification(path: str) -> bool:
     normalized = path.replace("\\", "/").lower()
     name = Path(normalized).name
     if Path(normalized).suffix in {
-        ".md", ".rst", ".txt", ".adoc", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+        ".md",
+        ".rst",
+        ".txt",
+        ".adoc",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
     }:
         return False
     if name in {
-        "pyproject.toml", "setup.cfg", "setup.py", "tox.ini", "package.json",
-        "dockerfile", "makefile", "requirements.txt",
+        "pyproject.toml",
+        "setup.cfg",
+        "setup.py",
+        "tox.ini",
+        "package.json",
+        "dockerfile",
+        "makefile",
+        "requirements.txt",
     }:
         return True
     return Path(normalized).suffix in {
-        ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".go",
-        ".rs", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php",
-        ".swift", ".scala", ".sh", ".ps1", ".toml", ".yaml", ".yml", ".json",
-        ".ini", ".cfg", ".xml",
+        ".py",
+        ".pyi",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".java",
+        ".kt",
+        ".go",
+        ".rs",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".cs",
+        ".rb",
+        ".php",
+        ".swift",
+        ".scala",
+        ".sh",
+        ".ps1",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".ini",
+        ".cfg",
+        ".xml",
     }

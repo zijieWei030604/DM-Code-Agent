@@ -433,7 +433,11 @@ function PlanPanel({ summary, className = '' }: { summary: SessionSummary; class
       ) : (
         <ol className="divide-y divide-line">
           {summary.plan_steps.map((step, index) => {
-            const ran = step.action ? executed.has(step.action) : false
+            const reported = step.status_source === 'model_reported'
+            const ran = reported ? step.completed : !!step.action && executed.has(step.action)
+            const statusText = reported
+              ? { pending: '待处理', in_progress: '进行中', completed: '模型报告完成' }[step.status ?? 'pending']
+              : ran ? '执行链里出现过这个动作' : '计划里有，但执行链里没出现'
             return (
               <li key={index} className="px-5 py-3">
                 <div className="flex items-center gap-2.5">
@@ -441,12 +445,13 @@ function PlanPanel({ summary, className = '' }: { summary: SessionSummary; class
                     className={`inline-block size-1.5 shrink-0 rounded-full ${
                       ran ? 'bg-green' : 'border border-line-strong bg-surface'
                     }`}
-                    title={ran ? '执行链里出现过这个动作' : '计划里有，但执行链里没出现'}
+                    title={statusText}
                   />
                   <span className="tabular-nums text-micro text-ink-4">
                     {step.step_number ?? index + 1}
                   </span>
                   <span className="truncate font-mono text-micro text-ink">{step.action ?? '—'}</span>
+                  {reported && <span className="text-micro text-ink-3">{statusText}</span>}
                 </div>
                 {step.reason && (
                   <p className="mt-1 pl-7 text-micro text-ink-3">{step.reason}</p>

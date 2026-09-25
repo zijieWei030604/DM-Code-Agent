@@ -182,7 +182,9 @@ def test_cli_advanced_features_wire_into_agent(monkeypatch):
         [Tool("noop", "No operation.", lambda arguments: "ok")],
     )
 
-    assert agent.enable_adaptive_replanning is True
+    assert agent.enable_adaptive_replanning is False
+    assert agent._legacy_replan_options is True
+    assert "update_plan" in agent.tools
     assert agent.enable_repo_map is True
     assert any(
         capability.__class__.__name__ == "SemanticWorkspaceCapability"
@@ -192,7 +194,7 @@ def test_cli_advanced_features_wire_into_agent(monkeypatch):
         capability.__class__.__name__ == "EvidenceGraphCapability"
         for capability in agent.capabilities
     )
-    assert agent.max_replans == 2
+    assert agent.max_replans == 0
     agent.close()
 
 

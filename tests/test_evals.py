@@ -20,7 +20,9 @@ def test_builtin_eval_suite_runs_full_variant():
     summary = report["summary"]["variants"]["full"]
     assert summary["tasks"] == 3
     assert summary["success_rate"] == 1.0
-    assert summary["recovery_events"] >= 2
+    assert summary["recovery_events"] >= 1
+    assert summary["recovered_runs"] >= 1
+    assert all(result["metadata"]["replan_count"] == 0 for result in report["results"])
 
 
 def test_eval_ablation_runs_all_builtin_tasks():

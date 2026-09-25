@@ -56,6 +56,8 @@ export interface PlanStep {
   action: string | null
   reason: string | null
   completed: boolean
+  status?: 'pending' | 'in_progress' | 'completed'
+  status_source?: 'model_reported'
 }
 
 export interface StepPayload {

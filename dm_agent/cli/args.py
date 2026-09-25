@@ -162,13 +162,13 @@ def parse_args(argv: Any) -> argparse.Namespace:
         "--enable-adaptive-replanning",
         action="store_true",
         default=saved_config.get("enable_adaptive_replanning", False),
-        help="启用基于失败信号的自适应重规划。默认关闭。",
+        help="兼容旧配置；独立重规划已移除，此参数不再生效。计划由 update_plan 更新。",
     )
     parser.add_argument(
         "--max-replans",
         type=int,
         default=saved_config.get("max_replans", -1),
-        help="自适应重规划最多触发次数；-1 表示不限（默认：-1）。",
+        help="兼容旧配置；独立重规划已移除，此参数不再生效。",
     )
     parser.add_argument(
         "--interactive",

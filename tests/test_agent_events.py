@@ -167,13 +167,13 @@ def test_after_tool_result_no_progress_signal_keeps_planned_step_pending():
     bus.on("after_tool_result", declare_no_progress, name="declare_no_progress")
     client = FakeRespondClient(
         [
-            json.dumps(
+            _action(
+                "update_plan",
                 {
                     "plan": [
-                        {"step": 1, "action": "echo", "reason": "produce output"},
-                        {"step": 2, "action": "task_complete", "reason": "finish"},
+                        {"id": "P1", "step": "produce output", "status": "pending"},
                     ]
-                }
+                },
             ),
             _action("echo", {}),
         ]
@@ -186,11 +186,9 @@ def test_after_tool_result_no_progress_signal_keeps_planned_step_pending():
         event_bus=bus,
     )
 
-    agent.run("produce output", max_steps=1)
+    agent.run("produce output", max_steps=2)
 
-    assert agent.planner is not None
-    assert agent.planner.current_plan[0].completed is False
-    assert agent.planner.get_next_step().action == "echo"
+    assert agent.task_plan.items[0]["status"] == "pending"
 
 
 def test_handler_exception_is_isolated_and_traced(tmp_path):
@@ -248,7 +246,7 @@ def test_before_llm_request_rewrites_actual_messages():
     assert sent_messages[-1] == {"role": "user", "content": "hook sentinel"}
 
 
-def test_before_llm_request_covers_planner_and_agent_phases():
+def test_before_llm_request_has_only_agent_phase_with_planning_enabled():
     phases = []
     bus = EventBus()
 
@@ -256,7 +254,7 @@ def test_before_llm_request_covers_planner_and_agent_phases():
         phases.append(event.phase)
 
     bus.on("before_llm_request", note_phase, name="note_phase")
-    client = FakeRespondClient([json.dumps({"plan": []}), _action("finish", "done")])
+    client = FakeRespondClient([_action("finish", "done")])
     agent = ReactAgent(
         client,
         [Tool("echo", "Echo", lambda arguments: "unused")],
@@ -267,7 +265,7 @@ def test_before_llm_request_covers_planner_and_agent_phases():
 
     agent.run("finish", max_steps=1)
 
-    assert phases == ["planner", "agent"]
+    assert phases == ["agent"]
 
 
 def test_before_tool_call_can_modify_arguments_in_place_without_revalidation():

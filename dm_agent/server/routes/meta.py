@@ -88,15 +88,6 @@ CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
         "help": "确定性回归请用 0。",
     },
     {
-        "flag": "--enable-adaptive-replanning",
-        "key": "enable_adaptive_replanning",
-        "kind": "bool",
-        "default": False,
-        "category": "behavior",
-        "label": "Adaptive Replanning",
-        "help": "扩展的重规划决策策略与限制。基础重规划本来就一直开着。",
-    },
-    {
         "flag": "--enable-semantic-workspace",
         "key": "enable_semantic_workspace",
         "kind": "bool",

@@ -99,6 +99,13 @@ def analyze_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         metadata=metadata,
     )
 
+    plan_updates = [
+        event.get("payload", {}) for event in events if event.get("event") == "plan_updated"
+    ]
+    planning_mode = metadata.get("planning_mode", "")
+    if planning_mode in {"model_checklist", "disabled"}:
+        signals = [signal for signal in signals if signal != "no_replan_after_failure"]
+
     return {
         "run_id": summary.get("run_id", ""),
         "task": summary.get("task", ""),
@@ -113,6 +120,12 @@ def analyze_events(events: list[dict[str, Any]]) -> dict[str, Any]:
             "replan_count": summary.get("replan_count", 0),
             "replanned_after_failure": replanned_after_failure,
             "recovered": recovered,
+        },
+        "planning": {
+            "mode": planning_mode,
+            "update_count": len(plan_updates),
+            "latest": plan_updates[-1] if plan_updates else {},
+            "status_source": "model_reported",
         },
         "verification": verification,
         "evidence": evidence,
@@ -313,7 +326,11 @@ def _trace_health(
     if verification_gap:
         score -= 0.2
         issues.append("verification_gap")
-    if failure_count and not replanned_after_failure:
+    if (
+        failure_count
+        and not replanned_after_failure
+        and metadata.get("planning_mode") not in {"model_checklist", "disabled"}
+    ):
         score -= 0.15
         issues.append("failure_without_replan")
     if int(metadata.get("parse_error_count") or 0) > 0 and final_stage != "none":

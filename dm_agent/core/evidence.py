@@ -15,6 +15,7 @@ EvidenceKind = Literal[
     "change",
     "verification",
     "conclusion",
+    "tool_execution",
 ]
 EvidenceStatus = Literal[
     "unaddressed",
@@ -134,6 +135,66 @@ class EvidenceGraph:
         self.nodes[node.node_id] = node
         return [node], []
 
+    def sync_checklist(
+        self, plan: Sequence[Mapping[str, Any]], *, scope: str, revision: int
+    ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
+        """Project versioned model claims; old revisions and removed goals stay auditable."""
+        nodes: list[EvidenceNode] = []
+        edges: list[EvidenceEdge] = []
+        self.current_plan_id = ""
+        current_ids = {f"plan-{scope}-{item['id']}-r{revision}" for item in plan}
+        for identity, old in list(self.nodes.items()):
+            if (
+                old.kind == "plan_step"
+                and old.metadata.get("current")
+                and identity not in current_ids
+            ):
+                updated = EvidenceNode(
+                    identity,
+                    old.kind,
+                    old.title,
+                    old.step_number,
+                    {**old.metadata, "current": False},
+                )
+                self.nodes[identity] = updated
+                nodes.append(updated)
+        for index, item in enumerate(plan, 1):
+            identity = f"plan-{scope}-{item['id']}-r{revision}"
+            if identity not in self.nodes:
+                node = EvidenceNode(
+                    identity,
+                    "plan_step",
+                    str(item["step"]),
+                    index,
+                    {
+                        "plan_id": item["id"],
+                        "scope": scope,
+                        "revision": revision,
+                        "status": item["status"],
+                        "status_source": "model_reported",
+                        "current": True,
+                        "completed": item["status"] == "completed",
+                    },
+                )
+                self.nodes[identity] = node
+                nodes.append(node)
+                edge = self._add_edge(
+                    identity, self.ROOT_REQUIREMENT_ID, "decomposes", confidence="claimed"
+                )
+                if edge:
+                    edges.append(edge)
+            if item["status"] == "in_progress":
+                self.current_plan_id = identity
+        return nodes, edges
+
+    def add_execution(
+        self, *, tool: str, step_number: int, succeeded: bool
+    ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
+        node = self._new_node(
+            "tool_execution", tool, step_number, {"tool": tool, "succeeded": succeeded}
+        )
+        return [node], self._link_current_plan(node.node_id, "occurred_during")
+
     def sync_plan(
         self, plan: Sequence[Mapping[str, Any]]
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
@@ -150,9 +211,7 @@ class EvidenceGraph:
             status = str(raw.get("status", ""))
             signature = hashlib.sha256(
                 f"{step_number}\0{phase or action}\0{goal or reason}".encode()
-            ).hexdigest()[
-                :8
-            ]
+            ).hexdigest()[:8]
             node_id = f"plan-{step_number}-{signature}"
             completed = bool(raw.get("completed", False)) or status == "satisfied"
             existing = self.nodes.get(node_id)
@@ -279,7 +338,7 @@ class EvidenceGraph:
             edge = self._add_edge(
                 node.node_id,
                 observation.node_id,
-                "motivated_by",
+                "read_before_edit",
                 confidence="deterministic",
             )
             if edge:
@@ -311,8 +370,7 @@ class EvidenceGraph:
         targets = tuple(
             change_id
             for change_id in dict.fromkeys(str(item) for item in target_change_ids)
-            if self.nodes.get(change_id) is not None
-            and self.nodes[change_id].kind == "change"
+            if self.nodes.get(change_id) is not None and self.nodes[change_id].kind == "change"
         )
         node = self._new_node(
             "verification",
@@ -337,9 +395,7 @@ class EvidenceGraph:
                 ),
             },
         )
-        edges: list[EvidenceEdge] = (
-            self._link_plan(node.node_id, "supported_by", phase) if phase else []
-        )
+        edges: list[EvidenceEdge] = self._link_plan(node.node_id, "supported_by", phase)
         for change_id in targets:
             edge = self._add_edge(
                 node.node_id,
@@ -386,22 +442,16 @@ class EvidenceGraph:
                 "claimed_success": True,
                 "accepted": accepted,
                 "evidence_status": conclusion_status,
+                "workspace_version": self.workspace_version,
             },
         )
         edges: list[EvidenceEdge] = []
-        supporting = [
-            item
-            for item in self.nodes.values()
-            if item.kind in {"verification", "change", "observation"}
-        ]
-        for item in sorted(
-            supporting, key=lambda candidate: candidate.step_number or 0, reverse=True
-        )[:5]:
+        for item in self.current_verifications():
             edge = self._add_edge(
                 node.node_id,
                 item.node_id,
-                "supported_by",
-                confidence="inferred",
+                "checked_at_completion",
+                confidence="deterministic",
             )
             if edge:
                 edges.append(edge)
@@ -429,8 +479,7 @@ class EvidenceGraph:
         for change in self._nodes_of_kind("change"):
             checks = self._current_checks_for_change(change.node_id)
             if any(
-                not bool(node.metadata.get("passed"))
-                and bool(node.metadata.get("blocking", True))
+                not bool(node.metadata.get("passed")) and bool(node.metadata.get("blocking", True))
                 for node in checks
             ):
                 result[change.node_id] = "contradicted"
@@ -442,7 +491,7 @@ class EvidenceGraph:
             }
             has_read_basis = any(
                 edge.source_id == change.node_id
-                and edge.relation == "motivated_by"
+                and edge.relation in {"read_before_edit", "motivated_by"}
                 and (edge.confidence == "deterministic" or legacy_change)
                 for edge in self.edges
             )
@@ -527,7 +576,9 @@ class EvidenceGraph:
             for node in checks
         ):
             return "verified"
-        if conclusions and (observations or any(bool(node.metadata.get("passed")) for node in checks)):
+        if conclusions and (
+            observations or any(bool(node.metadata.get("passed")) for node in checks)
+        ):
             return "partially_verified"
         return "unaddressed"
 
@@ -551,6 +602,7 @@ class EvidenceGraph:
             for kind in (
                 "requirement",
                 "plan_step",
+                "tool_execution",
                 "observation",
                 "change",
                 "verification",
@@ -618,7 +670,8 @@ class EvidenceGraph:
         unavailable = [
             node
             for node in verifications
-            if not bool(node.metadata.get("passed")) and not bool(node.metadata.get("blocking", True))
+            if not bool(node.metadata.get("passed"))
+            and not bool(node.metadata.get("blocking", True))
         ]
         if passed:
             lines.append(
@@ -627,9 +680,7 @@ class EvidenceGraph:
         if failed:
             lines.append("Contradicting checks: " + ", ".join(node.title for node in failed[-3:]))
         if unavailable:
-            lines.append(
-                "Unverified checks: " + ", ".join(node.title for node in unavailable[-3:])
-            )
+            lines.append("Unverified checks: " + ", ".join(node.title for node in unavailable[-3:]))
         issues = self.completion_issues()
         if issues:
             detail = ", ".join(f"{item['path']} ({item['status']})" for item in issues[:4])
@@ -717,24 +768,14 @@ class EvidenceGraph:
         if not self.current_plan_id:
             return []
         edge = self._add_edge(
-            self.current_plan_id,
             node_id,
-            relation,
-            confidence="inferred",
+            self.current_plan_id,
+            "occurred_during",
+            confidence="deterministic",
         )
         return [edge] if edge else []
 
     def _link_plan(self, node_id: str, relation: str, phase: str = "") -> list[EvidenceEdge]:
-        if phase:
-            candidates = [
-                item for item in self.nodes.values()
-                if item.kind == "plan_step" and item.metadata.get("phase") == phase
-            ]
-            if candidates:
-                edge = self._add_edge(
-                    candidates[-1].node_id, node_id, relation, confidence="deterministic"
-                )
-                return [edge] if edge else []
         return self._link_current_plan(node_id, relation)
 
     def _nodes_of_kind(self, kind: EvidenceKind) -> list[EvidenceNode]:
@@ -789,12 +830,7 @@ def _latest_verifications(nodes: Sequence[EvidenceNode]) -> list[EvidenceNode]:
     for node in nodes:
         key = (
             str(node.metadata.get("tool", "")),
-            tuple(
-                sorted(
-                    str(item).replace("\\", "/")
-                    for item in node.metadata.get("scope", [])
-                )
-            ),
+            tuple(sorted(str(item).replace("\\", "/") for item in node.metadata.get("scope", []))),
         )
         current = latest.get(key)
         if current is None or (node.step_number or 0) >= (current.step_number or 0):

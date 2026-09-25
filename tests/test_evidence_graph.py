@@ -113,16 +113,11 @@ def test_evidence_graph_builds_a_verified_chain_and_round_trips() -> None:
 
     assert graph.status() == "verified"
     assert graph.audit()["counts"]["change"] == 1
-    assert graph.audit()["edge_confidence_counts"] == {
-        "deterministic": 3,
-        "claimed": 4,
-        "inferred": 5,
-    }
-    assert any(edge.relation == "motivated_by" for edge in graph.edges)
+    assert any(edge.relation == "read_before_edit" for edge in graph.edges)
+    assert not any(edge.relation == "motivated_by" for edge in graph.edges)
+    assert any(edge.relation == "checked_at_completion" for edge in graph.edges)
     assert any(edge.relation == "verifies" for edge in graph.edges)
-    assert {
-        edge.confidence for edge in graph.edges
-    } == {"deterministic", "claimed", "inferred"}
+    assert {edge.confidence for edge in graph.edges} <= {"deterministic", "claimed", "inferred"}
     assert conclusion[0].metadata["evidence_status"] == graph.status()
 
     restored = EvidenceGraph.from_dict(graph.to_dict())
@@ -131,13 +126,15 @@ def test_evidence_graph_builds_a_verified_chain_and_round_trips() -> None:
     assert len(restored.prompt_summary(max_chars=200)) <= 200
 
 
-def test_runtime_fact_links_to_the_matching_plan_phase() -> None:
+def test_runtime_fact_links_to_active_plan_not_inferred_phase() -> None:
     graph = EvidenceGraph("Inspect before changing")
-    graph.sync_plan(
+    graph.sync_checklist(
         [
-            {"step_number": 1, "phase": "locate", "goal": "Locate implementation"},
-            {"step_number": 2, "phase": "inspect", "goal": "Inspect implementation"},
-        ]
+            {"id": "P1", "step": "Locate implementation", "status": "in_progress"},
+            {"id": "P2", "step": "Inspect implementation", "status": "pending"},
+        ],
+        scope="task",
+        revision=1,
     )
 
     nodes, edges = graph.add_observation(
@@ -151,11 +148,12 @@ def test_runtime_fact_links_to_the_matching_plan_phase() -> None:
     inspect_plan = next(
         node
         for node in graph.nodes.values()
-        if node.kind == "plan_step" and node.metadata.get("phase") == "inspect"
+        if node.kind == "plan_step" and node.metadata.get("plan_id") == "P1"
     )
     assert any(
-        edge.source_id == inspect_plan.node_id
-        and edge.target_id == nodes[0].node_id
+        edge.source_id == nodes[0].node_id
+        and edge.target_id == inspect_plan.node_id
+        and edge.relation == "occurred_during"
         and edge.confidence == "deterministic"
         for edge in edges
     )
@@ -321,9 +319,7 @@ def test_capability_records_content_anchor_as_tool_validated_basis(tmp_path, mon
     bus.emit_run_start(RunStartEvent("Update service", 1, "run", metadata=metadata))
     arguments = {"path": "service.py", "old_string": "value = 1", "new_string": "value = 2"}
     bus.emit_before_tool_call(
-        BeforeToolCallEvent(
-            "edit_file", arguments, 1, "run", metadata, content_anchor_safe=True
-        )
+        BeforeToolCallEvent("edit_file", arguments, 1, "run", metadata, content_anchor_safe=True)
     )
     target.write_text("value = 2\n", encoding="utf-8")
     bus.emit_after_tool_result(
@@ -624,9 +620,7 @@ def test_evidence_capability_never_injects_status_and_rejects_repeated_contradic
             "run-1",
             False,
             metadata,
-            result=_test_result(
-                outcome="failed", scope=("tests/test_users.py::test_update",)
-            ),
+            result=_test_result(outcome="failed", scope=("tests/test_users.py::test_update",)),
         )
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 3, "run-1", metadata)
@@ -659,9 +653,7 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
             "run-1",
             False,
             metadata,
-            result=_test_result(
-                outcome="failed", scope=("tests/test_users.py::test_update",)
-            ),
+            result=_test_result(outcome="failed", scope=("tests/test_users.py::test_update",)),
         )
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
@@ -704,9 +696,7 @@ def test_completion_pauses_once_when_historical_writes_leave_no_net_code_change(
                 "run-1",
                 True,
                 metadata,
-                result=ToolResult(
-                    "success", "updated", changed_files=(str(target),)
-                ),
+                result=ToolResult("success", "updated", changed_files=(str(target),)),
             )
         )
 
@@ -735,9 +725,7 @@ def test_completion_pauses_once_when_historical_writes_leave_no_net_code_change(
     assert second is None
     assert metadata["evidence_no_net_change_block_count"] == 1
     assert metadata["evidence_completion_block_count"] == 1
-    assert any(
-        event["event"] == "evidence_no_net_change_blocked" for event in trace.events
-    )
+    assert any(event["event"] == "evidence_no_net_change_blocked" for event in trace.events)
     conclusions = [node for node in capability.graph.nodes.values() if node.kind == "conclusion"]
     assert [node.metadata["accepted"] for node in conclusions[-2:]] == [False, True]
 
@@ -969,9 +957,7 @@ def test_new_edit_makes_prior_confirmed_failure_stale_and_allows_unverified_fini
             "run-1",
             False,
             metadata,
-            result=_test_result(
-                outcome="failed", scope=("tests/test_service.py::test_update",)
-            ),
+            result=_test_result(outcome="failed", scope=("tests/test_service.py::test_update",)),
         )
     )
     first = bus.emit_before_finish(
@@ -1061,9 +1047,7 @@ def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
     monkeypatch.chdir(tmp_path)
 
     def failed_test(arguments: dict[str, Any]) -> ToolResult:
-        return _test_result(
-            outcome="failed", scope=("tests/test_service.py::test_update",)
-        )
+        return _test_result(outcome="failed", scope=("tests/test_service.py::test_update",))
 
     agent = ReactAgent(
         _ScriptedClient(
@@ -1076,9 +1060,7 @@ def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
         [Tool("run_tests", "test", lambda arguments: "", result_runner=failed_test)],
         enable_planning=False,
         enable_compression=False,
-        capabilities=[
-            EvidenceGraphCapability(repeated_contradiction="critic_rejected")
-        ],
+        capabilities=[EvidenceGraphCapability(repeated_contradiction="critic_rejected")],
     )
 
     result = agent.run("Fix the failing test", max_steps=3)
@@ -1131,9 +1113,7 @@ def test_react_agent_allows_unchecked_finish_with_explicit_status(tmp_path, monk
     assert result["metadata"]["completion_summary"].endswith("本轮未运行本地验证。")
 
 
-def test_react_agent_marks_tested_finish_after_tests(
-    tmp_path, monkeypatch
-) -> None:
+def test_react_agent_marks_tested_finish_after_tests(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "service.py"
     target.write_text("value = 1\n", encoding="utf-8")

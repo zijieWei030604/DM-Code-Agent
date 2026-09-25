@@ -209,6 +209,10 @@ class EventBus:
         """该事件上是否已注册处理器。"""
         return bool(self._handlers.get(event))
 
+    def has_retry_handlers(self) -> bool:
+        """Read-only run-end observers cannot request a new attempt."""
+        return any(handler.kind != "observer" for handler in self._handlers["on_run_end"])
+
     def emit_before_tool_call(
         self,
         event: BeforeToolCallEvent,
@@ -328,6 +332,8 @@ class EventBus:
         """执行 run 收尾链；遇到第一个 ``retry=True`` 时停止并要求重试。"""
         for position, handler in enumerate(self._handlers["on_run_end"], start=1):
             succeeded, result = self._call("on_run_end", handler, position, event, on_error)
+            if handler.kind == "observer":
+                continue
             if not succeeded or result is None:
                 continue
             if not isinstance(result, Mapping):

@@ -299,16 +299,9 @@ def write_markdown_report(report: dict[str, Any], path: Path) -> None:
 
 
 def _script_for(task: EvalTask, variant: EvalVariant) -> list[str]:
-    responses: list[str] = []
-    if variant.enable_planning and task.planner_response:
-        responses.append(task.planner_response)
-    if variant.enable_planning and task.replan_response:
-        responses.extend(task.agent_responses[:1])
-        responses.append(task.replan_response)
-        responses.extend(task.agent_responses[1:])
-    else:
-        responses.extend(task.agent_responses)
-    return responses
+    # Legacy planner fixtures are not ReAct responses. Planning now uses a tool
+    # in the same response stream, covered separately by task-plan runtime tests.
+    return list(task.agent_responses)
 
 
 def _write_setup_files(workspace: Path, files: dict[str, str]) -> None:

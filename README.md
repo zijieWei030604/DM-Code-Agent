@@ -142,11 +142,15 @@ dm-agent-web                 # 完整工作台：对话式交任务 + SSE 实时
 
 | 默认**开**（基础设施护栏） | 默认**关**（行为 / 算法） |
 | --- | --- |
-| read-before-edit 守卫、观察截断、token 预算触发折叠 | Adaptive Replanning（错误信号映射到重规划策略） |
+| read-before-edit 守卫、观察截断、token 预算触发折叠 | Evidence Graph / Verified Edits |
 | 原子写 + 自动备份、LLM 统一重试 | |
 | `--checkpoint` / `--resume` run 级断点续跑 | |
 
 两个面向真实代码库的能力保持默认关闭，可分别启用：
+
+计划由 ReAct 模型按需调用 `update_plan` 维护，不再预先调用独立 Planner，失败后也不会
+额外启动 Replanner。简单任务可以不建计划；构造 Agent 时用 `enable_planning=False` 关闭计划工具。旧重规划开关
+仅兼容参数解析，不再生效。详见[计划与证据协作](docs/task-plan.md)。
 
 ```bash
 dm-agent --enable-repo-map "定位并修复订单金额计算问题"
@@ -155,7 +159,7 @@ dm-agent --enable-repo-map --enable-verified-edits "修复订单金额计算并�
 
 `--enable-repo-map` 会在 `.dm_agent/index/workspace.db` 中维护内容哈希、FTS5、作用域
 符号以及调用/导入/继承关系；文件修改后只重建变化记录，并反向传播得到受影响符号、
-文件、测试与风险分数。动态 Repo Map、Agent 上下文和 Planner/Replanner 共用这份有界证据。
+文件、测试与风险分数。Agent 可利用这份有界证据调整任务清单。
 `--enable-verified-edits` 把本轮所有写操作纳入同一事务，完成前校验 Python 语法，并按
 同一影响报告选择相关测试；校验未通过时恢复修改前字节快照并否决本次完成。影响计算、
 测试选择及原因同时写入 trace，关闭两个开关时不安装这些 capability，保持原有执行路径。
@@ -212,8 +216,8 @@ dm-agent-score-diff bench_reports/before.json bench_reports/after.json
 
 ## 👀 一次真实运行长什么样
 
-下面是**真跑出来的输出**（确定性 eval 的 `tool_failure_replan` 任务，无需 API key）——
-读文件失败 → 触发重规划 → 换路径完成：
+下面是旧版独立 Replanner 的历史输出（确定性 eval 的 `tool_failure_replan` 任务）——
+当前版本改由同一 ReAct 循环根据失败观察调整动作，必要时调用 `update_plan`，不再产生独立重规划调用。
 
 ```console
 $ dm-agent-trace view sessions/demo.jsonl
@@ -259,7 +263,7 @@ flowchart TD
     WEB["<b>server</b> — Web 控制台（与 cli 同级）<br/>只读审计 API · SSE 实时流 · 子进程执行器"]
     CLI["<b>cli</b> — 最外层装配者<br/>dm-agent · -eval · -bench · -trace · -economics · -manifest-diff"]
     EXT["<b>extensions</b> — ExtensionAPI · 注册表 · 五级发现 · 项目信任模型"]
-    CORE["<b>core</b> — agent.py 只做装配 + ReAct 主循环<br/>context_window · response_parser · tool_invoker · completion<br/>replan · persistence · run_state · observation · prompting"]
+    CORE["<b>core</b> — agent.py 只做装配 + ReAct 主循环<br/>lcm_context_window · response_parser · tool_invoker · completion<br/>task_plan · persistence · run_state · observation · prompting"]
     TRACING["<b>tracing</b> — 会话条目树 · append-only 写入 · 隐私分档 · fork"]
     TOOLS["<b>tools</b> — 19 个内置工具 + MCP 动态工具"]
     CLIENTS["<b>clients</b> — deepseek / openai / claude / gemini + 可注册自定义"]

@@ -74,12 +74,12 @@ CLI 子进程**，不把 CLI 当库用。这样 Web 界面永远和命令行做�
 | `tool_invoker.py` | 工具调用链（见下节） |
 | `observation.py` | 观察截断与失败判定 |
 | `completion.py` | 完成门禁与结果格式化 |
-| `replan.py` | 失败签名与重规划 |
+| `task_plan.py` | 模型调用 `update_plan` 维护任务清单、修订历史与任务作用域 |
 | `persistence.py` | checkpoint 编解码、写前备份、`--resume` 加载 |
 | `events.py` | 事件总线、事件对象、按 phase 包装的 LLM 客户端 |
 | `capabilities.py` | `AgentCapability` 协议与 `CapabilityContext` |
 | `guards.py` | read-before-edit 守卫（作为钩子处理器实现） |
-| `planner.py` | 计划生成与重规划决策策略 |
+| `planner.py` / `replan.py` / `plan_progress.py` | 旧实现与历史实验辅助代码，当前 ReactAgent 不调用 |
 
 > `RunContext` **必须原地改、不能整体替换**——`LLMRequestClient` 在构造期就绑定了它的
 > 取值回调，换新实例会让它继续读旧对象。
@@ -92,8 +92,7 @@ flowchart TD
     Disc --> Assemble[cli.runner 装配<br/>client / tools / skills / event_bus / ReactAgent]
     Assemble --> RunStart{{on_run_start}}
     RunStart --> Skills[技能激活]
-    Skills --> Plan[TaskPlanner 生成 3-8 步计划]
-    Plan --> Loop[ReAct 循环]
+    Skills --> Loop[ReAct 循环]
 
     Loop --> CP[落 checkpoint 条目]
     CP --> Build[ContextWindow.build_messages<br/>按需折叠 + 落 compaction 条目]
@@ -104,15 +103,13 @@ flowchart TD
 
     Branch -->|finish / task_complete| Finish{{before_finish}}
     Finish -->|放行| Done([run_end])
-    Finish -->|否决| Replan
+    Finish -->|否决后继续或终止| Feedback[返回检查结果]
 
     Branch -->|工具| Invoke[ToolInvoker]
-    Branch -->|未知工具 / 解析失败| Replan[replan.try_replan]
+    Branch -->|未知工具 / 解析失败| Feedback
 
-    Invoke --> Fail{失败观察?}
-    Fail -->|是| Replan
-    Fail -->|否| Loop
-    Replan --> Loop
+    Invoke --> Feedback
+    Feedback --> Loop
     Loop -.->|步数耗尽| Done
     Done --> RunEnd{{on_run_end}}
     RunEnd -->|retry| RunStart
@@ -120,6 +117,9 @@ flowchart TD
 ```
 
 `{{双花括号}}` 的是钩子点。语义与返回值见 [生命周期事件](lifecycle-events.md)。
+
+计划是模型报告的清单，执行事实由证据图独立记录；工具成功不自动完成计划项，计划全完成也不
+绕过完成门禁。当前清单作为单份结构化视图参与消息预算，压缩不会替换它。见[计划与证据协作](task-plan.md)。
 
 ## 工具调用链的次序（有意为之）
 

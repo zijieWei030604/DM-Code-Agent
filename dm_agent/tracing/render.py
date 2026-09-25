@@ -62,6 +62,12 @@ def _analyze(
     print(f"Status: {analysis.get('status', '')}")
     print(f"Primary failure stage: {analysis['primary_failure_stage']}")
     print(f"Final failure stage: {analysis['final_failure_stage']}")
+    planning = analysis.get("planning", {})
+    if planning.get("mode"):
+        print(
+            f"Planning: mode={planning['mode']}, updates={planning['update_count']}, "
+            f"status_source={planning['status_source']}"
+        )
     print(
         "Recovery: "
         f"failures={recovery['failure_event_count']}, "

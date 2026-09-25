@@ -13,6 +13,14 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     steps = [event["payload"] for event in events if event.get("event") == "step"]
     plan = _first(events, "plan")
     metadata = run_end.get("payload", {}).get("metadata", {}) if run_end else {}
+    plan_steps = (plan or {}).get("payload", {}).get("steps", [])
+    for event in events:
+        payload = event.get("payload", {})
+        if event.get("event") == "plan_updated" or (
+            event.get("event") == "run_start"
+            and payload.get("planning_mode") in {"model_checklist", "disabled"}
+        ):
+            plan_steps = _checklist_steps(payload.get("plan", []))
     runtime_payload = runtime.get("payload", {}) if runtime else {}
     return {
         "run_id": events[0].get("run_id") if events else "",
@@ -28,9 +36,23 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
         "step_count": len(steps),
         "tool_call_count": sum(1 for event in events if event.get("event") == "tool_call"),
         "replan_count": sum(1 for event in events if event.get("event") == "replan"),
-        "plan_steps": (plan or {}).get("payload", {}).get("steps", []),
+        "plan_steps": plan_steps,
         "steps": steps,
     }
+
+
+def _checklist_steps(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "step_number": index,
+            "action": item["id"],
+            "reason": item["step"],
+            "completed": item["status"] == "completed",
+            "status": item["status"],
+            "status_source": "model_reported",
+        }
+        for index, item in enumerate(items, 1)
+    ]
 
 
 def diff_events(
@@ -112,7 +134,14 @@ def _action_sequence(summary: dict[str, Any]) -> list[str]:
 
 
 def _plan_actions(summary: dict[str, Any]) -> list[str]:
-    return [str(step.get("action", "")) for step in summary.get("plan_steps", [])]
+    return [
+        (
+            f"{step['action']}: {step['reason']} [{step['status']}]"
+            if step.get("status_source") == "model_reported"
+            else str(step.get("action", ""))
+        )
+        for step in summary.get("plan_steps", [])
+    ]
 
 
 def _metric_delta(

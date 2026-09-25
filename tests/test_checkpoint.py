@@ -316,7 +316,7 @@ def test_resume_without_compressor_state_clears_existing_compressor_state():
     assert agent.compressor.store.search(agent.compressor.branch, "stale memory") == []
 
 
-def test_resume_restores_plan(tmp_path):
+def test_resume_rejects_legacy_phase_plan_without_guessing_progress(tmp_path):
     trace_path = tmp_path / "resume-plan.jsonl"
     checkpoint = RunCheckpoint(
         task="resume with plan",
@@ -349,18 +349,9 @@ def test_resume_restores_plan(tmp_path):
         enable_compression=False,
         trace_writer=writer,
     )
-    result = agent.run(checkpoint.task, max_steps=4, resume_state=checkpoint)
+    with pytest.raises(ValueError, match="Legacy phase plans"):
+        agent.run(checkpoint.task, max_steps=4, resume_state=checkpoint)
     writer.close()
-
-    assert result["metadata"]["status"] == "success"
-    assert agent.planner is not None
-    # 计划连同完成状态一起回到 planner，resume 后不会重跑已完成的步骤。
-    assert [step.action for step in agent.planner.current_plan] == ["echo", "task_complete"]
-    assert agent.planner.current_plan[0].completed is True
-
-    events = load_trace_events(trace_path)
-    assert any(event["event"] == "run_start" for event in events)
-    assert any(event["event"] == "run_end" for event in events)
 
 
 def test_resume_warns_on_config_mismatch(capsys):

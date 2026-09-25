@@ -61,6 +61,7 @@ class RunCheckpoint:
     steps: list[dict[str, Any]] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     plan: list[dict[str, Any]] = field(default_factory=list)
+    plan_state: dict[str, Any] | None = None
     compressor_state: dict[str, Any] | None = None
     capability_state: dict[str, Any] = field(default_factory=dict)
     agent_config: dict[str, Any] = field(default_factory=dict)
@@ -88,6 +89,7 @@ class RunCheckpoint:
             steps=list(data.get("steps") or []),
             metadata=dict(data.get("metadata") or {}),
             plan=list(data.get("plan") or []),
+            plan_state=data.get("plan_state"),
             compressor_state=data.get("compressor_state"),
             capability_state=dict(data.get("capability_state") or {}),
             agent_config=dict(data.get("agent_config") or {}),

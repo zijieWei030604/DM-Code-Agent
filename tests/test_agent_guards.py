@@ -319,14 +319,13 @@ def test_identity_edit_does_not_complete_planned_edit_step(tmp_path, monkeypatch
 
     client = FakeRespondClient(
         [
-            json.dumps(
+            _action(
+                "update_plan",
                 {
                     "plan": [
-                        {"step": 1, "action": "read_file", "reason": "inspect"},
-                        {"step": 2, "action": "edit_file", "reason": "change code"},
-                        {"step": 3, "action": "task_complete", "reason": "finish"},
+                        {"id": "P1", "step": "change code", "status": "in_progress"},
                     ]
-                }
+                },
             ),
             _action("read_file", {"path": "app.py"}),
             _action(
@@ -337,14 +336,11 @@ def test_identity_edit_does_not_complete_planned_edit_step(tmp_path, monkeypatch
     )
     agent = ReactAgent(client, _file_tools(), enable_planning=True, enable_compression=False)
 
-    result = agent.run("change app.py", max_steps=2)
+    result = agent.run("change app.py", max_steps=3)
 
     assert result["metadata"]["edit_noop_count"] == 1
     assert result["metadata"]["backup_count"] == 0
-    assert agent.planner is not None
-    assert agent.planner.current_plan[0].completed is True
-    assert agent.planner.current_plan[1].completed is False
-    assert agent.planner.get_next_step().action == "edit_file"
+    assert agent.task_plan.items[0]["status"] == "in_progress"
 
 
 def test_identity_edit_keeps_existing_stale_state_for_later_line_edit(tmp_path, monkeypatch):
