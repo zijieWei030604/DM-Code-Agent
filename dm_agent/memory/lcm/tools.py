@@ -24,10 +24,18 @@ def build_lcm_tools(
             dag = SummaryDAG(active_store, branch, resolve_artifact)
             if name == "lcm_grep":
                 rows = active_store.search(
-                    branch, str(arguments["query"]), limit=int(arguments.get("limit", 10))
+                    branch,
+                    str(arguments["query"]),
+                    limit=int(arguments.get("limit", 10)),
+                    record_types=arguments.get("record_types"),
                 )
                 result: Any = [
-                    {"id": row["id"], "kind": row["kind"], "preview": row["body"][:400]}
+                    {
+                        "id": row["id"],
+                        "sequence": row["seq"],
+                        "kind": active_store.record_type(row),
+                        **active_store.match_context(row["body"], str(arguments["query"])),
+                    }
                     for row in rows
                 ]
             elif name == "lcm_describe":
@@ -47,11 +55,30 @@ def build_lcm_tools(
     for name, description, required, properties in (
         (
             "lcm_grep",
-            "Search visible SQLite historical messages and summaries; no Trace search.",
+            "Search visible SQLite history. Returns a hit-centered preview and offset for lcm_expand; no Trace search.",
             ["query"],
             {
                 "query": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                "record_types": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [
+                            "task",
+                            "model_response",
+                            "tool_result",
+                            "observation",
+                            "completion",
+                            "imported",
+                            "summary",
+                            "artifact",
+                        ],
+                    },
+                    "uniqueItems": True,
+                    "maxItems": 8,
+                    "description": "Optional Runtime record-type filter.",
+                },
             },
         ),
         (

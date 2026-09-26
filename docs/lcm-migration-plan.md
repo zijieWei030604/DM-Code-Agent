@@ -5,8 +5,8 @@ Status: LCM is wired as the default backend when context compression is enabled.
 ## Current implementation boundary
 
 The new `dm_agent/memory/lcm/` package contains SQLite branch-prefix storage,
-summary provenance, explicit call/result boundaries, bounded positive-gain
-compaction batches, and three read-only tool factories. `core/lcm_memory.py` and
+summary provenance, explicit call/result boundaries, hierarchical leaf and same-depth
+condensation, and three read-only tool factories. `core/lcm_memory.py` and
 `core/lcm_context_window.py` connect these to Agent. The old heuristic evidence
 memory observer is removed; Planner and evidence-gate decisions are unchanged.
 Legacy compressor/window helpers remain for standalone legacy tests, not the
@@ -18,9 +18,10 @@ active Agent path. The prior atomic-memory checkpoint schema is explicitly rejec
   These are Runtime IDs, not a claim that provider-native call IDs are preserved.
   Normal and failed calls use the same grouping rule; no text matching is involved.
 - The four built-in provider clients make bounded tool-free summary calls directly,
-  bypassing request hooks. Output limit is 1024 tokens, transport timeout is 60 s,
-  at most two attempts per batch and four batches per request. SDK retries are
-  disabled for summary requests. A custom provider must implement `complete_summary`.
+  bypassing request hooks. A leaf or condensation pass uses normal LLM summarization,
+  then a smaller aggressive summary when necessary, and finally a marked deterministic
+  truncation fallback. SDK retries are disabled for summary requests. A custom provider
+  must implement `complete_summary`.
 - Summary usage is recorded separately in `lcm_summary_call`; estimated input and
   output totals are reported in result metadata. Estimates use the existing chars/4
   estimator, not a provider tokenizer. Failed calls may have unknown actual usage.
@@ -40,8 +41,11 @@ active Agent path. The prior atomic-memory checkpoint schema is explicitly rejec
 - Summary request input is capped at 16000 estimated tokens per call and 64000
   accumulated estimated input tokens per context-building request. Historical
   usage remains in the checkpoint for accounting; it does not permanently disable
-  future compaction after successful previous batches. Oversized protected
-  groups or exhausted budgets stop safely if the active context cannot fit.
+  future compaction after successful previous batches. Summary calls and compaction
+  passes are bounded; oversized protected groups or exhausted budgets stop safely if
+  the active context cannot fit.
+- New databases and checkpoints use schema `lcm-2`. Legacy LCM databases and
+  checkpoint state are rejected rather than silently migrated; original files remain untouched.
 
 Live-model quality and cost must be measured again; no old benchmark scores are
 claimed for this backend.
@@ -65,7 +69,11 @@ and preserving that revision's applicable license and notices first.
 - Search SQLite only; expand authorized Trace references on demand.
 - Limit visibility to the current branch and its visible ancestors.
 - Use direct, tool-free summary model calls with separate usage accounting.
-- Commit each successful compaction batch independently; retain failed batches.
+- Build independent depth-0 summaries from old raw records, then condense only
+  same-depth active summaries into the next depth.
+- Commit a summary, its source links and active frontier in one SQLite transaction.
+- Escalate normal summary -> aggressive summary -> deterministic marked truncation;
+  retain source records for bounded `lcm_expand` recovery.
 - Support bounded dynamic chunking and bounded multi-batch compaction.
 - Stop on unrecoverable context overflow; do not silently discard history.
 - Do not migrate legacy compressor checkpoints; support new-state resume and fork.

@@ -79,11 +79,12 @@ dm-agent-trace replay     sessions/fix.jsonl    # 显式重放工具调用
 dm-agent-trace analyze-dir sessions/             # 批量聚合统计
 ```
 
-### 📉 上下文折叠带净收益护栏，压亏了就整体回滚
+### 📉 分层摘要与可恢复历史
 
 默认压缩已切换为 **LCM 分层摘要**：SQLite 保留历史原文，独立、无工具的 LLM 请求
-生成摘要，近期完整调用与结果继续保留。仅在估算 token 净收益为正时提交摘要及来源关系，
-无收益或失败候选不替换历史；仍超预算则以 `context_overflow` 停止。
+生成摘要，近期完整调用与结果继续保留。旧原文先形成独立的底层摘要，同层摘要积累后再向上
+聚合；摘要模型先尝试正常摘要、再尝试更激进摘要，最后以带展开提示的确定性截短保证上下文
+能够收敛。原文和摘要来源关系始终保留；仍超预算则以 `context_overflow` 停止。
 摘要可跨请求和新格式 Checkpoint 复用，摘要调用用量单独记录。
 `lcm_grep`、`lcm_describe`、`lcm_expand` 支持搜索、查看及分页展开历史。
 详见 [LCM 存储、恢复与隐私边界](docs/lcm-migration-plan.md)。旧版压缩评测数字不代表新版效果。

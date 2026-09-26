@@ -15,6 +15,17 @@ from dm_agent.memory.lcm.tools import build_lcm_tools
 from dm_agent.tools.base import Tool
 from dm_agent.tracing.writer import read_lcm_artifact, redact_text
 
+LCM_RECALL_GUIDANCE = """
+
+## Historical-memory recall
+
+Use the current context when it is sufficient. For exact historical details, search with
+`lcm_grep` using distinctive terms, then use the returned `offset` with `lcm_expand`.
+Use `record_types` to narrow a search to tool results or summaries when helpful. Historical
+summaries and test results are retrieval clues, not proof that the current workspace is valid;
+verify the current version before relying on them for completion.
+"""
+
 
 class LCMMemory:
     """One conversation, one branch; resume creates a child at the saved cutoff."""
@@ -95,6 +106,7 @@ class LCMMemory:
         )
         self.history_ids.append(record)
         self.frontier.append(record)
+        store.save_frontier(self.branch, self.frontier)
 
     def preserve_output(self, full_text: str, preview: str) -> str:
         full_text = redact_text(full_text)
@@ -119,7 +131,7 @@ class LCMMemory:
     def export_state(self) -> dict[str, Any]:
         store = self.store
         return {
-            "schema": "lcm-1",
+            "schema": "lcm-2",
             "database": str(Path(store.path).resolve()),
             "branch": self.branch,
             "cutoff": store.head(),
@@ -131,8 +143,8 @@ class LCMMemory:
         }
 
     def restore_state(self, state: dict[str, Any]) -> None:
-        if state.get("schema") != "lcm-1":
-            raise ValueError("Legacy atomic-memory checkpoints are not supported by LCM")
+        if state.get("schema") != "lcm-2":
+            raise ValueError("Legacy atomic-memory or LCM checkpoints are not compatible with schema lcm-2")
         path = Path(state["database"])
         if not path.is_file():
             raise ValueError("LCM checkpoint database is missing")
@@ -146,6 +158,7 @@ class LCMMemory:
                 if store.get(parent, record_id)["seq"] > cutoff:
                     raise ValueError("Checkpoint references records beyond its cutoff")
             branch = store.create_branch(parent=parent, cutoff=cutoff)
+            store.save_frontier(branch, frontier)
         except Exception:
             store.close()
             raise
@@ -174,6 +187,8 @@ class LCMMemory:
         self.frontier = []
         self.history_ids = []
         self.pending_call = ""
+        if self._store is not None:
+            self._store.save_frontier(self.branch, self.frontier)
 
     def close(self) -> None:
         if self._store is not None:

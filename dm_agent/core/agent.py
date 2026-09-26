@@ -29,7 +29,7 @@ from .events import (
 )
 from .guards import ReadBeforeEditGuard
 from .lcm_context_window import LCMContextWindow
-from .lcm_memory import LCMMemory
+from .lcm_memory import LCM_RECALL_GUIDANCE, LCMMemory
 from .observation import ObservationBounder, is_failure_observation
 from .persistence import (
     RunPersistence,
@@ -188,6 +188,7 @@ class ReactAgent:
                 self.system_prompt = build_code_agent_prompt(
                     self.tools_list, native_tool_calling=self.native_tool_calling
                 )
+            self.system_prompt += LCM_RECALL_GUIDANCE
         self._context_window = LCMContextWindow(
             compressor=self.compressor,
             enabled=enable_compression,

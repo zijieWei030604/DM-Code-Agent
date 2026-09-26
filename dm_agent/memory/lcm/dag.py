@@ -52,8 +52,11 @@ class SummaryDAG:
         return {
             "id": record_id,
             "kind": row["kind"],
+            "historical": True,
+            "notice": "Historical content; verify the current workspace before relying on it.",
             "content": content[offset:end],
             "next_offset": end if end < len(content) else None,
+            "has_more": end < len(content),
             "sources": sources[source_offset:source_end],
             "next_source_offset": source_end if source_end < len(sources) else None,
         }

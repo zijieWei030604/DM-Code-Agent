@@ -31,11 +31,11 @@ class LCMContextWindow:
         self.output_token_reserve = output_token_reserve
         self.safety_margin_tokens = safety_margin_tokens
         self.last_budget_breakdown: ContextBudgetBreakdown | None = None
-        self._recorded_summary = ""
+        self._recorded_summaries: tuple[str, ...] = ()
 
     def reset(self) -> None:
         self.last_budget_breakdown = None
-        self._recorded_summary = ""
+        self._recorded_summaries = ()
 
     def build_messages(
         self,
@@ -77,7 +77,7 @@ class LCMContextWindow:
                 context.metadata["budget_compression_count"] = (
                     int(context.metadata.get("budget_compression_count", 0)) + 1
                 )
-                self._record_compaction(memory, history, context, phase="accepted")
+                self._record_compaction(memory, history, context, phase="accepted", node=node)
 
             try:
                 engine.compact(memory.frontier, token_budget=budget, on_commit=committed)
@@ -101,12 +101,13 @@ class LCMContextWindow:
                 )
         context.metadata["memory_items"] = memory.memory_count
         context.metadata["context_backend"] = "lcm"
-        if (
-            memory.frontier
-            and memory.store.get(memory.branch, memory.frontier[0])["kind"] == "summary"
-            and self._recorded_summary != memory.frontier[0]
-        ):
-            self._record_compaction(memory, history, context, phase="sticky_reuse")
+        summaries = tuple(
+            record_id
+            for record_id in memory.frontier
+            if memory.store.get(memory.branch, record_id)["kind"] == "summary"
+        )
+        if summaries and self._recorded_summaries != summaries:
+            self._record_compaction(memory, history, context, phase="sticky_reuse", node=summaries[0])
         effective = engine.render(memory.frontier)
         self.last_budget_breakdown = build_context_budget(
             total_budget=memory.token_budget,
@@ -119,11 +120,16 @@ class LCMContextWindow:
         return [{"role": "system", "content": system_prompt}, *effective]
 
     def _record_compaction(
-        self, memory: LCMMemory, history: list[dict[str, str]], context: RunContext, *, phase: str
+        self,
+        memory: LCMMemory,
+        history: list[dict[str, str]],
+        context: RunContext,
+        *,
+        phase: str,
+        node: str,
     ) -> None:
         engine = memory.compactor
         assert engine is not None
-        node = memory.frontier[0]
         after = engine.tokens(memory.frontier)
         node_metadata = memory.store.get(memory.branch, node)["metadata"]
         before = (
@@ -144,6 +150,11 @@ class LCMContextWindow:
                     "phase": phase,
                     "summary_id": node,
                     "summary": engine.render([node])[0]["content"],
+                    "summary_ids": list(
+                        record_id
+                        for record_id in memory.frontier
+                        if memory.store.get(memory.branch, record_id)["kind"] == "summary"
+                    ),
                     "folded_message_count": first,
                     "kept_message_count": len(memory.frontier),
                     "original_message_count": len(history),
@@ -154,4 +165,8 @@ class LCMContextWindow:
                 first_kept_index=first,
                 folded_indexes=range(first),
             )
-        self._recorded_summary = node
+        self._recorded_summaries = tuple(
+            record_id
+            for record_id in memory.frontier
+            if memory.store.get(memory.branch, record_id)["kind"] == "summary"
+        )

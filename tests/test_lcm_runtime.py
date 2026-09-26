@@ -83,6 +83,7 @@ def test_agent_uses_summaries_without_hooks_or_tools(tmp_path):
         assert not any("<agent_memory>" in m["content"] for m in client.requests[-1])
         assert len(agent.compressor.history_ids) == len(agent.conversation_history)
         assert {"lcm_grep", "lcm_describe", "lcm_expand"} <= set(agent.tools)
+        assert "Historical-memory recall" in agent.system_prompt
         calls = [
             event
             for event in load_trace_events(writer.path)
@@ -177,7 +178,7 @@ def test_checkpoint_resume_preserves_frontier_and_excludes_later_records(tmp_pat
             resumed.close()
 
 
-def test_summary_failure_stops_on_overflow_without_discarding_history():
+def test_summary_failure_uses_recoverable_deterministic_fallback():
     client = Client([action("echo") for _ in range(6)])
 
     def fail(*args, **kwargs):
@@ -189,8 +190,12 @@ def test_summary_failure_stops_on_overflow_without_discarding_history():
         result = agent.run("Long task", max_steps=6)
         assert result["metadata"]["status"] == "context_overflow"
         assert len(agent.compressor.history_ids) == len(agent.conversation_history)
-        assert agent.compressor.frontier == agent.compressor.history_ids
-        assert len(agent.compressor.compactor.calls) <= 4
+        assert agent.compressor.frontier != agent.compressor.history_ids
+        summary = agent.compressor.store.get(
+            agent.compressor.branch, agent.compressor.frontier[0]
+        )
+        assert summary["metadata"]["summary_level"] == 3
+        assert len(agent.compressor.compactor.calls) <= 12
     finally:
         agent.close()
 
