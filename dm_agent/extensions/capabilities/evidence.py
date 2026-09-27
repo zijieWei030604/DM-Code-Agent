@@ -18,8 +18,12 @@ from dm_agent.core.events import (
 )
 from dm_agent.core.evidence import EvidenceEdge, EvidenceGraph, EvidenceNode
 from dm_agent.core.evidence_policy import EvidenceCompletionPolicy, EvidenceCompletionResult
+from dm_agent.core.execution_facts import ExecutionFact
 from dm_agent.core.guards import READ_ACTIONS, WRITE_ACTIONS
-from dm_agent.core.workspace_version import workspace_version
+from dm_agent.core.workspace_version import workspace_files, workspace_version
+from dm_agent.verification import CommandRunner
+
+from .evidence_checks import EvidenceChecks, test_identity
 
 VERIFICATION_ACTIONS = frozenset({"run_python", "run_tests", "run_linter"})
 EvidenceEnforcement = Literal["observe", "warn", "strict"]
@@ -37,6 +41,8 @@ class EvidenceGraphCapability:
         summary_chars: int = 800,
         enforcement: EvidenceEnforcement = "strict",
         repeated_contradiction: RepeatedContradiction = "critic_rejected",
+        command_runner: CommandRunner | None = None,
+        environment_id: str = "local",
     ) -> None:
         if summary_chars < 200:
             raise ValueError("summary_chars must be at least 200.")
@@ -60,6 +66,9 @@ class EvidenceGraphCapability:
         self._last_unverified_pause_signature = ""
         self._last_no_net_change_signature = ""
         self._call_plans: dict[int, str] = {}
+        self._checks = EvidenceChecks(command_runner, environment_id)
+        self._shell_snapshots: dict[int, tuple[str, dict[str, str]]] = {}
+        self._test_identities: dict[int, str] = {}
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -121,6 +130,8 @@ class EvidenceGraphCapability:
         self._write_versions.clear()
         self._write_basis_kinds.clear()
         self._call_plans.clear()
+        self._shell_snapshots.clear()
+        self._test_identities.clear()
         self._last_contradiction_signature = ""
         self._last_unverified_pause_signature = ""
         self._last_no_net_change_signature = ""
@@ -147,6 +158,13 @@ class EvidenceGraphCapability:
         self._call_plans[event.step_number] = self.graph.current_plan_id
         if _is_verification_action(event.tool_name, event.arguments):
             self._verification_versions[event.step_number] = workspace_version(self._workspace_root)
+        if event.tool_name in {"run_shell", "run_python"}:
+            self._shell_snapshots[event.step_number] = (
+                workspace_version(self._workspace_root),
+                workspace_files(self._workspace_root),
+            )
+        if event.tool_name == "run_tests":
+            self._test_identities[event.step_number] = self._test_identity(event.arguments)
         if event.tool_name in WRITE_ACTIONS:
             self._write_versions[event.step_number] = workspace_version(self._workspace_root)
             self._write_basis_kinds[event.step_number] = _write_basis_kind(event)
@@ -162,6 +180,41 @@ class EvidenceGraphCapability:
         path = self._normalize_path(event.arguments.get("path"))
         nodes: list[EvidenceNode] = []
         edges: list[EvidenceEdge] = []
+        snapshot = self._shell_snapshots.pop(event.step_number, None)
+        if snapshot is not None:
+            before_version, old_files = snapshot
+            new_files = workspace_files(self._workspace_root)
+            changed = sorted(
+                p
+                for p in old_files.keys() | new_files.keys()
+                if old_files.get(p) != new_files.get(p)
+            )
+            if changed:
+                self.graph.change_revision += 1
+                after_version = workspace_version(self._workspace_root)
+                for changed_path in changed:
+                    added, linked = self.graph.add_change(
+                        tool=event.tool_name,
+                        path=changed_path,
+                        step_number=event.step_number,
+                        before_version=before_version,
+                        after_version=after_version,
+                        basis_kind="read",
+                        phase=phase,
+                    )
+                    self._record(added, linked)
+                change_fact = ExecutionFact(
+                    "workspace_changed",
+                    "change",
+                    "workspace_changed",
+                    event.tool_name,
+                    event.step_number,
+                    event.tool_succeeded,
+                    "workspace fingerprint changed during command",
+                    tuple(changed),
+                    after_version,
+                )
+                self._record_event("workspace_changed", change_fact.to_dict())
         if event.tool_name in READ_ACTIONS:
             nodes, edges = self.graph.add_observation(
                 tool=event.tool_name,
@@ -227,8 +280,15 @@ class EvidenceGraphCapability:
                     succeeded=event.tool_succeeded,
                 )
                 self._record(nodes, edges)
+                self._test_identities.pop(event.step_number, None)
+                self._update_metadata(event.metadata)
                 return
             verification = _verification_result(event)
+            identity = self._test_identities.pop(event.step_number, "")
+            if identity and identity != self._test_identity(event.arguments):
+                identity = ""
+            verification["identity"] = identity
+            verification["baseline_node_id"] = self._regression_baseline(identity)
             passed = verification["outcome"] == "passed"
             blocking, failure_kind = self._blocking_verification(
                 verification,
@@ -266,6 +326,8 @@ class EvidenceGraphCapability:
                 change_revision=self.graph.change_revision,
                 phase=phase,
                 scope_level=str(verification["scope_level"]),
+                identity=identity,
+                baseline_node_id=str(verification["baseline_node_id"]),
             )
         if not nodes:
             nodes, edges = self.graph.add_execution(
@@ -474,19 +536,80 @@ class EvidenceGraphCapability:
     ) -> tuple[bool, str]:
         outcome = str(verification.get("outcome", "unknown"))
         failure_kind = str(verification.get("failure_kind", ""))
-        scope_level = str(verification.get("scope_level", "related"))
 
-        if _current_change_has_syntax_error(self.graph, details):
-            return True, "syntax_error"
+        if outcome != "passed" and (
+            failure_kind == "syntax_error"
+            or "SyntaxError" in details
+            or "IndentationError" in details
+        ):
+            paths = []
+            for path in self.graph.changed_paths():
+                candidate = self._workspace_root / path
+                if candidate.suffix != ".py" or not candidate.is_file():
+                    continue
+                try:
+                    paths.append(
+                        candidate.resolve().relative_to(self._workspace_root.resolve()).as_posix()
+                    )
+                except ValueError:
+                    continue
+            if paths:
+                version = workspace_version(self._workspace_root)
+                report = self._checks.syntax(self._workspace_root, paths)
+                stable = version == workspace_version(self._workspace_root)
+                self._record_event(
+                    "evidence_syntax_check",
+                    {
+                        "workspace_version": version,
+                        "paths": paths,
+                        "result": report,
+                        "stable": stable,
+                    },
+                )
+                if stable and report and report.get("errors"):
+                    return True, "syntax_error"
         if (
             tool not in {"run_tests", "run_shell"}
             or outcome != "failed"
             or failure_kind != "assertion_failure"
+            or verification.get("execution_status") != "completed"
         ):
             return False, failure_kind
-        if scope_level == "direct":
+        if tool == "run_tests" and verification.get("baseline_node_id"):
             return True, failure_kind
         return False, "suite_failure"
+
+    def _test_identity(self, arguments: dict[str, Any]) -> str:
+        return test_identity(
+            self._workspace_root,
+            arguments,
+            workspace_files(self._workspace_root),
+            self._checks.environment(self._workspace_root),
+        )
+
+    def _regression_baseline(self, identity: str) -> str:
+        if not identity:
+            return ""
+        for node in reversed(list(self.graph.nodes.values())):
+            if node.kind != "verification" or node.metadata.get("identity") != identity:
+                continue
+            if node.metadata.get("execution_status") != "completed":
+                continue
+            # A failed recheck of the same version must retain its original baseline.
+            if (
+                node.metadata.get("blocking")
+                and node.metadata.get("workspace_version") == self.graph.workspace_version
+            ):
+                return str(node.metadata.get("baseline_node_id", ""))
+            if node.metadata.get("outcome") not in {"passed", "failed"}:
+                continue
+            if (
+                node.metadata.get("passed")
+                and node.metadata.get("workspace_version") != self.graph.workspace_version
+            ):
+                return node.node_id
+            return ""
+        return ""
 
     def _completion_signature(self, decision: EvidenceCompletionResult) -> str:
         current_checks = [
@@ -555,9 +678,7 @@ class EvidenceGraphCapability:
                 "evidence_failed_verifications": audit["failed_verifications"],
                 "evidence_change_evidence_gaps": audit["completion_issues"],
                 "evidence_completion_issues": completion_issues,
-                "evidence_verification_state": metadata.get(
-                    "evidence_verification_state", _verification_state(self.graph)
-                ),
+                "evidence_verification_state": _verification_state(self.graph),
             }
         )
         if decision is not None:
@@ -722,22 +843,6 @@ def _has_prior_passing_scope(graph: EvidenceGraph, scope: tuple[str, ...]) -> bo
         if prior_scope == normalized:
             return True
     return False
-
-
-def _current_change_has_syntax_error(graph: EvidenceGraph, details: str) -> bool:
-    if "SyntaxError" not in details and "IndentationError" not in details:
-        return False
-    normalized = details.replace("\\", "/").lower()
-    current_paths = [
-        str(node.metadata.get("path", "")).replace("\\", "/")
-        for node in graph.nodes.values()
-        if node.kind == "change"
-        and int(node.metadata.get("change_revision", -1)) == graph.change_revision
-    ]
-    return any(
-        path and (path.lower() in normalized or Path(path).name.lower() in normalized)
-        for path in current_paths
-    )
 
 
 def _path_requires_verification(path: str) -> bool:

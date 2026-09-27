@@ -686,6 +686,7 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
         enable_semantic_workspace=True,
         enable_repo_map=True,
         enable_verified_edits=True,
+        enable_evidence_graph=True,
         enable_adaptive_replanning=True,
         max_replans=2,
     )
@@ -697,6 +698,11 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
     )
     assert verified.command_runner is not None
     assert verified.command_runner.__self__.container_name == "test-container"
+    evidence = next(
+        capability for capability in capabilities
+        if getattr(capability, "checkpoint_key", "") == "evidence_graph"
+    )
+    assert evidence._checks.runner.__self__.container_name == "test-container"
     assert verified.run_affected_tests is False
     assert verified.policy.check_lint is False
     assert verified.policy.check_types is False

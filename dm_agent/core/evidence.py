@@ -365,6 +365,8 @@ class EvidenceGraph:
         change_revision: int | None = None,
         phase: str = "",
         scope_level: str = "related",
+        identity: str = "",
+        baseline_node_id: str = "",
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         is_direct = False if direct is None else direct
         targets = tuple(
@@ -390,12 +392,18 @@ class EvidenceGraph:
                 "failure_kind": failure_kind,
                 "blocking": blocking,
                 "scope_level": scope_level,
+                "identity": identity,
+                "baseline_node_id": baseline_node_id,
                 "change_revision": (
                     self.change_revision if change_revision is None else change_revision
                 ),
             },
         )
         edges: list[EvidenceEdge] = self._link_plan(node.node_id, "supported_by", phase)
+        if baseline_node_id:
+            edge = self._add_edge(node.node_id, baseline_node_id, "compared_with")
+            if edge:
+                edges.append(edge)
         for change_id in targets:
             edge = self._add_edge(
                 node.node_id,
@@ -826,13 +834,24 @@ def _normalize_path(path: str) -> str:
 
 
 def _latest_verifications(nodes: Sequence[EvidenceNode]) -> list[EvidenceNode]:
-    latest: dict[tuple[str, tuple[str, ...]], EvidenceNode] = {}
+    latest: dict[tuple[str, str, tuple[str, ...]], EvidenceNode] = {}
     for node in nodes:
         key = (
             str(node.metadata.get("tool", "")),
+            str(node.metadata.get("identity") or node.metadata.get("check", "")),
             tuple(sorted(str(item).replace("\\", "/") for item in node.metadata.get("scope", []))),
         )
         current = latest.get(key)
+        if current is not None and (
+            current.metadata.get("outcome") in {"passed", "failed"}
+            or bool(current.metadata.get("blocking"))
+        ):
+            valid = bool(node.metadata.get("blocking")) or (
+                node.metadata.get("execution_status") == "completed"
+                and node.metadata.get("outcome") in {"passed", "failed"}
+            )
+            if not valid:
+                continue
         if current is None or (node.step_number or 0) >= (current.step_number or 0):
             latest[key] = node
     return list(latest.values())

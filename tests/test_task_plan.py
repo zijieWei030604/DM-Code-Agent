@@ -231,13 +231,19 @@ def test_plan_links_use_call_start_revision_and_removed_history_survives(tmp_pat
     assert analyze_events(events)["planning"]["update_count"] == 3
 
 
-def test_model_completed_plan_cannot_override_direct_failure(tmp_path, monkeypatch):
+def test_model_completed_plan_cannot_override_confirmed_regression(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    (tmp_path / "service.py").write_text("value = 1\n")
+    (tmp_path / "test_x.py").write_text("def test_target(): assert True\n")
     evidence = EvidenceGraphCapability()
+    monkeypatch.setattr(evidence._checks, "environment", lambda root: "test-environment")
+    arguments = {"targets": ["test_x.py::test_target"]}
     client = Client(
         [
             action("update_plan", {"plan": [item()]}),
-            action("run_tests", {}),
+            action("run_tests", arguments),
+            action("run_shell", {"command": "change"}),
+            action("run_tests", arguments),
             action("update_plan", {"plan": [item(status="completed")]}),
             action("finish", "all done"),
         ]
@@ -246,7 +252,7 @@ def test_model_completed_plan_cannot_override_direct_failure(tmp_path, monkeypat
         "failed",
         "AssertionError: wrong result",
         exit_code=1,
-        check_scope=("tests/test_x.py::test_target",),
+        check_scope=("test_x.py::test_target",),
         metadata={
             "verification": {
                 "execution_status": "completed",
@@ -256,13 +262,30 @@ def test_model_completed_plan_cannot_override_direct_failure(tmp_path, monkeypat
             }
         },
     )
+    passed = ToolResult(
+        "success",
+        "1 passed",
+        check_scope=failed.check_scope,
+        metadata={
+            "verification": {"execution_status": "completed", "outcome": "passed"},
+        },
+    )
+    results = iter([passed, failed])
+
+    def change(args):
+        (tmp_path / "service.py").write_text("value = 2\n")
+        return "updated"
+
     agent = ReactAgent(
         client,
-        [Tool("run_tests", "Test", lambda args: failed)],
+        [
+            Tool("run_tests", "Test", lambda args: next(results)),
+            Tool("run_shell", "Change", change),
+        ],
         capabilities=[evidence],
         enable_compression=False,
     )
-    result = agent.run("fix target", max_steps=4)
+    result = agent.run("fix target", max_steps=6)
     assert result["metadata"]["status"] != "success"
     assert result["metadata"]["evidence_completion_block_count"] == 1
     assert agent.task_plan.items[0]["status"] == "completed"

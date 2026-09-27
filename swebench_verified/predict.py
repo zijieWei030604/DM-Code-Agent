@@ -376,7 +376,14 @@ def _neutralize_windows_git_noise(workspace: Path) -> None:
 
 
 _WINDOWS_RESERVED_BASENAMES = frozenset(
-    {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }
 )
 
 
@@ -414,10 +421,7 @@ def _discard_windows_reserved_untracked_files(container: str) -> tuple[str, ...]
         ]
     )
     if listed.returncode != 0:
-        raise RuntimeError(
-            "无法从运行容器列出未跟踪文件："
-            f"{listed.stderr.strip()[:300]}"
-        )
+        raise RuntimeError("无法从运行容器列出未跟踪文件：" f"{listed.stderr.strip()[:300]}")
 
     removed: list[str] = []
     for path in (item for item in listed.stdout.split("\0") if item):
@@ -550,7 +554,12 @@ def predict_one(
                 )
             )
         if enable_evidence_graph:
-            capabilities.append(EvidenceGraphCapability())
+            capabilities.append(
+                EvidenceGraphCapability(
+                    command_runner=execution_backend.run_validation,
+                    environment_id=f"docker:{container_name}:{container_image}",
+                )
+            )
         agent = ReactAgent(
             client,
             tools,

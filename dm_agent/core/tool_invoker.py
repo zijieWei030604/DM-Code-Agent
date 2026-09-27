@@ -87,8 +87,8 @@ def render_tool_observation(result: ToolResult) -> str:
         )
     elif scope_level == "direct":
         interpretation = (
-            "This check directly exercises the requested behavior; its failure is strong "
-            "contradictory evidence that must be examined."
+            "This check selects a precise target. Inspect the failure; target precision "
+            "alone does not establish task relevance or prove the current change caused it."
         )
     elif scope_level == "broad":
         interpretation = (
@@ -101,9 +101,7 @@ def render_tool_observation(result: ToolResult) -> str:
             "current change is incorrect."
         )
     suffix = (
-        "[verification assessment]\n"
-        f"scope: {scope_level}\n"
-        f"interpretation: {interpretation}"
+        "[verification assessment]\n" f"scope: {scope_level}\n" f"interpretation: {interpretation}"
     )
     return f"{message}\n\n{suffix}" if message else suffix
 

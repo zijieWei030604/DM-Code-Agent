@@ -179,7 +179,7 @@ def test_latest_verification_supersedes_an_older_result_for_the_same_scope() -> 
         step_number=2,
         passed=True,
         workspace_version="v1",
-        check='{"verbose": true}',
+        check='{"verbose": false}',
         scope=("tests/test_service.py",),
         outcome="passed",
         blocking=False,
@@ -623,6 +623,15 @@ def test_evidence_capability_never_injects_status_and_rejects_repeated_contradic
             result=_test_result(outcome="failed", scope=("tests/test_users.py::test_update",)),
         )
     )
+    # This test exercises enforcement of an already-confirmed contradiction.
+    capability.graph.add_verification(
+        tool="run_tests",
+        step_number=2,
+        passed=False,
+        workspace_version=capability.graph.workspace_version,
+        failure_kind="assertion_failure",
+        blocking=True,
+    )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 3, "run-1", metadata)
     first = bus.emit_before_finish(finish)
     second = bus.emit_before_finish(finish)
@@ -655,6 +664,14 @@ def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> N
             metadata,
             result=_test_result(outcome="failed", scope=("tests/test_users.py::test_update",)),
         )
+    )
+    capability.graph.add_verification(
+        tool="run_tests",
+        step_number=1,
+        passed=False,
+        workspace_version=capability.graph.workspace_version,
+        failure_kind="assertion_failure",
+        blocking=True,
     )
     finish = BeforeFinishEvent("Fix users", "finish", "done", [], 2, "run-1", metadata)
 
@@ -805,7 +822,7 @@ def test_declared_shell_verification_can_mark_current_workspace_tested() -> None
     assert metadata["evidence_verification_state"] == "tested"
 
 
-def test_direct_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -> None:
+def test_direct_shell_assertion_without_comparison_is_advisory() -> None:
     bus = EventBus()
     capability = EvidenceGraphCapability(repeated_contradiction="critic_rejected")
     capability.install(CapabilityContext(bus, lambda phase: None))
@@ -859,10 +876,9 @@ def test_direct_shell_assertion_failure_blocks_but_ordinary_shell_does_not() -> 
         BeforeFinishEvent("Fix service", "finish", "done", [], 3, "run-1", metadata)
     )
 
-    assert block is not None
-    assert "Latest failed verification" in block["reason"]
-    assert "AssertionError" in block["reason"]
-    assert metadata["evidence_verification_state"] == "contradicted"
+    assert block is None
+    assert metadata["evidence_verification_state"] == "unavailable"
+    assert not capability.graph.current_verifications()[0].metadata["blocking"]
 
 
 def test_related_shell_failure_is_recorded_without_blocking_completion() -> None:
@@ -960,6 +976,14 @@ def test_new_edit_makes_prior_confirmed_failure_stale_and_allows_unverified_fini
             result=_test_result(outcome="failed", scope=("tests/test_service.py::test_update",)),
         )
     )
+    capability.graph.add_verification(
+        tool="run_tests",
+        step_number=1,
+        passed=False,
+        workspace_version=capability.graph.workspace_version,
+        failure_kind="assertion_failure",
+        blocking=True,
+    )
     first = bus.emit_before_finish(
         BeforeFinishEvent("Fix service", "finish", "done", [], 2, "run-1", metadata)
     )
@@ -1041,9 +1065,7 @@ def test_syntax_error_in_current_changed_file_blocks_completion(tmp_path, monkey
     assert metadata["evidence_policy_issues"][0]["status"] == "confirmed_code_error"
 
 
-def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
-    tmp_path, monkeypatch
-) -> None:
+def test_react_agent_accepts_finish_after_failure_without_baseline(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
 
     def failed_test(arguments: dict[str, Any]) -> ToolResult:
@@ -1065,9 +1087,9 @@ def test_react_agent_returns_critic_rejected_after_repeated_contradiction(
 
     result = agent.run("Fix the failing test", max_steps=3)
 
-    assert result["metadata"]["status"] == "critic_rejected"
-    assert result["metadata"]["evidence_completion_block_count"] == 2
-    assert result["metadata"]["evidence_terminal_rejection_count"] == 1
+    assert result["metadata"]["status"] == "success"
+    assert result["metadata"]["evidence_completion_block_count"] == 0
+    assert result["metadata"]["evidence_terminal_rejection_count"] == 0
     assert result["steps"][-1]["action"] == "finish"
 
 

@@ -91,6 +91,28 @@ def _git_workspace_paths(root: Path) -> list[Path] | None:
     if completed.returncode != 0:
         return None
     return sorted(
-        (Path(item.decode("utf-8", errors="surrogateescape")) for item in completed.stdout.split(b"\0") if item),
+        (
+            Path(item.decode("utf-8", errors="surrogateescape"))
+            for item in completed.stdout.split(b"\0")
+            if item
+        ),
         key=lambda path: path.as_posix(),
     )
+
+
+def workspace_files(root: Path) -> dict[str, str]:
+    """Fingerprint source/config files using the version scanner's exclusions."""
+    paths = _git_workspace_paths(root)
+    if paths is None:
+        paths = []
+        for directory, children, files in os.walk(root):
+            children[:] = sorted(
+                name for name in children if name not in _IGNORED and not name.startswith(".")
+            )
+            paths.extend((Path(directory) / name).relative_to(root) for name in sorted(files))
+    result = {}
+    for relative in paths:
+        path = root / relative
+        if path.is_file() and not path.is_symlink() and path.suffix in _SUFFIXES:
+            result[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result

@@ -143,7 +143,7 @@ def test_structured_status_does_not_depend_on_output_words():
     [
         (
             {"execution_status": "completed", "outcome": "failed", "scope_level": "direct"},
-            "strong contradictory evidence",
+            "target precision alone does not establish task relevance",
         ),
         (
             {"execution_status": "completed", "outcome": "failed", "scope_level": "related"},
