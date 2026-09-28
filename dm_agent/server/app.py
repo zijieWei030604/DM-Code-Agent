@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -23,7 +24,8 @@ from starlette.types import Scope
 
 from dm_agent import __version__
 
-from .routes import conversations, meta, runs, sessions
+from .projection import TraceProjectionWorker
+from .routes import conversations, meta, runs, sessions, trace_index
 from .runs import RunRegistry
 from .settings import ServerSettings
 
@@ -49,7 +51,14 @@ def default_static_dir() -> Path | None:
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """关停时把还在跑的子进程收掉，不留孤儿 agent 继续改你的工作区。"""
+    worker = TraceProjectionWorker(app.state.settings.sessions_dir)
+    app.state.trace_projection = worker
+    # 首个查询不应抢在后台循环的首轮同步之前。
+    await asyncio.to_thread(worker.projection.sync_directory, worker.sessions_dir)
+    projection_task = asyncio.create_task(worker.run())
     yield
+    worker.stop()
+    await projection_task
     registry = getattr(app.state, "registry", None)
     if isinstance(registry, RunRegistry):
         registry.stop_all()
@@ -108,6 +117,7 @@ def create_app(settings: ServerSettings) -> FastAPI:
 
     app.include_router(meta.router)
     app.include_router(sessions.router)
+    app.include_router(trace_index.router)
     app.include_router(runs.router)
     app.include_router(conversations.router)
 
