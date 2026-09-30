@@ -121,6 +121,7 @@ class EvidenceGraphCapability:
         self._record_event(
             "evidence_graph_started",
             {
+                "schema": "evidence-4",
                 "task": event.task,
                 "workspace_version": self.graph.workspace_version,
             },
@@ -148,7 +149,7 @@ class EvidenceGraphCapability:
                 "evidence_intervention_prompt_count": 0,
                 "evidence_terminal_rejection_count": 0,
                 "evidence_enforcement": self.enforcement,
-                "evidence_schema_version": 3,
+                "evidence_schema_version": 4,
                 "evidence_verification_state": "not_run",
             }
         )
@@ -274,12 +275,6 @@ class EvidenceGraphCapability:
                         "workspace_version": self.graph.workspace_version,
                     },
                 )
-                nodes, edges = self.graph.add_execution(
-                    tool=event.tool_name,
-                    step_number=event.step_number,
-                    succeeded=event.tool_succeeded,
-                )
-                self._record(nodes, edges)
                 self._test_identities.pop(event.step_number, None)
                 self._update_metadata(event.metadata)
                 return
@@ -329,12 +324,6 @@ class EvidenceGraphCapability:
                 identity=identity,
                 baseline_node_id=str(verification["baseline_node_id"]),
             )
-        if not nodes:
-            nodes, edges = self.graph.add_execution(
-                tool=event.tool_name,
-                step_number=event.step_number,
-                succeeded=event.tool_succeeded,
-            )
         if nodes or edges:
             self._record(nodes, edges)
             self._update_metadata(event.metadata)
@@ -342,6 +331,7 @@ class EvidenceGraphCapability:
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
         self.graph.workspace_version = workspace_version(self._workspace_root)
         self._sync_plan()
+        self._record_verified_edit_checks(event)
         decision = self.completion_policy.evaluate(
             self.graph,
             verified_transaction=str(event.metadata.get("edit_transaction_status", "")).startswith(
@@ -366,6 +356,8 @@ class EvidenceGraphCapability:
                 step_number=event.step_number,
                 accepted=False,
                 evidence_status="no_net_change",
+                decision="block",
+                reason=reason,
             )
             self._record(nodes, edges)
             event.metadata["evidence_completion_block_count"] = (
@@ -412,6 +404,16 @@ class EvidenceGraphCapability:
                 "unverified"
                 if not should_block and decision.decision == "warn"
                 else decision.verification_state
+            ),
+            decision="block" if should_block else "allow",
+            reason=(
+                "Completion requires a current verification before it can be accepted."
+                if pause_unverified
+                else (
+                    "Completion accepted by the current evidence policy."
+                    if not should_block
+                    else "Completion rejected by the current evidence policy."
+                )
             ),
         )
         self._record(nodes, edges)
@@ -639,6 +641,48 @@ class EvidenceGraphCapability:
             }
         )
         self._record_event("evidence_summary", audit)
+
+    def _record_verified_edit_checks(self, event: BeforeFinishEvent) -> None:
+        """Project committed verified-edit results into auditable verification facts.
+
+        VerifiedEdits runs earlier in the same ``before_finish`` hook chain.  Its
+        structured report is therefore available here, before the completion
+        policy decides whether a committed transaction establishes ``tested``.
+        """
+        if not str(event.metadata.get("edit_transaction_status", "")).startswith("committed"):
+            return
+        reports = event.metadata.get("edit_verification_results")
+        if not isinstance(reports, list):
+            return
+        version = self.graph.workspace_version
+        for index, item in enumerate(reports, start=1):
+            if not isinstance(item, Mapping):
+                continue
+            marker = f"verified-edit-{index}:{item.get('name', '')}"
+            if any(
+                node.kind == "verification"
+                and node.metadata.get("identity") == marker
+                and node.metadata.get("workspace_version") == version
+                for node in self.graph.nodes.values()
+            ):
+                continue
+            passed = bool(item.get("passed"))
+            nodes, edges = self.graph.add_verification(
+                tool="verified_edits",
+                step_number=event.step_number,
+                passed=passed,
+                workspace_version=version,
+                check=str(item.get("name") or "verified edit check"),
+                details=str(item.get("detail") or ""),
+                scope=tuple(str(path) for path in event.metadata.get("edit_transaction_paths", ())),
+                direct=False,
+                execution_status="completed",
+                outcome="passed" if passed else "failed",
+                failure_kind=str(item.get("kind") or ""),
+                blocking=not passed,
+                identity=marker,
+            )
+            self._record(nodes, edges)
 
     def _sync_plan(self) -> None:
         if not callable(self._get_run_state):

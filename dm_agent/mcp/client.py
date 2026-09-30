@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any
@@ -348,3 +350,78 @@ class MCPClient:
             True
         """
         return self.process is not None and self.process.poll() is None
+
+
+class MCPHTTPClient:
+    """MCP client for Streamable HTTP (with legacy SSE response tolerance)."""
+
+    def __init__(self, name: str, url: str, headers: dict[str, str] | None = None, request_timeout: float = 5.0):
+        self.name = name
+        self.url = url
+        self.headers = headers or {}
+        self.request_timeout = max(0.1, float(request_timeout))
+        self.tools: list[dict[str, Any]] = []
+        self._message_id = 0
+        self._running = False
+
+    def start(self) -> bool:
+        result = self._send_message("initialize", {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "dm-code-agent", "version": "1.1.0"},
+        })
+        if not result:
+            return False
+        tools_result = self._send_message("tools/list")
+        if not isinstance(tools_result, dict) or not isinstance(tools_result.get("tools"), list):
+            return False
+        self.tools = tools_result["tools"]
+        self._running = True
+        return True
+
+    def stop(self) -> None:
+        self._running = False
+
+    def is_running(self) -> bool:
+        return self._running
+
+    def get_tools(self) -> list[dict[str, Any]]:
+        return self.tools.copy()
+
+    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
+        result = self._send_message("tools/call", {"name": tool_name, "arguments": arguments})
+        if not isinstance(result, dict):
+            return None
+        content = result.get("content", [])
+        if isinstance(content, list):
+            texts = [str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content]
+            return "\n".join(texts)
+        return str(content)
+
+    def _send_message(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        self._message_id += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": self._message_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **self.headers}
+        request = urllib.request.Request(self.url, data=json.dumps(message).encode(), headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+        except (OSError, urllib.error.URLError):
+            return None
+        if response.headers.get_content_type() == "text/event-stream":
+            for line in body.splitlines():
+                if line.startswith("data:"):
+                    try:
+                        value = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(value, dict) and value.get("id") == self._message_id:
+                        return value.get("result")
+            return None
+        try:
+            value = json.loads(body)
+        except json.JSONDecodeError:
+            return None
+        return value.get("result") if isinstance(value, dict) and "error" not in value else None

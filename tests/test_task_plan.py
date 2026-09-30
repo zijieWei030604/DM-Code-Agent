@@ -40,9 +40,10 @@ class Client:
 
 def agent_for(responses, **kwargs):
     client = Client(responses)
+    tools = kwargs.pop("tools", [Tool("echo", "Echo", lambda args: "ok", read_only=True)])
     agent = ReactAgent(
         client,
-        [Tool("echo", "Echo", lambda args: "ok", read_only=True)],
+        tools,
         enable_compression=False,
         **kwargs,
     )
@@ -196,30 +197,27 @@ def test_plan_links_use_call_start_revision_and_removed_history_survives(tmp_pat
     agent, _ = agent_for(
         [
             action("update_plan", {"plan": [item()]}),
-            action("echo", {}),
+            action("read_file", {"path": "x.py"}),
             action("update_plan", {"plan": [item("P2", step="Different route")]}),
-            action("echo", {}),
+            action("read_file", {"path": "x.py"}),
             action("update_plan", {"plan": []}),
-            action("echo", {}),
+            action("read_file", {"path": "x.py"}),
             action("finish", "done"),
         ],
         capabilities=[evidence],
         trace_writer=writer,
+        tools=[Tool("read_file", "Read", lambda args: "ok", read_only=True)],
     )
     agent.run("work", max_steps=7)
     writer.close()
     graph = evidence.graph
-    nodes = {
-        node.step_number: node for node in graph.nodes.values() if node.kind == "tool_execution"
-    }
+    nodes = {node.step_number: node for node in graph.nodes.values() if node.kind == "observation"}
     links = {
         edge.source_id: graph.nodes[edge.target_id]
         for edge in graph.edges
         if edge.relation == "occurred_during"
     }
-    assert nodes[1].node_id not in links
     assert links[nodes[2].node_id].metadata["plan_id"] == "P1"
-    assert links[nodes[3].node_id].metadata["plan_id"] == "P1"
     assert links[nodes[4].node_id].metadata["plan_id"] == "P2"
     assert nodes[6].node_id not in links
     plans = [node for node in graph.nodes.values() if node.kind == "plan_step"]

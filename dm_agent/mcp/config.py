@@ -31,6 +31,9 @@ class MCPServerConfig:
     enabled: bool = True
     # 单次 JSON-RPC 请求的超时秒数
     timeout: float = 5.0
+    transport: str = "stdio"
+    url: str = ""
+    headers: dict[str, str] | None = None
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "MCPServerConfig":
@@ -57,6 +60,9 @@ class MCPServerConfig:
             env=data.get("env"),
             enabled=data.get("enabled", True),
             timeout=float(data.get("timeout", 5.0)),
+            transport=str(data.get("transport", "stdio")).lower(),
+            url=str(data.get("url", "")),
+            headers=data.get("headers"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,6 +88,12 @@ class MCPServerConfig:
             result["enabled"] = self.enabled
         if self.timeout != 5.0:
             result["timeout"] = self.timeout
+        if self.transport != "stdio":
+            result["transport"] = self.transport
+        if self.url:
+            result["url"] = self.url
+        if self.headers:
+            result["headers"] = self.headers
         return result
 
 

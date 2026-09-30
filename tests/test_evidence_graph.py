@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from dm_agent.core import ReactAgent
 from dm_agent.core.capabilities import CapabilityContext
 from dm_agent.core.checkpoint import RunCheckpoint
@@ -116,7 +118,8 @@ def test_evidence_graph_builds_a_verified_chain_and_round_trips() -> None:
     assert any(edge.relation == "read_before_edit" for edge in graph.edges)
     assert not any(edge.relation == "motivated_by" for edge in graph.edges)
     assert any(edge.relation == "checked_at_completion" for edge in graph.edges)
-    assert any(edge.relation == "verifies" for edge in graph.edges)
+    verification = next(node for node in graph.nodes.values() if node.kind == "verification")
+    assert verification.metadata["target_change_ids"] == ["change-1"]
     assert {edge.confidence for edge in graph.edges} <= {"deterministic", "claimed", "inferred"}
     assert conclusion[0].metadata["evidence_status"] == graph.status()
 
@@ -192,32 +195,31 @@ def test_latest_verification_supersedes_an_older_result_for_the_same_scope() -> 
     assert current[0].metadata["passed"] is True
 
 
-def test_legacy_edge_confidence_is_migrated_to_the_three_source_levels() -> None:
-    graph = EvidenceGraph.from_dict(
-        {
-            "task": "legacy",
-            "nodes": [
-                {"node_id": "requirement-1", "kind": "requirement", "title": "legacy"},
-                {"node_id": "change-1", "kind": "change", "title": "changed"},
-            ],
-            "edges": [
-                {
-                    "source_id": "change-1",
-                    "target_id": "requirement-1",
-                    "relation": "old-direct",
-                    "confidence": "direct",
-                },
-                {
-                    "source_id": "requirement-1",
-                    "target_id": "change-1",
-                    "relation": "old-indirect",
-                    "confidence": "indirect",
-                },
-            ],
-        }
-    )
-
-    assert [edge.confidence for edge in graph.edges] == ["deterministic", "inferred"]
+def test_legacy_evidence_schema_is_rejected() -> None:
+    with pytest.raises(ValueError, match="Unsupported evidence graph schema"):
+        EvidenceGraph.from_dict(
+            {
+                "task": "legacy",
+                "nodes": [
+                    {"node_id": "requirement-1", "kind": "requirement", "title": "legacy"},
+                    {"node_id": "change-1", "kind": "change", "title": "changed"},
+                ],
+                "edges": [
+                    {
+                        "source_id": "change-1",
+                        "target_id": "requirement-1",
+                        "relation": "old-direct",
+                        "confidence": "direct",
+                    },
+                    {
+                        "source_id": "requirement-1",
+                        "target_id": "change-1",
+                        "relation": "old-indirect",
+                        "confidence": "indirect",
+                    },
+                ],
+            }
+        )
 
 
 def test_failed_verification_contradicts_a_change() -> None:
@@ -644,7 +646,7 @@ def test_evidence_capability_never_injects_status_and_rejects_repeated_contradic
     conclusions = [node for node in capability.graph.nodes.values() if node.kind == "conclusion"]
     assert conclusions and all(node.metadata["accepted"] is False for node in conclusions)
     assert capability.graph.audit()["has_conclusion"] is False
-    assert any(edge.relation == "attempts_to_conclude" for edge in capability.graph.edges)
+    assert {node.metadata["decision"] for node in conclusions} == {"block"}
 
 
 def test_benchmark_policy_marks_repeated_unchanged_contradiction_terminal() -> None:
@@ -1210,16 +1212,26 @@ def test_evidence_gate_accepts_prior_verified_edit_transaction(tmp_path, monkeyp
             result=ToolResult("success", "updated", changed_files=(str(target),)),
         )
     )
-    metadata["edit_transaction_status"] = "committed"
+    metadata.update(
+        {
+            "edit_transaction_status": "committed",
+            "edit_transaction_paths": ["service.py"],
+            "edit_verification_results": [
+                {"name": "pytest tests/test_service.py", "passed": True, "detail": "1 passed"}
+            ],
+        }
+    )
 
     block = bus.emit_before_finish(
         BeforeFinishEvent("Update service", "finish", "done", [], 3, "run", metadata)
     )
 
     assert block is None
-    # VerifiedEdit owns transaction validation; the graph deliberately records
-    # no fabricated run_tests node merely to make its factual status verified.
-    assert capability.graph.status() == "implemented"
+    checks = [node for node in capability.graph.nodes.values() if node.kind == "verification"]
+    assert len(checks) == 1
+    assert checks[0].metadata["tool"] == "verified_edits"
+    conclusion = next(node for node in capability.graph.nodes.values() if node.kind == "conclusion")
+    assert conclusion.metadata["evidence_ids"] == [checks[0].node_id]
     assert metadata["evidence_completion_decision"] == "allow"
 
 
@@ -1236,6 +1248,14 @@ def test_checkpoint_and_trace_rebuild_preserve_evidence_state() -> None:
     assert restored.status() == "implemented"
 
     events = [
+        {
+            "event": "evidence_graph_started",
+            "payload": {
+                "schema": "evidence-4",
+                "task": "Fix parser",
+                "workspace_version": "",
+            },
+        },
         *({"event": "evidence_node", "payload": node.to_dict()} for node in nodes),
         *({"event": "evidence_edge", "payload": edge.to_dict()} for edge in edges),
     ]

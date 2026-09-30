@@ -4,7 +4,7 @@ from typing import Any
 
 from dm_agent.tools.base import Tool
 
-from .client import MCPClient
+from .client import MCPClient, MCPHTTPClient
 from .config import MCPConfig, MCPServerConfig
 
 
@@ -29,7 +29,7 @@ class MCPManager:
 
         """
         self.config = config or MCPConfig()
-        self.clients: dict[str, MCPClient] = {}
+        self.clients: dict[str, MCPClient | MCPHTTPClient] = {}
         self._tools_cache: list[Tool] = []
         # 每个服务器的自动重连次数（用于审计与测试）
         self.reconnect_counts: dict[str, int] = {}
@@ -93,13 +93,24 @@ class MCPManager:
             return False
 
         # 创建并启动客户端
-        client = MCPClient(
-            name=name,
-            command=server_config.command,
-            args=server_config.args,
-            env=server_config.env,
-            request_timeout=server_config.timeout,
-        )
+        if server_config.transport in {"http", "streamable-http", "sse"}:
+            if not server_config.url:
+                print(f"[MCP] 远程服务器 '{name}' 缺少 url")
+                return False
+            client = MCPHTTPClient(
+                name=name,
+                url=server_config.url,
+                headers=server_config.headers,
+                request_timeout=server_config.timeout,
+            )
+        else:
+            client = MCPClient(
+                name=name,
+                command=server_config.command,
+                args=server_config.args,
+                env=server_config.env,
+                request_timeout=server_config.timeout,
+            )
 
         if client.start():
             self.clients[name] = client
@@ -245,7 +256,7 @@ class MCPManager:
             input_schema=input_schema,
         )
 
-    def _try_reconnect(self, server_name: str) -> MCPClient | None:
+    def _try_reconnect(self, server_name: str) -> MCPClient | MCPHTTPClient | None:
         """对已配置且启用的服务器做单次重连；成功返回新客户端，失败返回 None。"""
         server_config = self.config.servers.get(server_name)
         if not server_config or not server_config.enabled:

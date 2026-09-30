@@ -14,17 +14,24 @@ def rebuild_evidence_graph(events: Sequence[Mapping[str, Any]]) -> EvidenceGraph
     edges: list[dict[str, Any]] = []
     task = ""
     snapshot_version = ""
+    enabled = False
     for event in events:
         name = event.get("event")
         payload = event.get("payload")
         if not isinstance(payload, Mapping):
             continue
         if name == "evidence_graph_started":
+            if payload.get("schema") != "evidence-4":
+                raise ValueError("Unsupported evidence graph trace schema.")
+            enabled = True
             nodes = []
             edges = []
             snapshot_version = str(payload.get("workspace_version", ""))
             task = str(payload.get("task", ""))
         elif name == "evidence_snapshot":
+            if payload.get("schema") != "evidence-4":
+                raise ValueError("Unsupported evidence graph checkpoint schema.")
+            enabled = True
             nodes = list(payload.get("nodes", []))
             edges = list(payload.get("edges", []))
             task = str(payload.get("task", ""))
@@ -42,15 +49,18 @@ def rebuild_evidence_graph(events: Sequence[Mapping[str, Any]]) -> EvidenceGraph
             snapshot_version = str(payload["workspace_version"])
         elif name == "evidence_edge":
             edges.append(dict(payload))
-    graph = EvidenceGraph.from_dict({"task": task, "nodes": nodes, "edges": edges})
+    graph = EvidenceGraph.from_dict(
+        {"schema": "evidence-4", "task": task, "nodes": nodes, "edges": edges}
+    )
     graph.workspace_version = snapshot_version
+    graph.trace_enabled = enabled
     return graph
 
 
 def analyze_evidence_events(events: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """Return a compact, deterministic evidence coverage report."""
     graph = rebuild_evidence_graph(events)
-    enabled = bool(graph.nodes)
+    enabled = graph.trace_enabled
     if not enabled:
         return {
             "enabled": False,

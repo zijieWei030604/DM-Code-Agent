@@ -251,6 +251,13 @@ class VerifiedEditCapability:
                 },
             )
         report = self.runner.verify(self._changed, affected_tests=tests)
+        metadata["edit_verification_results"] = [
+            {"name": item.name, "passed": item.passed, "detail": item.detail}
+            for item in report.results
+        ]
+        metadata["edit_transaction_paths"] = [
+            path.relative_to(self.root).as_posix() for path in sorted(self._changed)
+        ]
         metadata["edit_validation_count"] = int(metadata.get("edit_validation_count", 0)) + len(
             report.results
         )

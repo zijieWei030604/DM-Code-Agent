@@ -35,6 +35,20 @@
 
 ## 证据边界
 
+## 证据投影
+
+证据图是从 append-only trace 投影出的轻量视图，采用 `evidence-4` schema；旧 schema
+不自动迁移。任务文本和运行标识属于 run metadata，不再作为图中的重复根节点。图只保留
+`plan_step`、`observation`、`change`、`verification` 与 `conclusion` 五类节点。
+
+关系只表达需要跨记录追溯的事实：`occurred_during` 关联事实与当时的计划项；
+`read_before_edit` 关联同文件同版本的读取与修改；`compared_with` 关联可比较验证基线；
+`checked_at_completion` 记录完成判断实际采用的当前验证。验证结果、阻断性、完成决定、
+理由和 policy version 存在节点字段中，不再以额外边重复表达。
+
+Verified Edits 提交事务时，会将实际校验条目投影为 `verification` 节点；因此 `tested`
+完成结论始终能回溯到具体检查记录。
+
 `read_before_edit` 表示同文件、同版本的先前读取，不声称它一定是模型决策原因。
 `checked_at_completion` 指向完成检查时当前有效的验证记录，包含失败记录，不等于通过认证。
 旧版本验证留作复盘，但不作为新版本正确性的证明。
