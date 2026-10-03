@@ -19,6 +19,7 @@ from dm_agent.core.capabilities import AgentCapability
 from dm_agent.core.checkpoint import RunCheckpoint
 from dm_agent.extensions.capabilities import (
     EvidenceGraphCapability,
+    LspImpactCapability,
     RepeatCallRedirectCapability,
     SemanticWorkspaceCapability,
     VerifiedEditCapability,
@@ -26,7 +27,8 @@ from dm_agent.extensions.capabilities import (
 from dm_agent.mcp import MCPManager, load_mcp_config
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.skills import SkillManager
-from dm_agent.tools import bind_semantic_workspace_tools
+from dm_agent.lsp_impact.service import LspImpactService
+from dm_agent.tools import bind_lsp_impact_tools, bind_semantic_workspace_tools
 from dm_agent.tracing import SessionWriter, TraceWriter
 from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
@@ -109,6 +111,7 @@ def create_agent(
     advanced = resolve_advanced_features(config)
     capabilities: list[AgentCapability] = []
     workspace_engine = None
+    lsp_service = None
     if config.enable_semantic_workspace or config.enable_repo_map or config.enable_verified_edits:
         workspace_engine = SemanticWorkspaceEngine(Path.cwd())
         bind_semantic_workspace_tools(tools, workspace_engine)
@@ -118,6 +121,14 @@ def create_agent(
         capabilities.append(
             VerifiedEditCapability(Path.cwd(), engine=workspace_engine, policy=VerificationPolicy())
         )
+    if config.enable_lsp_impact:
+        lsp_service = LspImpactService(
+            Path.cwd(),
+            command=config.lsp_impact_command,
+            timeout_seconds=config.lsp_impact_timeout_seconds,
+        )
+        bind_lsp_impact_tools(tools, lsp_service)
+        capabilities.append(LspImpactCapability(lsp_service))
     if config.enable_evidence_graph:
         capabilities.append(EvidenceGraphCapability())
     if config.enable_repeat_call_redirect:
@@ -146,7 +157,7 @@ def create_agent(
         event_bus=(
             extension_registry.create_event_bus() if extension_registry is not None else None
         ),
-        owned_resources=([workspace_engine] if workspace_engine is not None else []),
+        owned_resources=([resource for resource in (workspace_engine, lsp_service) if resource is not None]),
     )
 
 
@@ -223,6 +234,7 @@ def _assemble_agent(
                 "adaptive_replanning_enabled": advanced["adaptive_replanning"],
                 "semantic_workspace_enabled": config.enable_semantic_workspace,
                 "semantic_impact_enabled": config.enable_semantic_workspace,
+                "lsp_impact_enabled": config.enable_lsp_impact,
                 "verified_edits_enabled": advanced["verified_edits"],
                 "evidence_graph_enabled": advanced["evidence_graph"],
                 "max_replans": config.max_replans,

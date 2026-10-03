@@ -42,6 +42,9 @@ class Config:
     context_token_budget: int = 24000
     enable_edit_guard: bool = True
     enable_semantic_workspace: bool = False
+    enable_lsp_impact: bool = False
+    lsp_impact_command: str = "pyright-langserver"
+    lsp_impact_timeout_seconds: float = 5.0
     enable_repo_map: bool = False
     enable_verified_edits: bool = False
     enable_evidence_graph: bool = False
@@ -88,6 +91,9 @@ def save_config_to_file(config: Config) -> None:
             "context_token_budget": config.context_token_budget,
             "enable_edit_guard": config.enable_edit_guard,
             "enable_semantic_workspace": config.enable_semantic_workspace,
+            "enable_lsp_impact": config.enable_lsp_impact,
+            "lsp_impact_command": config.lsp_impact_command,
+            "lsp_impact_timeout_seconds": config.lsp_impact_timeout_seconds,
             "enable_repo_map": config.enable_repo_map,
             "enable_verified_edits": config.enable_verified_edits,
             "enable_evidence_graph": config.enable_evidence_graph,
@@ -141,6 +147,7 @@ def resolve_advanced_features(config: Config) -> dict[str, bool]:
     return {
         "adaptive_replanning": config.enable_adaptive_replanning,
         "semantic_workspace": config.enable_semantic_workspace,
+        "lsp_impact": config.enable_lsp_impact,
         "verified_edits": config.enable_verified_edits,
         "evidence_graph": config.enable_evidence_graph,
         "repeat_call_redirect": config.enable_repeat_call_redirect,
@@ -155,6 +162,7 @@ def format_advanced_feature_status(config: Config) -> str:
         for key, label in [
             ("adaptive_replanning", "adaptive-replan"),
             ("semantic_workspace", "semantic-workspace"),
+            ("lsp_impact", "lsp-impact"),
             ("verified_edits", "verified-edits"),
             ("evidence_graph", "evidence-graph"),
             ("repeat_call_redirect", "repeat-call-redirect"),

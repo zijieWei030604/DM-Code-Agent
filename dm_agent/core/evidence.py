@@ -250,6 +250,42 @@ class EvidenceGraph:
         edges = self._link_current_plan(node.node_id)
         return [node], edges
 
+    def add_lsp_impact(
+        self, *, report: Mapping[str, Any], step_number: int
+    ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
+        """Record an LSP impact report as an observation linked to this change."""
+        path = _normalize_path(str(report.get("path", "")))
+        node = self._new_node(
+            "observation",
+            f"LSP impact for {path or '<workspace>'}",
+            step_number,
+            {
+                "tool": "lsp_impact",
+                "kind": "lsp_impact",
+                "path": path,
+                "status": str(report.get("status", "unknown")),
+                "report_id": str(report.get("report_id", "")),
+                "changed_symbols": list(report.get("changed_symbols") or ()),
+                "candidate_files": list(report.get("candidate_files") or ()),
+                "new_error_count": len(list(report.get("new_error_diagnostics") or ())),
+                "truncated": bool(report.get("truncated", False)),
+                "workspace_version": self.workspace_version,
+            },
+        )
+        edges = self._link_current_plan(node.node_id)
+        changes = [
+            item
+            for item in self.nodes.values()
+            if item.kind == "change"
+            and item.step_number == step_number
+            and _normalize_path(str(item.metadata.get("path", ""))) == path
+        ]
+        for change in changes[-1:]:
+            edge = self._add_edge(change.node_id, node.node_id, "derived_from")
+            if edge:
+                edges.append(edge)
+        return [node], edges
+
     def add_change(
         self,
         *,
@@ -406,6 +442,17 @@ class EvidenceGraph:
         )
         edges: list[EvidenceEdge] = []
         for item in self.current_verifications():
+            edge = self._add_edge(
+                node.node_id,
+                item.node_id,
+                "checked_at_completion",
+                confidence="deterministic",
+            )
+            if edge:
+                edges.append(edge)
+        for item in self._nodes_of_kind("observation"):
+            if item.metadata.get("kind") != "lsp_impact":
+                continue
             edge = self._add_edge(
                 node.node_id,
                 item.node_id,

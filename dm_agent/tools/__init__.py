@@ -56,6 +56,12 @@ from .structured_edit_tools import (
     inspect_python_symbol,
     inspect_python_symbol_result,
 )
+from .lsp_impact_tools import (
+    analyze_lsp_impact,
+    analyze_lsp_impact_result,
+    lsp_query,
+    lsp_query_result,
+)
 
 if TYPE_CHECKING:
     from dm_agent.extensions import ExtensionAPI, ExtensionRegistry
@@ -197,6 +203,16 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         ("path", "qualified_name", "expected_hash", "operation", "content"),
     ),
     "task_complete": _object_schema({"message": _STR}),
+    "analyze_lsp_impact": _object_schema({"path": _STR}, ("path",)),
+    "lsp_query": _object_schema(
+        {
+            "path": _STR,
+            "action": {"type": "string", "enum": ["symbols", "references", "definition", "diagnostics"]},
+            "line": _INT,
+            "character": _INT,
+        },
+        ("path", "action"),
+    ),
 }
 
 
@@ -438,6 +454,28 @@ def _builtin_tools() -> list[Tool]:
             result_runner=edit_python_symbol_result,
         ),
         Tool(
+            name="analyze_lsp_impact",
+            description=(
+                "Analyze a Python file's current LSP reference impact and diagnostics. "
+                'Arguments: {"path": string}. Available when --enable-lsp-impact is enabled.'
+            ),
+            runner=analyze_lsp_impact,
+            result_runner=analyze_lsp_impact_result,
+            read_only=True,
+        ),
+        Tool(
+            name="lsp_query",
+            description=(
+                "Query LSP symbols, references, definition, or diagnostics for a Python file. "
+                'Arguments: {"path": string, "action": "symbols"|"references"|"definition"|"diagnostics", '
+                '"line": optional zero-based int, "character": optional zero-based int}. '
+                "Available when --enable-lsp-impact is enabled."
+            ),
+            runner=lsp_query,
+            result_runner=lsp_query_result,
+            read_only=True,
+        ),
+        Tool(
             name="task_complete",
             description='Mark the task as complete and finish execution. Arguments: {"message": optional string with completion summary}.',
             runner=task_complete,
@@ -472,6 +510,29 @@ def bind_semantic_workspace_tools(tools: list[Tool], engine: SemanticWorkspaceEn
             )
 
 
+def bind_lsp_impact_tools(tools: list[Tool], service: Any) -> None:
+    """Bind LSP tool schemas to this run's shared service (also MCP-schema compatible)."""
+    for index, tool in enumerate(tools):
+        if tool.name == "analyze_lsp_impact" and tool.runner is analyze_lsp_impact:
+            tools[index] = Tool(
+                name=tool.name,
+                description=tool.description,
+                runner=partial(analyze_lsp_impact, service=service),
+                result_runner=partial(analyze_lsp_impact_result, service=service),
+                read_only=True,
+                input_schema=tool.input_schema,
+            )
+        elif tool.name == "lsp_query" and tool.runner is lsp_query:
+            tools[index] = Tool(
+                name=tool.name,
+                description=tool.description,
+                runner=partial(lsp_query, service=service),
+                result_runner=partial(lsp_query_result, service=service),
+                read_only=True,
+                input_schema=tool.input_schema,
+            )
+
+
 def register_builtin_tools(api: ExtensionAPI) -> None:
     """通过 ExtensionAPI 注册全部内置工具。"""
     for tool in _builtin_tools():
@@ -500,6 +561,7 @@ def default_tools(
 __all__ = [
     "Tool",
     "bind_semantic_workspace_tools",
+    "bind_lsp_impact_tools",
     "default_tools",
     "register_builtin_tools",
     "task_complete",

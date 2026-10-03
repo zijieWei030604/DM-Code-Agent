@@ -258,6 +258,15 @@ class EvidenceGraphCapability:
                         "verification_invalidated",
                         {"step_number": event.step_number, "workspace_version": after_version},
                     )
+                reports = event.metadata.get("lsp_impact_reports")
+                if isinstance(reports, list):
+                    for report in reports:
+                        if isinstance(report, Mapping):
+                            added_nodes, added_edges = self.graph.add_lsp_impact(
+                                report=report, step_number=event.step_number
+                            )
+                            nodes.extend(added_nodes)
+                            edges.extend(added_edges)
             else:
                 self._write_versions.pop(event.step_number, None)
                 self._write_basis_kinds.pop(event.step_number, None)

@@ -89,6 +89,8 @@ dm-agent-economics = "dm_agent.benchmarks.economics:main"
 dm-agent-manifest-diff = "dm_agent.benchmarks.manifest_diff:main"
 dm-agent-score-diff = "dm_agent.benchmarks.score_diff:main"
 dm-agent-impact-eval = "dm_agent.workspace.eval_cli:main"
+dm-agent-lsp-impact = "dm_agent.lsp_impact.cli:main"
+dm-agent-lsp-impact-mcp = "dm_agent.lsp_impact.mcp_server:main"
 dm-agent-web = "dm_agent.server.cli:main"
 
 [tool.setuptools.packages.find]

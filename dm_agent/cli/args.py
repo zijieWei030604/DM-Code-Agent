@@ -128,6 +128,23 @@ def parse_args(argv: Any) -> argparse.Namespace:
         help="启用持久化符号索引，并在有效修改后向 Agent 提供一次受限的影响摘要。",
     )
     parser.add_argument(
+        "--enable-lsp-impact",
+        action="store_true",
+        default=saved_config.get("enable_lsp_impact", False),
+        help="启用基于 pyright-langserver 的 Python 引用影响分析；未安装服务时只记录不可用状态。",
+    )
+    parser.add_argument(
+        "--lsp-impact-command",
+        default=saved_config.get("lsp_impact_command", "pyright-langserver"),
+        help="LSP 服务命令（默认：pyright-langserver）。",
+    )
+    parser.add_argument(
+        "--lsp-impact-timeout-seconds",
+        type=float,
+        default=saved_config.get("lsp_impact_timeout_seconds", 5.0),
+        help="单次 LSP 请求超时秒数（默认：5）。",
+    )
+    parser.add_argument(
         "--enable-repo-map",
         action="store_true",
         default=saved_config.get("enable_repo_map", False),

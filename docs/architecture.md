@@ -43,6 +43,7 @@ CLI 子进程**，不把 CLI 当库用。这样 Web 界面永远和命令行做�
 | --- | --- |
 | `dm_agent/clients/` | 四家 LLM 适配 + 注册制工厂 + 统一重试 |
 | `dm_agent/tools/` | 文件、执行、测试、lint、AST、代码索引工具 |
+| `dm_agent/lsp_impact/` | 独立的本地 LSP JSON-RPC 客户端、变更快照与引用影响报告；不依赖旧 AST 语义工作区 |
 | `dm_agent/prompts/` | system prompt 构造 |
 | `dm_agent/memory/` | token 估算 + Mem0 风格原子记忆折叠 |
 | `dm_agent/tracing/` | 会话日志写入、读取归一化、分析/diff/fork CLI |
