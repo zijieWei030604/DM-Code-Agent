@@ -116,11 +116,15 @@ class ToolInvoker:
         bounder: ObservationBounder,
         persistence: RunPersistence,
         on_error: HookErrorHandler | None = None,
+        include_workspace_version: bool = True,
     ) -> None:
         self.event_bus = event_bus
         self.bounder = bounder
         self.persistence = persistence
         self.on_error = on_error
+        # Read-only, isolated workers do not create change or verification evidence.
+        # Avoid fingerprinting the whole repository after every lookup in that mode.
+        self.include_workspace_version = include_workspace_version
 
     def invoke(
         self,
@@ -246,7 +250,9 @@ class ToolInvoker:
             step_number=context.step_number,
             tool_succeeded=tool_succeeded,
             no_progress=confirmed_no_change,
-            workspace_version=workspace_version(Path.cwd()),
+            workspace_version=(
+                workspace_version(Path.cwd()) if self.include_workspace_version else ""
+            ),
         )
         after_event = AfterToolResultEvent(
             tool_name=action,

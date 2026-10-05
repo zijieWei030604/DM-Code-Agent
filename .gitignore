@@ -105,5 +105,9 @@ logs/run_evaluation/
 # Local pytest/benchmark temporary workspaces
 .pytest-tmp-*/
 .test-tmp-*/
+.codex-pytest-*/
+.codex-test-tmp*/
+.codex-pycache/
+.tools/
 .pytest-*/
 .verified-edits-subprocess-temp/

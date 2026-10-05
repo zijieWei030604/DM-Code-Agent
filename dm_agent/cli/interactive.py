@@ -198,6 +198,7 @@ def multi_turn_conversation(
     tools: list[Tool],
     skill_manager: SkillManager | None = None,
     extension_registry: ExtensionRegistry | None = None,
+    mcp_manager: MCPManager | None = None,
 ) -> None:
     """多轮对话模式"""
     UI.section(
@@ -207,6 +208,7 @@ def multi_turn_conversation(
     )
 
     agent: ReactAgent | None = None
+    unsubscribe_mcp_tools = None
     try:
         # 创建客户端和智能体
         client = create_llm_client(
@@ -227,6 +229,8 @@ def multi_turn_conversation(
             skill_manager=skill_manager,
             extension_registry=extension_registry,
         )
+        if mcp_manager is not None:
+            unsubscribe_mcp_tools = mcp_manager.add_tools_changed_listener(agent.refresh_mcp_tools)
 
         conversation_count = 0
 
@@ -284,6 +288,8 @@ def multi_turn_conversation(
     except Exception as e:
         UI.status("error", "初始化错误", str(e))
     finally:
+        if unsubscribe_mcp_tools is not None:
+            unsubscribe_mcp_tools()
         if agent:
             agent.close()
 
@@ -293,6 +299,7 @@ def execute_task(
     tools: list[Tool],
     skill_manager: SkillManager | None = None,
     extension_registry: ExtensionRegistry | None = None,
+    mcp_manager: MCPManager | None = None,
 ) -> None:
     """执行任务"""
     UI.section("执行新任务")
@@ -303,6 +310,7 @@ def execute_task(
         return
 
     agent: ReactAgent | None = None
+    unsubscribe_mcp_tools = None
     try:
         # 创建客户端和智能体
         client = create_llm_client(
@@ -325,6 +333,8 @@ def execute_task(
             skill_manager=skill_manager,
             extension_registry=extension_registry,
         )
+        if mcp_manager is not None:
+            unsubscribe_mcp_tools = mcp_manager.add_tools_changed_listener(agent.refresh_mcp_tools)
 
         UI.status("run", "正在执行任务")
 
@@ -349,6 +359,8 @@ def execute_task(
     except Exception as e:
         UI.status("error", "发生错误", str(e))
     finally:
+        if unsubscribe_mcp_tools is not None:
+            unsubscribe_mcp_tools()
         if agent:
             agent.close()
 
@@ -400,11 +412,13 @@ def interactive_mode(config: Config, extension_registry: ExtensionRegistry | Non
 
                 if choice == "1":
                     # 执行新任务
-                    execute_task(config, tools, skill_manager, extension_registry)
+                    execute_task(config, tools, skill_manager, extension_registry, mcp_manager)
 
                 elif choice == "2":
                     # 多轮对话模式
-                    multi_turn_conversation(config, tools, skill_manager, extension_registry)
+                    multi_turn_conversation(
+                        config, tools, skill_manager, extension_registry, mcp_manager
+                    )
 
                 elif choice == "3":
                     # 查看工具列表

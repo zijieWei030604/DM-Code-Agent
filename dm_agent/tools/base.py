@@ -33,6 +33,7 @@ class Tool:
     result_runner: Callable[[dict[str, Any]], ToolResult] | None = None
     read_only: bool = False
     input_schema: dict[str, Any] | None = None
+    completes_task: bool = False
 
     def execute(self, arguments: dict[str, Any]) -> str | ToolResult:
         """

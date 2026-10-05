@@ -24,10 +24,11 @@ from dm_agent.extensions.capabilities import (
     SemanticWorkspaceCapability,
     VerifiedEditCapability,
 )
+from dm_agent.lsp_impact.service import LspImpactService
 from dm_agent.mcp import MCPManager, load_mcp_config
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.skills import SkillManager
-from dm_agent.lsp_impact.service import LspImpactService
+from dm_agent.subagents.manager import TaskManager
 from dm_agent.tools import bind_lsp_impact_tools, bind_semantic_workspace_tools
 from dm_agent.tracing import SessionWriter, TraceWriter
 from dm_agent.verification import VerificationPolicy
@@ -112,6 +113,29 @@ def create_agent(
     capabilities: list[AgentCapability] = []
     workspace_engine = None
     lsp_service = None
+    subagents = None
+    if config.subagent_store:
+        store = Path(config.subagent_store).resolve()
+        if store.is_relative_to(Path.cwd().resolve()):
+            raise ValueError("subagent store must be outside the workspace")
+        subagents = TaskManager(
+            store,
+            {
+                "workspace": str(Path.cwd().resolve()),
+                "provider": config.provider,
+                "api_key": config.api_key,
+                "model": config.model,
+                "base_url": config.base_url,
+                "temperature": config.temperature,
+                "steps": min(config.max_steps, 30),
+                "lsp": config.enable_lsp_impact,
+                "lsp_command": config.lsp_impact_command,
+            },
+            workers=config.subagent_workers,
+            timeout=config.subagent_timeout,
+        )
+        tools = [*tools, *subagents.tools()]
+        capabilities.append(subagents)
     if config.enable_semantic_workspace or config.enable_repo_map or config.enable_verified_edits:
         workspace_engine = SemanticWorkspaceEngine(Path.cwd())
         bind_semantic_workspace_tools(tools, workspace_engine)
@@ -157,7 +181,13 @@ def create_agent(
         event_bus=(
             extension_registry.create_event_bus() if extension_registry is not None else None
         ),
-        owned_resources=([resource for resource in (workspace_engine, lsp_service) if resource is not None]),
+        owned_resources=(
+            [
+                resource
+                for resource in (workspace_engine, lsp_service, subagents)
+                if resource is not None
+            ]
+        ),
     )
 
 
@@ -251,6 +281,9 @@ def _assemble_agent(
         trace_writer=trace_writer,
         extension_registry=extension_registry,
     )
+    # A stdio MCP server can notify ``tools/list_changed`` during a long run.
+    # Rebind only between model requests through ReactAgent's coherent snapshot API.
+    mcp_manager.add_tools_changed_listener(agent.refresh_mcp_tools)
     return agent, trace_writer
 
 

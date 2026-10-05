@@ -418,6 +418,7 @@ class EvidenceGraph:
         decision: str = "allow",
         reason: str = "",
         policy_version: str = "completion-policy-v2",
+        lsp_report_ids: Sequence[str] | None = None,
     ) -> tuple[list[EvidenceNode], list[EvidenceEdge]]:
         states = list(self.change_states().values())
         conclusion_status = evidence_status or (
@@ -450,8 +451,14 @@ class EvidenceGraph:
             )
             if edge:
                 edges.append(edge)
+        allowed_lsp_reports = set(lsp_report_ids) if lsp_report_ids is not None else None
         for item in self._nodes_of_kind("observation"):
             if item.metadata.get("kind") != "lsp_impact":
+                continue
+            if (
+                allowed_lsp_reports is not None
+                and str(item.metadata.get("report_id", "")) not in allowed_lsp_reports
+            ):
                 continue
             edge = self._add_edge(
                 node.node_id,

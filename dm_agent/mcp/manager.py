@@ -1,5 +1,7 @@
 """MCP 管理器 - 统一管理多个 MCP 服务器"""
 
+from collections.abc import Callable
+from threading import Lock
 from typing import Any
 
 from dm_agent.tools.base import Tool
@@ -33,6 +35,8 @@ class MCPManager:
         self._tools_cache: list[Tool] = []
         # 每个服务器的自动重连次数（用于审计与测试）
         self.reconnect_counts: dict[str, int] = {}
+        self._refresh_lock = Lock()
+        self._tools_changed_listeners: list[Callable[[list[Tool]], None]] = []
 
     def start_all(self) -> int:
         """
@@ -93,6 +97,7 @@ class MCPManager:
             return False
 
         # 创建并启动客户端
+        client: MCPClient | MCPHTTPClient
         if server_config.transport in {"http", "streamable-http", "sse"}:
             if not server_config.url:
                 print(f"[MCP] 远程服务器 '{name}' 缺少 url")
@@ -102,6 +107,9 @@ class MCPManager:
                 url=server_config.url,
                 headers=server_config.headers,
                 request_timeout=server_config.timeout,
+                oauth=server_config.oauth,
+                oauth_client_id=server_config.oauth_client_id,
+                oauth_client_secret_env=server_config.oauth_client_secret_env,
             )
         else:
             client = MCPClient(
@@ -112,6 +120,9 @@ class MCPManager:
                 request_timeout=server_config.timeout,
             )
 
+        client.set_notification_handler(
+            lambda method, params: self._handle_server_notification(name, method, params)
+        )
         if client.start():
             self.clients[name] = client
             self._rebuild_tools_cache()
@@ -178,6 +189,38 @@ class MCPManager:
                     input_schema=input_schema,
                 )
                 self._tools_cache.append(wrapped_tool)
+
+    def add_tools_changed_listener(
+        self, listener: Callable[[list[Tool]], None]
+    ) -> Callable[[], None]:
+        """Notify a live Agent after a server has refreshed its MCP tool catalog."""
+        self._tools_changed_listeners.append(listener)
+
+        def unsubscribe() -> None:
+            if listener in self._tools_changed_listeners:
+                self._tools_changed_listeners.remove(listener)
+
+        return unsubscribe
+
+    def refresh_server_tools(self, name: str) -> bool:
+        """Reload one running server and then publish one coherent tool snapshot."""
+        with self._refresh_lock:
+            client = self.clients.get(name)
+            if client is None or not client.is_running() or not client.refresh_tools():
+                return False
+            self._rebuild_tools_cache()
+            snapshot = self.get_tools()
+        for listener in tuple(self._tools_changed_listeners):
+            try:
+                listener(snapshot)
+            except Exception as error:
+                print(f"[MCP] 工具刷新监听器失败: {error}")
+        return True
+
+    def _handle_server_notification(self, name: str, method: str, params: dict[str, Any]) -> None:
+        del params
+        if method == "notifications/tools/list_changed":
+            self.refresh_server_tools(name)
 
     def _create_tool_wrapper(
         self, server_name: str, tool_name: str, description: str, input_schema: dict[str, Any]

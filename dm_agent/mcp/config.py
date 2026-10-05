@@ -34,6 +34,11 @@ class MCPServerConfig:
     transport: str = "stdio"
     url: str = ""
     headers: dict[str, str] | None = None
+    # 仅供远程 HTTP MCP 使用。授权令牌不会写入该配置文件。
+    oauth: bool = False
+    # 当授权服务器不支持动态客户端注册时，使用用户预注册的 OAuth App。
+    oauth_client_id: str = ""
+    oauth_client_secret_env: str = ""
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "MCPServerConfig":
@@ -63,6 +68,9 @@ class MCPServerConfig:
             transport=str(data.get("transport", "stdio")).lower(),
             url=str(data.get("url", "")),
             headers=data.get("headers"),
+            oauth=bool(data.get("oauth", False)),
+            oauth_client_id=str(data.get("oauth_client_id", "")),
+            oauth_client_secret_env=str(data.get("oauth_client_secret_env", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -94,6 +102,12 @@ class MCPServerConfig:
             result["url"] = self.url
         if self.headers:
             result["headers"] = self.headers
+        if self.oauth:
+            result["oauth"] = True
+        if self.oauth_client_id:
+            result["oauth_client_id"] = self.oauth_client_id
+        if self.oauth_client_secret_env:
+            result["oauth_client_secret_env"] = self.oauth_client_secret_env
         return result
 
 

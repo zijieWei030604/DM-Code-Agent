@@ -17,13 +17,18 @@ import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 
 def path_to_uri(path: Path) -> str:
     # Keep the Windows drive separator literal: ``file:///E:/repo/a.py`` is the
     # URI form expected by Pyright, whereas encoding ``:`` produces a different path.
     return "file:///" + quote(path.resolve().as_posix(), safe="/:")
+
+
+def _document_key(uri: str) -> str:
+    path = unquote(urlparse(uri).path)
+    return path.casefold() if os.name == "nt" else path
 
 
 class LspClient(Protocol):
@@ -42,7 +47,9 @@ class LspClient(Protocol):
         self, path: Path, line: int, character: int, text: str
     ) -> list[dict[str, Any]]: ...
 
-    def definition(self, path: Path, line: int, character: int, text: str) -> list[dict[str, Any]]: ...
+    def definition(
+        self, path: Path, line: int, character: int, text: str
+    ) -> list[dict[str, Any]]: ...
 
     def diagnostics(self, path: Path, text: str) -> list[dict[str, Any]]: ...
 
@@ -58,6 +65,9 @@ class PyrightLspClient:
         self._process: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[dict[str, Any]] = queue.Queue()
         self._notifications: dict[str, list[dict[str, Any]]] = {}
+        self._pending_diagnostics: dict[str, int] = {}
+        self._document_versions: dict[Path, int] = {}
+        self._notification_condition = threading.Condition()
         self._reader: threading.Thread | None = None
         self._next_id = 0
         self._opened: dict[Path, str] = {}
@@ -82,8 +92,15 @@ class PyrightLspClient:
                 {
                     "processId": os.getpid(),
                     "rootUri": path_to_uri(workspace_root),
-                    "capabilities": {"textDocument": {"publishDiagnostics": {"relatedInformation": True}}},
-                    "workspaceFolders": [{"uri": path_to_uri(workspace_root), "name": workspace_root.name}],
+                    "capabilities": {
+                        "textDocument": {
+                            "publishDiagnostics": {"relatedInformation": True},
+                            "documentSymbol": {"hierarchicalDocumentSymbolSupport": True},
+                        }
+                    },
+                    "workspaceFolders": [
+                        {"uri": path_to_uri(workspace_root), "name": workspace_root.name}
+                    ],
                 },
             )
             self._notify("initialized", {})
@@ -111,12 +128,12 @@ class PyrightLspClient:
 
     def document_symbols(self, path: Path, text: str) -> list[dict[str, Any]]:
         self._sync(path, text)
-        result = self._request("textDocument/documentSymbol", {"textDocument": {"uri": path_to_uri(path)}})
+        result = self._request(
+            "textDocument/documentSymbol", {"textDocument": {"uri": path_to_uri(path)}}
+        )
         return list(result) if isinstance(result, list) else []
 
-    def references(
-        self, path: Path, line: int, character: int, text: str
-    ) -> list[dict[str, Any]]:
+    def references(self, path: Path, line: int, character: int, text: str) -> list[dict[str, Any]]:
         self._sync(path, text)
         result = self._request(
             "textDocument/references",
@@ -137,29 +154,63 @@ class PyrightLspClient:
                 "position": {"line": line, "character": character},
             },
         )
-        return list(result) if isinstance(result, list) else ([result] if isinstance(result, dict) else [])
+        return (
+            list(result)
+            if isinstance(result, list)
+            else ([result] if isinstance(result, dict) else [])
+        )
 
     def diagnostics(self, path: Path, text: str) -> list[dict[str, Any]]:
         self._sync(path, text)
-        # Pyright publishes diagnostics asynchronously.  Give it one bounded scheduling turn.
-        time.sleep(min(0.15, self.timeout_seconds / 10))
-        return list(self._notifications.get(path_to_uri(path), []))
+        # Pyright publishes diagnostics asynchronously.  Wait for the document version we
+        # just sent rather than reading a possibly stale cache after a fixed sleep.
+        uri = _document_key(path_to_uri(path))
+        deadline = time.monotonic() + self.timeout_seconds
+        with self._notification_condition:
+            while uri in self._pending_diagnostics and time.monotonic() < deadline:
+                self._notification_condition.wait(timeout=max(0.01, deadline - time.monotonic()))
+            if uri in self._pending_diagnostics:
+                raise TimeoutError(f"LSP diagnostics timed out for {path}")
+            return list(self._notifications.get(uri, []))
 
     def _sync(self, path: Path, text: str) -> None:
         if not self.available:
             raise RuntimeError(self.unavailable_reason or "LSP is unavailable")
         uri = path_to_uri(path)
         previous = self._opened.get(path)
+        if previous == text:
+            return
+        version = self._document_versions.get(path, 0) + 1
+        with self._notification_condition:
+            self._pending_diagnostics[_document_key(uri)] = version
         if previous is None:
+            version = 1
             self._notify(
                 "textDocument/didOpen",
-                {"textDocument": {"uri": uri, "languageId": "python", "version": 1, "text": text}},
+                {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "python",
+                        "version": version,
+                        "text": text,
+                    }
+                },
             )
         elif previous != text:
+            version = self._document_versions.get(path, 1) + 1
             self._notify(
                 "textDocument/didChange",
-                {"textDocument": {"uri": uri, "version": 1, "contentChanges": [{"text": text}]}},
+                {
+                    "textDocument": {
+                        "uri": uri,
+                        "version": version,
+                    },
+                    "contentChanges": [{"text": text}],
+                },
             )
+        else:
+            return
+        self._document_versions[path] = version
         self._opened[path] = text
 
     def _request(self, method: str, params: dict[str, Any]) -> Any:
@@ -194,7 +245,9 @@ class PyrightLspClient:
         if self._process is None or self._process.stdin is None:
             raise RuntimeError("LSP stdin is unavailable")
         payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
-        self._process.stdin.write(f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii") + payload)
+        self._process.stdin.write(
+            f"Content-Length: {len(payload)}\r\n\r\n".encode("ascii") + payload
+        )
         self._process.stdin.flush()
 
     def _read_loop(self) -> None:
@@ -221,8 +274,16 @@ class PyrightLspClient:
                 continue
             if message.get("method") == "textDocument/publishDiagnostics":
                 params = message.get("params") or {}
-                uri = str(params.get("uri", ""))
+                uri = _document_key(str(params.get("uri", "")))
                 values = params.get("diagnostics")
-                self._notifications[uri] = list(values) if isinstance(values, Sequence) else []
+                with self._notification_condition:
+                    self._notifications[uri] = list(values) if isinstance(values, Sequence) else []
+                    expected = self._pending_diagnostics.get(uri)
+                    version = params.get("version")
+                    if expected is not None and (
+                        not isinstance(version, int) or version >= expected
+                    ):
+                        self._pending_diagnostics.pop(uri, None)
+                    self._notification_condition.notify_all()
             elif "id" in message:
                 self._responses.put(message)

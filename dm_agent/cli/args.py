@@ -11,6 +11,10 @@ from .config import load_config_from_file
 
 def validate_feature_args(args: argparse.Namespace) -> str:
     """Validate default-off advanced feature CLI arguments."""
+    if not 1 <= getattr(args, "subagent_workers", 3) <= 8:
+        return "--subagent-workers must be 1..8."
+    if getattr(args, "subagent_timeout", 180) <= 0:
+        return "--subagent-timeout must be positive."
     if args.max_replans < -1:
         return "--max-replans must be -1 or greater."
     if args.max_observation_chars != 0 and args.max_observation_chars < 200:
@@ -121,6 +125,13 @@ def parse_args(argv: Any) -> argparse.Namespace:
             "依赖行号的连续编辑在写后需重读）。"
         ),
     )
+    parser.add_argument(
+        "--subagent-store",
+        default="",
+        help="启用前台只读并行；指定工作区外的私有目录保存子任务、完整 checkpoint 和结果。",
+    )
+    parser.add_argument("--subagent-workers", type=int, default=3)
+    parser.add_argument("--subagent-timeout", type=float, default=180.0)
     parser.add_argument(
         "--enable-semantic-workspace",
         action="store_true",

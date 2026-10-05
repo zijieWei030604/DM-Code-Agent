@@ -3,6 +3,17 @@
 MCP（Model Context Protocol）服务器给 agent 提供额外工具。配置文件是当前工作目录下的
 `mcp_config.json`，独立于 `config.json` 与 CLI 参数。
 
+## 运行中工具刷新
+
+对于在初始化响应中声明 `tools.listChanged` 的 stdio 或支持 SSE 的 HTTP MCP Server，若它在长任务中发送
+`notifications/tools/list_changed`，Runtime 会重新请求 `tools/list`，替换该 Server 的工具包装器，
+并在下一次模型请求前把更新后的工具集合交给当前 Agent。刷新事件会记录为
+`mcp_tools_refreshed`。
+
+该机制不会中断已经发出的模型请求或工具调用；当前一步完成后，下一步才使用新工具目录。
+HTTP MCP 会在该能力存在时以 `GET` 建立常驻 SSE 监听；断线后以 500ms 间隔重连。若 Server 不支持
+SSE `GET`，客户端保持普通请求/响应模式，仍支持显式刷新与重连刷新。
+
 ## 快速开始
 
 ### 1. 准备工作
@@ -133,6 +144,56 @@ python main.py "在 Context7 中搜索所有与数据库设计相关的上下文
 ```bash
 python main.py "从 Context7 获取与当前任务相关的历史决策和代码片段"
 ```
+
+---
+
+## GitHub 远程 MCP（只读）
+
+项目预置了 `github_readonly`，使用 GitHub 托管的 Streamable HTTP 服务。它只暴露
+仓库、Issue 与 Pull Request 的读取工具，可为代码维护任务补充 Issue 需求、历史变更和
+PR Diff；返回内容应作为外部观察记录，不能替代本地测试验证。
+
+配置默认启用；首次启动时才会连接 GitHub，未授权前不会暴露 GitHub 工具：
+
+```json
+{
+  "github_readonly": {
+    "transport": "streamable-http",
+    "url": "https://api.githubcopilot.com/mcp/readonly",
+    "headers": {
+      "X-MCP-Toolsets": "repos,issues,pull_requests",
+      "X-MCP-Readonly": "true",
+      "X-MCP-Lockdown": "true"
+    },
+    "oauth": true,
+    "enabled": true,
+    "timeout": 30
+  }
+}
+```
+
+首次连接收到 `401` OAuth Challenge 后，Runtime 会：
+
+1. 发现远程 MCP 的 OAuth 元数据并动态注册客户端；
+2. 在本机 `127.0.0.1` 随机端口接收回调，打开浏览器让用户在 GitHub 完成授权；
+3. 使用 PKCE 交换授权码；
+4. 通过 Windows DPAPI 将 Token 和客户端注册信息加密保存到
+   `%LOCALAPPDATA%\\dm-code-agent\\mcp-oauth`，之后自动刷新即将到期的 Token。
+
+Token 不会写入 `mcp_config.json`、Trace 或仓库。若授权服务器不支持动态注册，Runtime 会
+停止并提示使用预注册 OAuth App。此时在 `mcp_config.json` 的该服务配置内加入客户端 ID，
+并把密钥只放入当前用户环境变量：
+
+```json
+"oauth_client_id": "你的 GitHub OAuth App Client ID",
+"oauth_client_secret_env": "GITHUB_MCP_OAUTH_CLIENT_SECRET"
+```
+
+```cmd
+setx GITHUB_MCP_OAUTH_CLIENT_SECRET "你的 OAuth App Client Secret"
+```
+
+重新打开终端后再运行 Agent。Client Secret 不会进入配置文件或 Trace。
 
 ---
 
@@ -358,58 +419,15 @@ python main.py
 
 ### 场景：接入 GitHub MCP 服务器
 
-假设有一个 GitHub MCP 服务器，配置如下：
-
-```json
-{
-  "command": "npx",
-  "args": ["-y", "@modelcontextprotocol/server-github@latest"],
-  "env": {
-    "GITHUB_TOKEN": "ghp_your_token_here"
-  }
-}
-```
-
-**步骤**：
-
-1. **获取 GitHub Token**
-   访问 https://github.com/settings/tokens 生成一个 Personal Access Token
-
-2. **编辑 `mcp_config.json`**
-
-```json
-{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["@playwright/mcp@latest"],
-      "enabled": true
-    },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github@latest"],
-      "env": {
-        "GITHUB_TOKEN": "ghp_your_token_here"
-      },
-      "enabled": true
-    }
-  }
-}
-```
-
-3. **启动系统**
+根目录 `mcp_config.json` 已配置 `github_readonly`。启动时，首次 GitHub MCP 请求会打开
+浏览器进行 OAuth 授权，不需要在配置或 `.env` 中填写 Personal Access Token。
 
 ```bash
-python main.py
+dm-agent "读取仓库中的 GitHub Issue 与最近关联 PR，梳理修复需求；不要修改远程仓库。"
 ```
 
-4. **使用 GitHub MCP 工具**
-
-```
-"列出我的 GitHub 仓库中所有 Python 项目"
-```
-
-Agent 会自动调用 GitHub MCP 工具来完成任务！
+授权完成后，Runtime 只加载仓库、Issue 与 Pull Request 的读取工具。不要将 GitHub MCP
+检索结果作为完成验收；仍需对本地工作区运行对应测试。
 
 ---
 

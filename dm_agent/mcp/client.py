@@ -1,14 +1,18 @@
 """MCP 客户端 - 负责与单个 MCP 服务器通信"""
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
-import urllib.request
 import urllib.error
+import urllib.request
+from collections.abc import Callable
 from queue import Empty, Queue
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from typing import Any
+
+from .oauth import OAuthAuthorizer, OAuthError
 
 
 class MCPClient:
@@ -65,6 +69,7 @@ class MCPClient:
         self._message_id = 0
         self._stdout_queue: Queue = Queue()
         self._running = False
+        self._notification_handler: Callable[[str, dict[str, Any]], None] | None = None
 
     def start(self) -> bool:
         """
@@ -172,8 +177,16 @@ class MCPClient:
         while self._running and self.process.poll() is None:
             try:
                 line = self.process.stdout.readline()
-                if line:
-                    self._stdout_queue.put(line.strip())
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(message, dict) and "method" in message and "id" not in message:
+                    self._dispatch_notification(str(message["method"]), message.get("params"))
+                else:
+                    self._stdout_queue.put(message)
             except Exception as e:
                 if self._running:
                     print(f"[MCP] 读取服务器输出错误: {e}")
@@ -223,8 +236,10 @@ class MCPClient:
                 max_polls = max(1, int(self.request_timeout / 0.1))
                 while timeout_count < max_polls:
                     try:
-                        response_line = self._stdout_queue.get(timeout=0.1)
-                        response = json.loads(response_line)
+                        queued = self._stdout_queue.get(timeout=0.1)
+                        response = json.loads(queued) if isinstance(queued, str) else queued
+                        if not isinstance(response, dict):
+                            continue
 
                         if response.get("id") == self._message_id:
                             if "error" in response:
@@ -232,10 +247,8 @@ class MCPClient:
                                 return None
                             return response.get("result")
 
-                        # Requests are serialized by ``_lock``. An unmatched message is
-                        # therefore a server notification, not another request's response.
-                        # Re-queueing it would make this loop consume the same notification
-                        # forever and starve the matching tool response.
+                        # Requests are serialized by ``_lock``. An unmatched response belongs
+                        # to a stale request, while notifications are dispatched by the reader.
                         continue
                     except Empty:
                         timeout_count += 1
@@ -276,13 +289,47 @@ class MCPClient:
         if not result:
             return False
 
-        # 获取工具列表
-        tools_result = self._send_message("tools/list")
-        if tools_result and "tools" in tools_result:
-            self.tools = tools_result["tools"]
-            return True
+        self._send_notification("notifications/initialized")
 
-        return False
+        # 获取工具列表
+        return self.refresh_tools()
+
+    def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+        """Send a JSON-RPC notification without competing for a response id."""
+        if not self.process or not self.process.stdin:
+            return
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params:
+            message["params"] = params
+        try:
+            with self._lock:
+                self.process.stdin.write(json.dumps(message) + "\n")
+                self.process.stdin.flush()
+        except OSError:
+            return
+
+    def refresh_tools(self) -> bool:
+        """Reload this server's tool catalog after ``tools/list_changed``."""
+        tools_result = self._send_message("tools/list")
+        tools = tools_result.get("tools") if isinstance(tools_result, dict) else None
+        if not isinstance(tools, list):
+            return False
+        self.tools = [tool for tool in tools if isinstance(tool, dict)]
+        return True
+
+    def set_notification_handler(
+        self, handler: Callable[[str, dict[str, Any]], None] | None
+    ) -> None:
+        """Install a process-wide notification sink for this MCP connection."""
+        self._notification_handler = handler
+
+    def _dispatch_notification(self, method: str, params: Any) -> None:
+        handler = self._notification_handler
+        if handler is None:
+            return
+        payload = params if isinstance(params, dict) else {}
+        # The reader must keep consuming stdout while a refresh waits for tools/list.
+        Thread(target=handler, args=(method, payload), daemon=True).start()
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
         """
@@ -355,32 +402,68 @@ class MCPClient:
 class MCPHTTPClient:
     """MCP client for Streamable HTTP (with legacy SSE response tolerance)."""
 
-    def __init__(self, name: str, url: str, headers: dict[str, str] | None = None, request_timeout: float = 5.0):
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        headers: dict[str, str] | None = None,
+        request_timeout: float = 5.0,
+        oauth: bool = False,
+        oauth_client_id: str = "",
+        oauth_client_secret_env: str = "",
+    ):
         self.name = name
         self.url = url
         self.headers = headers or {}
+        self.oauth = oauth
+        self._authorizer = (
+            OAuthAuthorizer(url, oauth_client_id, oauth_client_secret_env) if oauth else None
+        )
+        self._oauth_header = self._authorizer.authorization_header() if self._authorizer else None
         self.request_timeout = max(0.1, float(request_timeout))
         self.tools: list[dict[str, Any]] = []
         self._message_id = 0
         self._running = False
+        self._notification_handler: Callable[[str, dict[str, Any]], None] | None = None
+        self._request_lock = Lock()
+        self._notification_stop = Event()
+        self._notification_thread: Thread | None = None
+        self._notification_response: Any | None = None
+        self._notification_response_lock = Lock()
+        self._server_supports_tool_notifications = False
 
     def start(self) -> bool:
-        result = self._send_message("initialize", {
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {"name": "dm-code-agent", "version": "1.1.0"},
-        })
-        if not result:
+        result = self._send_message(
+            "initialize",
+            {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "dm-code-agent", "version": "1.1.0"},
+            },
+        )
+        if not isinstance(result, dict):
             return False
-        tools_result = self._send_message("tools/list")
-        if not isinstance(tools_result, dict) or not isinstance(tools_result.get("tools"), list):
+        capabilities = result.get("capabilities")
+        tools_capability = capabilities.get("tools") if isinstance(capabilities, dict) else None
+        self._server_supports_tool_notifications = bool(
+            isinstance(tools_capability, dict) and tools_capability.get("listChanged")
+        )
+        self._send_notification("notifications/initialized")
+        if not self.refresh_tools():
             return False
-        self.tools = tools_result["tools"]
         self._running = True
+        self._start_notification_stream()
         return True
 
     def stop(self) -> None:
         self._running = False
+        self._notification_stop.set()
+        with self._notification_response_lock:
+            response = self._notification_response
+            self._notification_response = None
+        if response is not None:
+            with contextlib.suppress(OSError):
+                response.close()
 
     def is_running(self) -> bool:
         return self._running
@@ -388,40 +471,187 @@ class MCPHTTPClient:
     def get_tools(self) -> list[dict[str, Any]]:
         return self.tools.copy()
 
+    def refresh_tools(self) -> bool:
+        """Refresh this server's catalog after reconnect or an SSE notification."""
+        tools_result = self._send_message("tools/list")
+        tools = tools_result.get("tools") if isinstance(tools_result, dict) else None
+        if not isinstance(tools, list):
+            return False
+        self.tools = [tool for tool in tools if isinstance(tool, dict)]
+        return True
+
+    def set_notification_handler(
+        self, handler: Callable[[str, dict[str, Any]], None] | None
+    ) -> None:
+        self._notification_handler = handler
+        self._start_notification_stream()
+
+    def _start_notification_stream(self) -> None:
+        if (
+            not self._running
+            or not self._server_supports_tool_notifications
+            or self._notification_handler is None
+            or (self._notification_thread is not None and self._notification_thread.is_alive())
+        ):
+            return
+        self._notification_stop.clear()
+        self._notification_thread = Thread(target=self._notification_loop, daemon=True)
+        self._notification_thread.start()
+
+    def _notification_loop(self) -> None:
+        """Listen for server-initiated JSON-RPC notifications over SSE when supported."""
+        while self._running and not self._notification_stop.is_set():
+            request = urllib.request.Request(
+                self.url,
+                headers=self._request_headers(accept="text/event-stream"),
+                method="GET",
+            )
+            try:
+                response = urllib.request.urlopen(request, timeout=self.request_timeout)
+            except urllib.error.HTTPError:
+                # A server that rejects GET does not expose a notification stream.
+                return
+            except (OSError, urllib.error.URLError):
+                self._notification_stop.wait(0.5)
+                continue
+            try:
+                if response.headers.get_content_type() != "text/event-stream":
+                    return
+                with self._notification_response_lock:
+                    self._notification_response = response
+                self._consume_notification_stream(response)
+            except (OSError, UnicodeError):
+                pass
+            finally:
+                with self._notification_response_lock:
+                    if self._notification_response is response:
+                        self._notification_response = None
+                response.close()
+            self._notification_stop.wait(0.5)
+
+    def _consume_notification_stream(self, response: Any) -> None:
+        data_lines: list[str] = []
+        while self._running and not self._notification_stop.is_set():
+            raw = response.readline()
+            if not raw:
+                return
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            if not line:
+                self._dispatch_sse_event(data_lines)
+                data_lines = []
+            elif line.startswith("data:"):
+                data_lines.append(line[5:].lstrip())
+
+    def _dispatch_sse_event(self, data_lines: list[str]) -> None:
+        if not data_lines:
+            return
+        try:
+            message = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(message, dict) or "id" in message or "method" not in message:
+            return
+        handler = self._notification_handler
+        if handler is None:
+            return
+        params = message.get("params")
+        payload = params if isinstance(params, dict) else {}
+        Thread(target=handler, args=(str(message["method"]), payload), daemon=True).start()
+
+    def _send_notification(self, method: str, params: dict[str, Any] | None = None) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params:
+            message["params"] = params
+        headers = self._request_headers(content_type="application/json")
+        request = urllib.request.Request(
+            self.url, data=json.dumps(message).encode(), headers=headers, method="POST"
+        )
+        try:
+            with self._request_lock, urllib.request.urlopen(request, timeout=self.request_timeout):
+                return
+        except (OSError, urllib.error.URLError):
+            return
+
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str | None:
         result = self._send_message("tools/call", {"name": tool_name, "arguments": arguments})
         if not isinstance(result, dict):
             return None
         content = result.get("content", [])
         if isinstance(content, list):
-            texts = [str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content]
+            texts = [
+                str(item.get("text", item)) if isinstance(item, dict) else str(item)
+                for item in content
+            ]
             return "\n".join(texts)
         return str(content)
 
-    def _send_message(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        self._message_id += 1
-        message: dict[str, Any] = {"jsonrpc": "2.0", "id": self._message_id, "method": method}
+    def _send_message(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any] | None:
+        with self._request_lock:
+            self._message_id += 1
+            request_id = self._message_id
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream", **self.headers}
-        request = urllib.request.Request(self.url, data=json.dumps(message).encode(), headers=headers, method="POST")
+
+        for attempt in range(2):
+            headers = self._request_headers(
+                content_type="application/json", accept="application/json, text/event-stream"
+            )
+            request = urllib.request.Request(
+                self.url, data=json.dumps(message).encode(), headers=headers, method="POST"
+            )
+            try:
+                with (
+                    self._request_lock,
+                    urllib.request.urlopen(request, timeout=self.request_timeout) as response,
+                ):
+                    body = response.read().decode("utf-8", errors="replace")
+            except urllib.error.HTTPError as error:
+                if error.code == 401 and attempt == 0 and self._begin_oauth(error):
+                    continue
+                return None
+            except (OSError, urllib.error.URLError):
+                return None
+            if response.headers.get_content_type() == "text/event-stream":
+                for line in body.splitlines():
+                    if line.startswith("data:"):
+                        try:
+                            value = json.loads(line[5:].strip())
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(value, dict) and value.get("id") == request_id:
+                            return value.get("result")
+                return None
+            try:
+                value = json.loads(body)
+            except json.JSONDecodeError:
+                return None
+            return value.get("result") if isinstance(value, dict) and "error" not in value else None
+        return None
+
+    def _request_headers(
+        self, *, content_type: str | None = None, accept: str | None = None
+    ) -> dict[str, str]:
+        """Build one authenticated header snapshot for RPC, notifications and SSE."""
+        headers = dict(self.headers)
+        if content_type:
+            headers["Content-Type"] = content_type
+        if accept:
+            headers["Accept"] = accept
+        if self._oauth_header and "Authorization" not in headers:
+            headers["Authorization"] = self._oauth_header
+        return headers
+
+    def _begin_oauth(self, error: urllib.error.HTTPError) -> bool:
+        """Start interactive OAuth only after a protected resource challenges us."""
+        if self._authorizer is None:
+            return False
+        challenge = error.headers.get("WWW-Authenticate", "")
         try:
-            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except (OSError, urllib.error.URLError):
-            return None
-        if response.headers.get_content_type() == "text/event-stream":
-            for line in body.splitlines():
-                if line.startswith("data:"):
-                    try:
-                        value = json.loads(line[5:].strip())
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(value, dict) and value.get("id") == self._message_id:
-                        return value.get("result")
-            return None
-        try:
-            value = json.loads(body)
-        except json.JSONDecodeError:
-            return None
-        return value.get("result") if isinstance(value, dict) and "error" not in value else None
+            self._oauth_header = self._authorizer.authorize(challenge)
+        except OAuthError as exc:
+            print(f"[MCP] 远程服务器 '{self.name}' OAuth 授权失败: {exc}")
+            return False
+        return True

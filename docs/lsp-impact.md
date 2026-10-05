@@ -19,6 +19,9 @@
    `checked_at_completion` 边引用该观察。
 5. 修改前基线中不存在、修改后新增的 Error 级 LSP 诊断会阻止完成；服务缺失、超时、影响
    候选尚未验证只会记录为警告或不可用事实。
+6. 历史 ImpactReport 始终保留以支持复盘；完成时每个文件只采用最新一份且 `after_hash`
+   与当前文件文本哈希一致的报告。后续编辑会使旧报告过期，超时或不可用报告属于尚未验证，
+   不会被当作通过，也不会让已修复的历史 Error 持续阻断完成。
 
 ## 命令
 
@@ -32,3 +35,15 @@ dm-agent-lsp-impact dm_agent/core/agent.py --workspace .
 
 外部 MCP 客户端可将 `dm-agent-lsp-impact-mcp` 配置为 stdio 命令，工作目录设为目标仓库。
 它暴露与内置 Agent 一致的 `analyze_lsp_impact` 和 `lsp_query` 两个工具 Schema。
+
+## `lsp_query` 的引用结果
+
+`lsp_query(path, action="references")` 在首次查询为空、或只得到当前位置的声明时，会每隔
+250ms 最多重试两次，减少语言服务器尚未完成索引造成的空结果。展示给模型的结果最多 200 条：
+
+- 前 50 条附带命中行前后各两行的源码上下文；
+- 其余可见条目仅保留 `uri` 与 `range`；
+- 返回 `total`、`contextual_items`、`location_only_items` 与 `truncated`，模型可据此决定是否
+  再读取某个候选文件。
+
+源码上下文只会读取当前工作区内的文件；工作区外的库或标准库位置始终只返回位置。

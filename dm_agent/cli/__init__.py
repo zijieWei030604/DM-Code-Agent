@@ -214,6 +214,9 @@ def main(argv: Any = None) -> int:
         llm_max_retries=args.llm_max_retries,
         enable_adaptive_replanning=args.enable_adaptive_replanning,
         max_replans=args.max_replans,
+        subagent_store=args.subagent_store,
+        subagent_workers=args.subagent_workers,
+        subagent_timeout=args.subagent_timeout,
     )
 
     # --resume：从 checkpoint 恢复任务（任务参数可省略）

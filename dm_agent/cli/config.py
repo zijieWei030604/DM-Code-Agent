@@ -52,6 +52,9 @@ class Config:
     llm_max_retries: int = 2
     enable_adaptive_replanning: bool = False
     max_replans: int = -1
+    subagent_store: str = ""
+    subagent_workers: int = 3
+    subagent_timeout: float = 180.0
 
 
 def load_config_from_file() -> dict[str, Any]:

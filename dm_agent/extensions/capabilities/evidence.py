@@ -181,6 +181,20 @@ class EvidenceGraphCapability:
         path = self._normalize_path(event.arguments.get("path"))
         nodes: list[EvidenceNode] = []
         edges: list[EvidenceEdge] = []
+        delegated = event.result.metadata.get("subagent_results") if event.result else None
+        if event.tool_name == "task" and isinstance(delegated, list):
+            for result in delegated:
+                added, linked = self.graph.add_observation(
+                    tool="task",
+                    path="",
+                    step_number=event.step_number,
+                    succeeded=result.get("status") == "succeeded",
+                    phase=phase,
+                )
+                for node in added:
+                    node.metadata.update({"kind": "subagent_report", "source": result})
+                nodes.extend(added)
+                edges.extend(linked)
         snapshot = self._shell_snapshots.pop(event.step_number, None)
         if snapshot is not None:
             before_version, old_files = snapshot
@@ -341,6 +355,12 @@ class EvidenceGraphCapability:
         self.graph.workspace_version = workspace_version(self._workspace_root)
         self._sync_plan()
         self._record_verified_edit_checks(event)
+        raw_lsp_report_ids = event.metadata.get("lsp_impact_effective_report_ids")
+        current_lsp_report_ids = (
+            tuple(str(item) for item in raw_lsp_report_ids)
+            if isinstance(raw_lsp_report_ids, list)
+            else None
+        )
         decision = self.completion_policy.evaluate(
             self.graph,
             verified_transaction=str(event.metadata.get("edit_transaction_status", "")).startswith(
@@ -367,6 +387,7 @@ class EvidenceGraphCapability:
                 evidence_status="no_net_change",
                 decision="block",
                 reason=reason,
+                lsp_report_ids=current_lsp_report_ids,
             )
             self._record(nodes, edges)
             event.metadata["evidence_completion_block_count"] = (
@@ -424,6 +445,7 @@ class EvidenceGraphCapability:
                     else "Completion rejected by the current evidence policy."
                 )
             ),
+            lsp_report_ids=current_lsp_report_ids,
         )
         self._record(nodes, edges)
         self._update_metadata(event.metadata, decision=decision)

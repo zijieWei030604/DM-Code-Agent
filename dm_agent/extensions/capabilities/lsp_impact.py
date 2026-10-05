@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Any
 
 from dm_agent.core.capabilities import CapabilityContext
-from dm_agent.core.events import AfterToolResultEvent, BeforeFinishEvent, BeforeToolCallEvent, RunEndEvent, RunStartEvent
+from dm_agent.core.events import (
+    AfterToolResultEvent,
+    BeforeFinishEvent,
+    BeforeToolCallEvent,
+    RunEndEvent,
+    RunStartEvent,
+)
 from dm_agent.core.workspace_version import workspace_files
 from dm_agent.lsp_impact.service import LspImpactService
 
@@ -24,10 +30,18 @@ class LspImpactCapability:
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
         context.event_bus.on("on_run_start", self._on_run_start, name="lsp-impact.run-start")
-        context.event_bus.on("before_tool_call", self._before_tool_call, name="lsp-impact.snapshot", kind="observer")
-        context.event_bus.on("after_tool_result", self._after_tool_result, name="lsp-impact.after-write")
-        context.event_bus.on("before_finish", self._before_finish, name="lsp-impact.before-finish", kind="policy")
-        context.event_bus.on("on_run_end", self._on_run_end, name="lsp-impact.run-end", kind="observer")
+        context.event_bus.on(
+            "before_tool_call", self._before_tool_call, name="lsp-impact.snapshot", kind="observer"
+        )
+        context.event_bus.on(
+            "after_tool_result", self._after_tool_result, name="lsp-impact.after-write"
+        )
+        context.event_bus.on(
+            "before_finish", self._before_finish, name="lsp-impact.before-finish", kind="policy"
+        )
+        context.event_bus.on(
+            "on_run_end", self._on_run_end, name="lsp-impact.run-end", kind="observer"
+        )
 
     def export_state(self) -> dict[str, Any]:
         return {"report_ids": [report.report_id for report in self.service.reports]}
@@ -47,7 +61,10 @@ class LspImpactCapability:
             }
         )
         self._shell_snapshots.clear()
-        self._record("lsp_impact_started", {"available": started, "reason": self.service.client.unavailable_reason})
+        self._record(
+            "lsp_impact_started",
+            {"available": started, "reason": self.service.client.unavailable_reason},
+        )
         return ""
 
     def _before_tool_call(self, event: BeforeToolCallEvent) -> None:
@@ -63,7 +80,11 @@ class LspImpactCapability:
         if before is not None:
             after = workspace_files(self.service.workspace_root)
             paths = tuple(
-                sorted(path for path in before.keys() | after.keys() if before.get(path) != after.get(path))
+                sorted(
+                    path
+                    for path in before.keys() | after.keys()
+                    if before.get(path) != after.get(path)
+                )
             )
         python_paths = [path for path in paths if Path(path).suffix == ".py"]
         if not python_paths or event.no_change:
@@ -80,22 +101,44 @@ class LspImpactCapability:
         return event.observation + "\n\n" + "\n".join(summaries)
 
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
-        failures = self.service.current_new_errors()
+        state = self.service.completion_state()
+        failures = [report for report in state.effective_reports if report.new_error_diagnostics]
         event.metadata["lsp_impact_report_count"] = len(self.service.reports)
+        event.metadata["lsp_impact_effective_report_ids"] = [
+            report.report_id for report in state.effective_reports
+        ]
+        event.metadata["lsp_impact_stale_report_ids"] = [
+            report.report_id for report in state.stale_reports
+        ]
+        event.metadata["lsp_impact_unavailable_report_ids"] = [
+            report.report_id for report in state.unavailable_reports
+        ]
         event.metadata["lsp_impact_new_error_count"] = sum(
             len(report.new_error_diagnostics) for report in failures
+        )
+        self._record(
+            "lsp_impact_completion_state",
+            {
+                "effective_report_ids": event.metadata["lsp_impact_effective_report_ids"],
+                "stale_report_ids": event.metadata["lsp_impact_stale_report_ids"],
+                "unavailable_report_ids": event.metadata["lsp_impact_unavailable_report_ids"],
+            },
         )
         if not failures:
             return None
         paths = ", ".join(report.path for report in failures)
         reason = f"Completion blocked: LSP found new Error diagnostics in {paths}. Fix them or inspect the diagnostics before finishing."
         event.metadata["lsp_impact_completion_blocked"] = True
-        self._record("lsp_impact_completion_blocked", {"paths": paths, "step_number": event.step_number})
+        self._record(
+            "lsp_impact_completion_blocked", {"paths": paths, "step_number": event.step_number}
+        )
         return {"block": True, "reason": reason}
 
     def _on_run_end(self, event: RunEndEvent) -> None:
         event.metadata["lsp_impact_report_count"] = len(self.service.reports)
-        self._record("lsp_impact_summary", {"reports": [report.to_dict() for report in self.service.reports]})
+        self._record(
+            "lsp_impact_summary", {"reports": [report.to_dict() for report in self.service.reports]}
+        )
         self.service.close()
 
     def _record(self, name: str, payload: dict[str, Any]) -> None:

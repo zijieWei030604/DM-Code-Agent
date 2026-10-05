@@ -115,6 +115,7 @@ class ReactAgent:
         repository_map: RepositoryMap | None = None,
         event_bus: EventBus | None = None,
         owned_resources: Sequence[Any] = (),
+        include_workspace_version: bool = True,
     ) -> None:
         """初始化 ReactAgent。
 
@@ -207,6 +208,7 @@ class ReactAgent:
             bounder=self._observation_bounder,
             persistence=self._persistence,
             on_error=self._record_hook_error,
+            include_workspace_version=include_workspace_version,
         )
         # read-before-edit 守卫：首次编辑前必须读过目标文件；依赖行号的连续编辑
         # 在写后需重读，内容锚定编辑由唯一精确匹配保证当前性。
@@ -232,6 +234,7 @@ class ReactAgent:
                     self.task_plan.tool().function_definition(), ensure_ascii=False
                 )
         self._base_system_prompt = self.system_prompt
+        self._mcp_catalog_prompt = ""
         self._base_tools = dict(self.tools)
         # Legacy constructor arguments remain accepted, but never start another LLM loop.
         self.enable_adaptive_replanning = False
@@ -569,6 +572,12 @@ class ReactAgent:
                 if self.native_tool_calling
                 else []
             )
+            structured_completion_tools = [
+                tool.name for tool in self.tools.values() if tool.completes_task
+            ]
+            completion_tool_hint = (
+                structured_completion_tools[0] if structured_completion_tools else "task_complete"
+            )
             try:
                 messages_to_send = self._context_window.build_messages(
                     self.system_prompt + (self.task_plan.context() if self.enable_planning else ""),
@@ -635,7 +644,7 @@ class ReactAgent:
                                 "content": (
                                     "The previous response did not contain a native tool call. "
                                     "Continue by calling exactly one available tool; call "
-                                    "task_complete when the task is finished."
+                                    f"{completion_tool_hint} when the task is finished."
                                 ),
                             },
                         ]
@@ -850,7 +859,8 @@ class ReactAgent:
                 else self._is_failure_observation(observation, action=action)
             )
             accepted = False
-            if action == "task_complete" and invocation.tool_succeeded:
+            is_completion_tool = action == "task_complete" or tool.completes_task
+            if is_completion_tool and invocation.tool_succeeded:
                 accepted, observation = self._completion_gate.review(
                     task=task,
                     action=action,
@@ -891,15 +901,20 @@ class ReactAgent:
                 metadata["duration_seconds"] = time.perf_counter() - started_at
                 return finish_result("")
 
-            # 检查是否调用了 task_complete 工具
+            # 工具可以显式声明自己是结构化完成通道；task_complete 保持兼容。
             if (
-                action == "task_complete"
+                is_completion_tool
                 and accepted
-                and not self._is_failure_observation(observation, action=action)
+                # A structured completion may legitimately quote source text such as
+                # ``worker_failed`` or ``error``. Its ToolResult status is the
+                # authoritative execution outcome; scanning report prose here would
+                # turn a valid submission into another model turn.
+                and invocation.tool_succeeded
             ):
                 metadata["status"] = "success"
                 metadata["failure_reason"] = ""
                 metadata["duration_seconds"] = time.perf_counter() - started_at
+                metadata["completion_action"] = action
                 return finish_result(observation)
 
         metadata["status"] = "max_steps_exceeded"
@@ -917,6 +932,47 @@ class ReactAgent:
             )
         return finish_result("Reached step limit without completion.")
 
+    def refresh_mcp_tools(self, mcp_tools: list[Tool]) -> None:
+        """Atomically replace MCP wrappers before the next model request.
+
+        MCP notifications may arrive between ReAct steps.  Core tools and active
+        skill tools stay intact; only wrappers created by ``MCPManager`` carry
+        the reserved ``mcp_`` prefix.
+        """
+
+        def replace_mcp_tools(current: dict[str, Tool]) -> dict[str, Tool]:
+            retained = {name: tool for name, tool in current.items() if not name.startswith("mcp_")}
+            retained.update({tool.name: tool for tool in mcp_tools})
+            return retained
+
+        self._base_tools = replace_mcp_tools(self._base_tools)
+        self.tools = replace_mcp_tools(self.tools)
+        self.tools_list = list(self.tools.values())
+        if not self.native_tool_calling:
+            descriptions = "\n".join(f"- {tool.name}: {tool.description}" for tool in mcp_tools)
+            self._mcp_catalog_prompt = (
+                "\n\n<!-- mcp-tool-catalog:start -->\n"
+                "MCP tool catalog refreshed. Use only the following current MCP tools:\n"
+                + (descriptions or "- (none)")
+                + "\n<!-- mcp-tool-catalog:end -->"
+            )
+            self.system_prompt = self._replace_mcp_catalog(self.system_prompt)
+        if self.trace_writer:
+            self.trace_writer.record(
+                "mcp_tools_refreshed",
+                {"tool_count": len(mcp_tools), "tools": [tool.name for tool in mcp_tools]},
+            )
+
+    def _replace_mcp_catalog(self, prompt: str) -> str:
+        """Replace, rather than accumulate, the prompt-only MCP catalog."""
+        start = "<!-- mcp-tool-catalog:start -->"
+        end = "<!-- mcp-tool-catalog:end -->"
+        before, marker, remainder = prompt.partition(start)
+        if marker:
+            _, closing, after = remainder.partition(end)
+            prompt = before + (after if closing else "")
+        return prompt.rstrip() + self._mcp_catalog_prompt
+
     def _apply_skills_for_task(self, task: str) -> list[str]:
         """根据任务自动选择技能，并把增量合并进本轮的 prompt 与工具表。"""
         # 调用点（_run_once）已用 `if self.skill_manager:` 守卫，此处的 None 分支不可达；
@@ -926,7 +982,7 @@ class ReactAgent:
             return []
 
         # 恢复基础状态，避免上一次任务的技能残留
-        self.system_prompt = self._base_system_prompt
+        self.system_prompt = self._replace_mcp_catalog(self._base_system_prompt)
         self.tools = dict(self._base_tools)
 
         from dm_agent.skills.runtime import prepare_skills
