@@ -28,6 +28,7 @@ def build_lcm_tools(
                     str(arguments["query"]),
                     limit=int(arguments.get("limit", 10)),
                     record_types=arguments.get("record_types"),
+                    sort=str(arguments.get("sort", "recency")),
                 )
                 result: Any = [
                     {
@@ -60,6 +61,11 @@ def build_lcm_tools(
             {
                 "query": {"type": "string", "minLength": 1, "maxLength": 1000},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                "sort": {
+                    "type": "string",
+                    "enum": ["recency", "relevance", "hybrid"],
+                    "default": "recency",
+                },
                 "record_types": {
                     "type": "array",
                     "items": {

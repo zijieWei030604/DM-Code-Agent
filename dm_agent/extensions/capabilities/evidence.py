@@ -355,6 +355,7 @@ class EvidenceGraphCapability:
         self.graph.workspace_version = workspace_version(self._workspace_root)
         self._sync_plan()
         self._record_verified_edit_checks(event)
+        self._record_lsp_completion_failure(event)
         raw_lsp_report_ids = event.metadata.get("lsp_impact_effective_report_ids")
         current_lsp_report_ids = (
             tuple(str(item) for item in raw_lsp_report_ids)
@@ -714,6 +715,42 @@ class EvidenceGraphCapability:
                 identity=marker,
             )
             self._record(nodes, edges)
+
+    def _record_lsp_completion_failure(self, event: BeforeFinishEvent) -> None:
+        """Project a current LSP/syntax fact into the existing verification node type."""
+        failure = event.metadata.get("lsp_impact_confirmed_failure")
+        if not isinstance(failure, Mapping):
+            return
+        kind = str(failure.get("kind") or "lsp_code_error")
+        paths = tuple(part.strip() for part in str(failure.get("paths") or "").split(",") if part)
+        marker = f"lsp-failure:{kind}:{'|'.join(paths)}"
+        version = self.graph.workspace_version
+        if any(
+            node.kind == "verification"
+            and node.metadata.get("identity") == marker
+            and node.metadata.get("workspace_version") == version
+            for node in self.graph.nodes.values()
+        ):
+            return
+        nodes, edges = self.graph.add_verification(
+            tool="lsp_impact",
+            step_number=event.step_number,
+            passed=False,
+            workspace_version=version,
+            check=(
+                "Pyright impact analysis" if kind == "lsp_code_error" else "Python syntax fallback"
+            ),
+            details=str(failure.get("reason") or ""),
+            scope=paths or ("<workspace>",),
+            direct=True,
+            execution_status="completed",
+            outcome="failed",
+            failure_kind="syntax_error" if kind == "python_syntax_error" else "lsp_code_error",
+            blocking=True,
+            change_revision=self.graph.change_revision,
+            identity=marker,
+        )
+        self._record(nodes, edges)
 
     def _sync_plan(self) -> None:
         if not callable(self._get_run_state):

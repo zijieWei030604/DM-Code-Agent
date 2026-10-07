@@ -66,7 +66,18 @@ class GeminiClient(BaseLLMClient):
             contents = self._convert_messages_to_contents(messages)
 
             # 调用 Gemini API
-            response = self.client.models.generate_content(model=self.model, contents=contents)
+            request_options: dict[str, Any] = {}
+            timeout = extra.pop("request_timeout_seconds", None)
+            if timeout is not None:
+                request_options["config"] = {
+                    "http_options": {
+                        "timeout": max(1, int(float(timeout) * 1000)),
+                        "retry_options": {"attempts": 1},
+                    }
+                }
+            response = self.client.models.generate_content(
+                model=self.model, contents=contents, **request_options
+            )
 
             # 返回包含响应的字典
             return {"response": response}

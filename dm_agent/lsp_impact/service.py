@@ -55,6 +55,7 @@ class LspImpactService:
     def start(self, run_id: str) -> bool:
         self.run_id = run_id
         self.reports.clear()
+        self.analyzer.reset()
         return self.client.start(self.workspace_root)
 
     def close(self) -> None:

@@ -16,6 +16,8 @@ from dm_agent.core.events import (
 from dm_agent.core.workspace_version import workspace_files
 from dm_agent.lsp_impact.service import LspImpactService
 
+from .evidence_checks import EvidenceChecks
+
 
 class LspImpactCapability:
     """Snapshot before Python writes and analyze their current LSP impact afterwards."""
@@ -26,6 +28,9 @@ class LspImpactCapability:
         self.service = service
         self._trace_writer: Any | None = None
         self._shell_snapshots: dict[int, dict[str, str]] = {}
+        self._changed_python_paths: set[str] = set()
+        self._last_failure_signature = ""
+        self._checks = EvidenceChecks()
 
     def install(self, context: CapabilityContext) -> None:
         self._trace_writer = context.trace_writer
@@ -61,6 +66,8 @@ class LspImpactCapability:
             }
         )
         self._shell_snapshots.clear()
+        self._changed_python_paths.clear()
+        self._last_failure_signature = ""
         self._record(
             "lsp_impact_started",
             {"available": started, "reason": self.service.client.unavailable_reason},
@@ -92,6 +99,7 @@ class LspImpactCapability:
         summaries: list[str] = []
         reports: list[dict[str, Any]] = []
         for path in python_paths:
+            self._changed_python_paths.add(path)
             report = self.service.analyze(path)
             summaries.append(self.service.summary(report))
             reports.append(report.to_dict())
@@ -102,7 +110,9 @@ class LspImpactCapability:
 
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
         state = self.service.completion_state()
-        failures = [report for report in state.effective_reports if report.new_error_diagnostics]
+        failures = [
+            report for report in state.effective_reports if report.blocking_error_diagnostics
+        ]
         event.metadata["lsp_impact_report_count"] = len(self.service.reports)
         event.metadata["lsp_impact_effective_report_ids"] = [
             report.report_id for report in state.effective_reports
@@ -114,7 +124,10 @@ class LspImpactCapability:
             report.report_id for report in state.unavailable_reports
         ]
         event.metadata["lsp_impact_new_error_count"] = sum(
-            len(report.new_error_diagnostics) for report in failures
+            len(report.blocking_error_diagnostics) for report in failures
+        )
+        event.metadata["lsp_impact_uncertain_error_count"] = sum(
+            len(report.uncertain_error_diagnostics) for report in state.effective_reports
         )
         self._record(
             "lsp_impact_completion_state",
@@ -124,13 +137,71 @@ class LspImpactCapability:
                 "unavailable_report_ids": event.metadata["lsp_impact_unavailable_report_ids"],
             },
         )
-        if not failures:
+        if failures:
+            paths = ", ".join(report.path for report in failures)
+            return self._report_or_block(
+                event,
+                kind="lsp_code_error",
+                paths=paths,
+                reason=(
+                    "Completion blocked: Pyright found current new code Error diagnostics in "
+                    f"{paths}. Fix them or inspect the diagnostics before finishing."
+                ),
+            )
+
+        # A language-server timeout cannot prove the edited code is invalid.
+        # Fall back to Python parsing only; a clean parse remains a verification
+        # gap for the evidence policy rather than an artificial pass.
+        if state.unavailable_reports and self._changed_python_paths:
+            paths = sorted(self._changed_python_paths)
+            syntax = self._checks.syntax(self.service.workspace_root, paths)
+            event.metadata["lsp_impact_syntax_fallback"] = syntax
+            self._record(
+                "lsp_impact_syntax_fallback",
+                {"paths": paths, "result": syntax, "step_number": event.step_number},
+            )
+            if syntax and syntax.get("errors"):
+                return self._report_or_block(
+                    event,
+                    kind="python_syntax_error",
+                    paths=", ".join(paths),
+                    reason=(
+                        "Completion blocked: Pyright was unavailable and the Python syntax "
+                        "fallback found an error in the current changed files."
+                    ),
+                )
+        return None
+
+    def _report_or_block(
+        self, event: BeforeFinishEvent, *, kind: str, paths: str, reason: str
+    ) -> dict[str, Any] | None:
+        failure = {"kind": kind, "paths": paths, "reason": reason}
+        event.metadata["lsp_impact_confirmed_failure"] = failure
+        # With the evidence graph enabled it owns the conclusion and repeated
+        # failure lifecycle, so this capability only supplies a proven fact.
+        if event.metadata.get("evidence_graph_enabled"):
+            self._record(
+                "lsp_impact_confirmed_failure",
+                {**failure, "step_number": event.step_number},
+            )
             return None
-        paths = ", ".join(report.path for report in failures)
-        reason = f"Completion blocked: LSP found new Error diagnostics in {paths}. Fix them or inspect the diagnostics before finishing."
+        signature = f"{kind}:{paths}"
+        repeated = signature == self._last_failure_signature
+        self._last_failure_signature = signature
         event.metadata["lsp_impact_completion_blocked"] = True
+        if repeated:
+            # CompletionGate turns this existing terminal marker into the normal
+            # critic_rejected result. It prevents an endless finish → block loop.
+            event.metadata["evidence_terminal_completion_rejection"] = True
+            reason = "Completion ended as uncompleted: the same confirmed code error remains."
         self._record(
-            "lsp_impact_completion_blocked", {"paths": paths, "step_number": event.step_number}
+            "lsp_impact_completion_blocked",
+            {
+                "paths": paths,
+                "step_number": event.step_number,
+                "kind": kind,
+                "terminal": repeated,
+            },
         )
         return {"block": True, "reason": reason}
 

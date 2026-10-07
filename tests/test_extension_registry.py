@@ -25,6 +25,8 @@ BUILTIN_TOOL_NAMES = [
     "inspect_change_impact",
     "inspect_python_symbol",
     "edit_python_symbol",
+    "analyze_lsp_impact",
+    "lsp_query",
     "task_complete",
 ]
 BUILTIN_SKILL_NAMES = ["python_expert", "db_expert", "frontend_dev"]

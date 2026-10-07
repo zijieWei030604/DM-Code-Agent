@@ -1,7 +1,7 @@
 """Bounded foreground batches with append-only attempt records.
 
-The parent never returns while a child process is alive. Credentials travel over
-stdin, not command arguments or persisted task records.
+Each worker owns an independent in-process session. Foreground batches drain all
+workers before returning; credentials stay in memory, outside task records.
 """
 
 from __future__ import annotations
@@ -9,39 +9,19 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
-import signal
-import subprocess
-import sys
 import threading
 import time
 import uuid
 from contextlib import suppress
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from dm_agent.tools.base import Tool, ToolResult
 
+from .control import ExplorationStopped, RunControl
 from .schema import DEFAULT_REPORT, check_schema
-
-
-def stop_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-            capture_output=True,
-            check=False,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    else:
-        posix: Any = os
-        signals: Any = signal
-        with suppress(ProcessLookupError):
-            posix.killpg(process.pid, signals.SIGKILL)
-    if process.poll() is None:
-        process.kill()
-    process.wait()
+from .worker import execute
 
 
 class TaskManager:
@@ -54,7 +34,6 @@ class TaskManager:
         *,
         workers: int = 3,
         timeout: float = 180,
-        command: list[str] | None = None,
     ) -> None:
         if not 1 <= workers <= 8 or timeout <= 0:
             raise ValueError("workers must be 1..8 and timeout must be positive")
@@ -75,9 +54,8 @@ class TaskManager:
 
             locking: Any = fcntl
             locking.flock(self._store_lock, locking.LOCK_EX | locking.LOCK_NB)
-        self.settings = settings
+        self.settings = deepcopy(settings)
         self.workers, self.timeout = workers, timeout
-        self.command = command or [sys.executable, "-m", "dm_agent.subagents.worker"]
         self._lock = threading.RLock()
         self._batch_lock = threading.Lock()
         self._cancel = threading.Event()
@@ -139,10 +117,11 @@ class TaskManager:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
-        self.cancel()
+        with self._lock:
+            self._closed = True
+            self.cancel()
         with self._batch_lock:
-            pass  # the batch owns and reaps every process before releasing this lock
+            pass  # the batch drains every worker before releasing this lock
         self._store_lock.close()
 
     def batch(self, arguments: dict[str, Any]) -> ToolResult:
@@ -167,9 +146,10 @@ class TaskManager:
                     raise ValueError("cannot run the same child session twice in a batch")
                 seen.add(logical_id)
         with self._batch_lock:
-            if self._closed:
-                raise RuntimeError("manager is closed")
-            self._cancel.clear()
+            with self._lock:
+                if self._closed:
+                    raise RuntimeError("manager is closed")
+                self._cancel.clear()
             records = []
             for task in tasks:
                 identity = uuid.uuid4().hex
@@ -216,7 +196,7 @@ class TaskManager:
 
     def _execute(self, record: dict[str, Any]) -> None:
         started = time.monotonic()
-        process: subprocess.Popen[str] | None = None
+        control = RunControl(self._cancel, self.timeout)
         identity = record["id"]
         attempt = self.root / identity
         attempt.mkdir()
@@ -225,7 +205,7 @@ class TaskManager:
                 self._update(record, status="cancelled")
                 return
             request = {
-                "settings": self.settings,
+                "settings": deepcopy(self.settings),
                 "instruction": record["instruction"],
                 "context": record["context"],
                 "attempt": str(attempt),
@@ -238,50 +218,15 @@ class TaskManager:
                     request["previous"] = str(self.root / previous)
                     break
                 previous = self.records[previous].get("previous_attempt")
-            env = dict(os.environ)
-            source_root = str(Path(__file__).resolve().parents[2])
-            env["PYTHONPATH"] = source_root + os.pathsep + env.get("PYTHONPATH", "")
-            env["PYTHONDONTWRITEBYTECODE"] = "1"
-            with (attempt / "worker.log").open("w", encoding="utf-8") as log:
-                process = subprocess.Popen(
-                    self.command,
-                    stdin=subprocess.PIPE,
-                    stdout=log,
-                    stderr=log,
-                    text=True,
-                    encoding="utf-8",
-                    env=env,
-                    cwd=self.settings["workspace"],
-                    start_new_session=os.name != "nt",
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                )
-                self._update(record, status="running", pid=process.pid)
-                assert process.stdin is not None
-                process.stdin.write(json.dumps(request) + "\n")
-                process.stdin.flush()  # keep pipe open: EOF tells the worker its owner died
-                while process.poll() is None:
-                    if self._cancel.wait(0.05):
-                        stop_process(process)
-                        self._update(record, status="cancelled")
-                        return
-                    if time.monotonic() - started >= self.timeout:
-                        stop_process(process)
-                        self._update(record, status="timed_out")
-                        return
-                result_path = attempt / "result.json"
-                if process.returncode != 0 or not result_path.exists():
-                    self._update(record, status="failed", error="worker_failed; see worker.log")
-                    return
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-                self._update(record, **result)
+            self._update(record, status="running", execution_backend="in_process")
+            result = execute(request, control=control)
+            control.check()
+            self._update(record, **result)
+        except ExplorationStopped as exc:
+            self._update(record, status=exc.status)
         except Exception as exc:
             self._update(record, status="failed", error=type(exc).__name__)
         finally:
-            if process is not None:
-                stop_process(process)
-                if process.stdin:
-                    with suppress(OSError):
-                        process.stdin.close()
             usage_path = attempt / "usage.jsonl"
             if usage_path.exists():
                 for line in usage_path.read_text(encoding="utf-8").splitlines():

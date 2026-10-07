@@ -95,6 +95,8 @@ _STRUCTURED_OUTPUT_TOOLS = frozenset(
         "inspect_change_impact",
         "inspect_python_symbol",
         "edit_python_symbol",
+        "analyze_lsp_impact",
+        "lsp_query",
         "task_complete",
     }
 )

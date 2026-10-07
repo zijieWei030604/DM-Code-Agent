@@ -1,17 +1,13 @@
-"""Isolated Explore process. Never loads project extensions or executable skills."""
+"""Independent Explore session. Never loads project extensions or executable skills."""
 
 from __future__ import annotations
 
 import json
 import os
-import signal
-import subprocess
-import sys
-import threading
 from pathlib import Path
 from typing import Any
 
-from dm_agent.clients import LLMError, create_llm_client
+from dm_agent.clients import GeminiClient, LLMError, create_llm_client
 from dm_agent.core.agent import ReactAgent
 from dm_agent.core.events import EventBus
 from dm_agent.core.persistence import load_resume_state
@@ -20,6 +16,7 @@ from dm_agent.tools import default_tools
 from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tracing import TraceWriter
 
+from .control import ExplorationStopped, RunControl
 from .delivery import DeliveryExhausted, DeliveryPolicy
 from .schema import DEFAULT_REPORT, check_schema, validate
 
@@ -155,8 +152,15 @@ def exploration_result_tool(schema: dict[str, Any], submitted: dict[str, Any]) -
 class Meter:
     """Count model-visible text estimates; do not label them provider billing tokens."""
 
-    def __init__(self, client: Any, usage_path: Path, delivery: DeliveryPolicy) -> None:
+    def __init__(
+        self,
+        client: Any,
+        usage_path: Path,
+        delivery: DeliveryPolicy,
+        control: RunControl | None = None,
+    ) -> None:
         self.client = client
+        self.control = control
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
@@ -182,6 +186,15 @@ class Meter:
         return getattr(self.client, name)
 
     def respond(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        if self.control:
+            timeout = self.control.request_timeout()
+            self.client.timeout = timeout
+            sdk = getattr(self.client, "client", None)
+            if sdk is not None and callable(getattr(sdk, "with_options", None)):
+                self.client.client = sdk.with_options(timeout=timeout, max_retries=0)
+            # Gemini exposes per-request HTTP options rather than with_options.
+            if isinstance(self.client, GeminiClient):
+                kwargs["request_timeout_seconds"] = timeout
         self.delivery.ensure_request_allowed()
         estimated_next = estimate_tokens_from_chars(
             sum(len(m.get("content", "")) for m in messages)
@@ -193,13 +206,25 @@ class Meter:
             sum(len(m.get("content", "")) for m in messages)
         )
         self.record(False)
-        response = self.client.respond(messages, **kwargs)
+        try:
+            response = self.client.respond(messages, **kwargs)
+        except Exception:
+            if self.control:
+                self.control.check()
+            raise
         self.output_tokens += estimate_tokens_from_chars(len(response))
         self.record(True)
+        if self.control:
+            self.control.check()
         return response
 
 
-def execute(request: dict[str, Any], client: Any = None) -> dict[str, Any]:
+def execute(
+    request: dict[str, Any], client: Any = None, *, control: RunControl | None = None
+) -> dict[str, Any]:
+    """Run in the caller thread; never change cwd or process-global stdio."""
+    if control:
+        control.check()
     settings = request["settings"]
     attempt = Path(request["attempt"])
     attempt.mkdir(parents=True, exist_ok=True)
@@ -208,133 +233,150 @@ def execute(request: dict[str, Any], client: Any = None) -> dict[str, Any]:
     check_schema(output_schema)
     delivery = DeliveryPolicy(output_schema, attempt / "rejected_submissions.jsonl")
     trace = TraceWriter(attempt / "trace.jsonl")
-    client = Meter(
-        client
-        or create_llm_client(
-            provider=settings["provider"],
-            api_key=settings["api_key"],
-            model=settings["model"],
-            base_url=settings["base_url"],
-            timeout=30,
-            respond_retries=0,
-        ),
-        attempt / "usage.jsonl",
-        delivery,
-    )
-    bus = EventBus()
-    delivery.install(bus)
-    evidence: list[dict[str, Any]] = []
-    submitted: dict[str, Any] = {}
-    source_calls = 0
-    max_source_calls = max(1, int(settings.get("max_source_calls", DEFAULT_MAX_SOURCE_CALLS)))
-
-    def limit_source_calls(event: Any) -> dict[str, Any] | None:
-        """Reserve a final turn for structured delivery instead of exhausting context."""
-        nonlocal source_calls
-        if event.tool_name not in READ_TOOLS:
-            return None
-        if source_calls >= max_source_calls:
-            return {
-                "block": True,
-                "reason": (
-                    "Explore source-call budget reached. Use submit_exploration_result now and "
-                    "state any remaining uncertainty."
-                ),
-            }
-        source_calls += 1
-        return None
-
-    def observe(event: Any) -> None:
-        if event.tool_name == "submit_exploration_result":
-            return
-        evidence.append(
-            {
-                "tool": event.tool_name,
-                "arguments": event.arguments,
-                "step": event.step_number,
-                "succeeded": event.tool_succeeded,
-                "run_id": event.run_id,
-            }
-        )
-
-    bus.on("before_tool_call", limit_source_calls, name="explore.source_budget")
-    bus.on("after_tool_result", observe, name="explore.sources")
-    tools = [*scoped_tools(workspace), exploration_result_tool(output_schema, submitted)]
     resources: list[Any] = []
-    if settings.get("lsp"):
-        from dm_agent.lsp_impact.service import LspImpactService
-        from dm_agent.tools.lsp_impact_tools import lsp_query_result
-
-        service = LspImpactService(workspace, command=settings["lsp_command"], timeout_seconds=5)
-        # Child workers do not install LspImpactCapability, so they must start
-        # their own local LSP session explicitly before exposing lsp_query.
-        service.start(f"subagent-{attempt.name}")
-        resources.append(service)
-
-        def query(arguments: dict[str, Any]) -> ToolResult:
-            if arguments.get("action", "symbols") not in {
-                "symbols",
-                "references",
-                "definition",
-                "diagnostics",
-            }:
-                raise ValueError("only read-only LSP queries are allowed")
-            path = (workspace / str(arguments.get("path", ""))).resolve()
-            if not path.is_relative_to(workspace):
-                raise ValueError("path escapes workspace")
-            return lsp_query_result({**arguments, "path": str(path)}, service=service)
-
-        tools.append(
-            Tool(
-                "lsp_query",
-                "Read-only LSP query: path, action (symbols/references/definition/diagnostics), line, character.",
-                query,
-                read_only=True,
-            )
-        )
-    agent = ReactAgent(
-        client,
-        tools,
-        max_steps=settings.get("steps", 20),
-        temperature=settings.get("temperature", 0),
-        enable_planning=False,
-        enable_compression=False,
-        enable_edit_guard=False,
-        event_bus=bus,
-        step_callback=delivery.observe_step,
-        trace_writer=trace,
-        owned_resources=resources,
-        include_workspace_version=False,
-        # Explore workers retain full source in their append-only trace but send a
-        # compact view back to the model, leaving room for several investigation
-        # steps and the final structured submission.
-        max_observation_chars=4000,
-    )
-    task = (
-        "You are a read-only Explore agent. Search and read code; do not execute code, modify files, "
-        "or delegate. Distinguish facts from hypotheses. For files longer than 120 lines, use "
-        "search_in_file to locate symbols before reading one non-overlapping range of at most 120 lines. "
-        "Use at most "
-        + str(max_source_calls)
-        + " source lookup tools; prefer precise line ranges and do not reread the same range. "
-        "When investigation is complete, call "
-        "submit_exploration_result with the report object matching the supplied output schema. "
-        "After an invalid delivery, at most two correction attempts are allowed within the existing budgets. "
-        "Do not put the report in a finish message. Include file/line references in findings. "
-        "Tool provenance is recorded independently.\n"
-        + request["context"]
-        + "\nAssignment:\n"
-        + request["instruction"]
-        + "\nOutput schema:\n"
-        + json.dumps(output_schema)
-    )
-    previous = request.get("previous")
-    if previous:
-        old = Path(previous) / "checkpoint.jsonl"
-        if old.exists():
-            agent.conversation_history = load_resume_state(old).conversation_history
-            task += "\nThis is a follow-up attempt. Prior observations may predate parent edits; re-read relevant code."
+    agent: ReactAgent | None = None
     try:
+        client = Meter(
+            client
+            or create_llm_client(
+                provider=settings["provider"],
+                api_key=settings["api_key"],
+                model=settings["model"],
+                base_url=settings["base_url"],
+                timeout=30,
+                respond_retries=0,
+                max_retries=0,
+            ),
+            attempt / "usage.jsonl",
+            delivery,
+            control,
+        )
+        bus = EventBus()
+        if control:
+
+            def check_control(_event: Any) -> None:
+                control.check()
+
+            for stage in (
+                "before_llm_request",
+                "before_tool_call",
+                "after_tool_result",
+                "before_finish",
+            ):
+                bus.on(stage, check_control, name="explore.cancellation")
+        delivery.install(bus)
+        evidence: list[dict[str, Any]] = []
+        submitted: dict[str, Any] = {}
+        source_calls = 0
+        max_source_calls = max(1, int(settings.get("max_source_calls", DEFAULT_MAX_SOURCE_CALLS)))
+
+        def limit_source_calls(event: Any) -> dict[str, Any] | None:
+            """Reserve a final turn for structured delivery instead of exhausting context."""
+            nonlocal source_calls
+            if event.tool_name not in READ_TOOLS:
+                return None
+            if source_calls >= max_source_calls:
+                return {
+                    "block": True,
+                    "reason": (
+                        "Explore source-call budget reached. Use submit_exploration_result now and "
+                        "state any remaining uncertainty."
+                    ),
+                }
+            source_calls += 1
+            return None
+
+        def observe(event: Any) -> None:
+            if event.tool_name == "submit_exploration_result":
+                return
+            evidence.append(
+                {
+                    "tool": event.tool_name,
+                    "arguments": event.arguments,
+                    "step": event.step_number,
+                    "succeeded": event.tool_succeeded,
+                    "run_id": event.run_id,
+                }
+            )
+
+        bus.on("before_tool_call", limit_source_calls, name="explore.source_budget")
+        bus.on("after_tool_result", observe, name="explore.sources")
+        tools = [*scoped_tools(workspace), exploration_result_tool(output_schema, submitted)]
+        if settings.get("lsp"):
+            from dm_agent.lsp_impact.service import LspImpactService
+            from dm_agent.tools.lsp_impact_tools import lsp_query_result
+
+            service = LspImpactService(
+                workspace, command=settings["lsp_command"], timeout_seconds=5
+            )
+            # Child sessions do not install LspImpactCapability, so they must start
+            # their own local LSP session explicitly before exposing lsp_query.
+            resources.append(service)
+            service.start(f"subagent-{attempt.name}")
+
+            def query(arguments: dict[str, Any]) -> ToolResult:
+                if arguments.get("action", "symbols") not in {
+                    "symbols",
+                    "references",
+                    "definition",
+                    "diagnostics",
+                }:
+                    raise ValueError("only read-only LSP queries are allowed")
+                path = (workspace / str(arguments.get("path", ""))).resolve()
+                if not path.is_relative_to(workspace):
+                    raise ValueError("path escapes workspace")
+                return lsp_query_result({**arguments, "path": str(path)}, service=service)
+
+            tools.append(
+                Tool(
+                    "lsp_query",
+                    "Read-only LSP query: path, action (symbols/references/definition/diagnostics), line, character.",
+                    query,
+                    read_only=True,
+                )
+            )
+        agent = ReactAgent(
+            client,
+            tools,
+            max_steps=settings.get("steps", 20),
+            temperature=settings.get("temperature", 0),
+            enable_planning=False,
+            enable_compression=False,
+            enable_edit_guard=False,
+            event_bus=bus,
+            step_callback=delivery.observe_step,
+            trace_writer=trace,
+            owned_resources=resources,
+            include_workspace_version=False,
+            # Explore workers retain full source in their append-only trace but send a
+            # compact view back to the model, leaving room for several investigation
+            # steps and the final structured submission.
+            max_observation_chars=4000,
+        )
+        task = (
+            "You are a read-only Explore agent. Search and read code; do not execute code, modify files, "
+            "or delegate. Distinguish facts from hypotheses. For files longer than 120 lines, use "
+            "search_in_file to locate symbols before reading one non-overlapping range of at most 120 lines. "
+            "Use at most "
+            + str(max_source_calls)
+            + " source lookup tools; prefer precise line ranges and do not reread the same range. "
+            "When investigation is complete, call "
+            "submit_exploration_result with the report object matching the supplied output schema. "
+            "After an invalid delivery, at most two correction attempts are allowed within the existing budgets. "
+            "Do not put the report in a finish message. Include file/line references in findings. "
+            "Tool provenance is recorded independently.\n"
+            + request["context"]
+            + "\nAssignment:\n"
+            + request["instruction"]
+            + "\nOutput schema:\n"
+            + json.dumps(output_schema)
+        )
+        previous = request.get("previous")
+        if previous:
+            old = Path(previous) / "checkpoint.jsonl"
+            if old.exists():
+                agent.conversation_history = load_resume_state(old).conversation_history
+                task += "\nThis is a follow-up attempt. Prior observations may predate parent edits; re-read relevant code."
         trace.record("delegated_from", {"parent_run_id": request.get("parent_run_id", "")})
         error = ""
         result: dict[str, Any] = {}
@@ -373,6 +415,8 @@ def execute(request: dict[str, Any], client: Any = None) -> dict[str, Any]:
             completion_protocol = "invalid"
         if status == "failed" and delivery.exhausted:
             error = "report_corrections_exhausted"
+        if control:
+            control.check()
         (attempt / "answer.txt").write_text(answer, encoding="utf-8")
         trace.record(
             "exploration_result_submitted",
@@ -409,32 +453,16 @@ def execute(request: dict[str, Any], client: Any = None) -> dict[str, Any]:
             json.dumps(payload, ensure_ascii=False), encoding="utf-8"
         )
         return payload
+    except ExplorationStopped as exc:
+        trace.record("exploration_stopped", {"status": exc.status})
+        raise
     finally:
-        agent.close()
-        trace.close()
-
-
-def main() -> None:
-    request = json.loads(sys.stdin.readline())
-
-    def watch_owner() -> None:
-        sys.stdin.read()
-        if os.name == "nt":
-            subprocess.run(
-                ["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                check=False,
-            )
+        if agent is not None:
+            agent.close()
         else:
-            posix: Any = os
-            signals: Any = signal
-            posix.killpg(posix.getpgrp(), signals.SIGKILL)
-        os._exit(1)
-
-    threading.Thread(target=watch_owner, daemon=True).start()
-    execute(request)
-
-
-if __name__ == "__main__":
-    main()
+            for resource in reversed(resources):
+                resource.close()
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+        trace.close()

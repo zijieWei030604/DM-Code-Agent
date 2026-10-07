@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import time
 import uuid
 from collections.abc import Sequence
 from pathlib import Path
@@ -13,10 +14,12 @@ from typing import Any
 from .search_query import (
     escape_like,
     extract_search_terms,
+    normalize_search_sort,
     requires_like_fallback,
     sanitize_fts5_query,
     sanitize_like_query,
 )
+from .search_ranking import prepare_rank, rank_results
 
 
 class LCMStore:
@@ -73,6 +76,10 @@ class LCMStore:
             self.db.execute("INSERT INTO lcm_metadata VALUES ('schema', 'lcm-2')")
         elif version["value"] != "lcm-2":
             raise ValueError("Unsupported LCM database schema")
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(lcm_records)")}
+        for column in ("created_at", "latest_at"):
+            if column not in columns:
+                self.db.execute(f"ALTER TABLE lcm_records ADD COLUMN {column} REAL")
         try:
             self.db.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS lcm_fts USING fts5(record_id UNINDEXED, body)"
@@ -156,9 +163,9 @@ class LCMStore:
             return str(existing["id"])
         record_id = uuid.uuid4().hex
         self.db.execute(
-            "INSERT INTO lcm_records(id, branch, event_key, kind, body, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (record_id, branch, event_key, kind, body, encoded),
+            "INSERT INTO lcm_records(id, branch, event_key, kind, body, metadata, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (record_id, branch, event_key, kind, body, encoded, time.time()),
         )
         if self.fts_enabled:
             self.db.execute("INSERT INTO lcm_fts VALUES (?, ?)", (record_id, body))
@@ -225,6 +232,7 @@ class LCMStore:
             for source in sources:
                 self.get(branch, source)
             node_id = self._insert(branch, uuid.uuid4().hex, "summary", body, metadata)
+            self._set_source_time(branch, node_id, sources)
             self.db.executemany(
                 "INSERT INTO lcm_sources VALUES (?, ?, ?)",
                 [(node_id, source, index) for index, source in enumerate(sources)],
@@ -261,11 +269,22 @@ class LCMStore:
             for source in sources:
                 self.get(branch, source)
             node_id = self._insert(branch, uuid.uuid4().hex, "summary", body, metadata)
+            self._set_source_time(branch, node_id, sources)
             self.db.executemany(
                 "INSERT INTO lcm_sources VALUES (?, ?, ?)",
                 [(node_id, source, index) for index, source in enumerate(sources)],
             )
         return node_id
+
+    def _set_source_time(self, branch: str, node_id: str, sources: list[str]) -> None:
+        timestamps = [
+            row["latest_at"] or row["created_at"]
+            for row in (self.get(branch, source) for source in sources)
+        ]
+        self.db.execute(
+            "UPDATE lcm_records SET latest_at=? WHERE id=?",
+            (max((value for value in timestamps if value is not None), default=None), node_id),
+        )
 
     def sources(self, branch: str, node_id: str) -> list[str]:
         self.get(branch, node_id)
@@ -320,35 +339,44 @@ class LCMStore:
         *,
         limit: int = 10,
         record_types: Sequence[str] | None = None,
+        sort: str = "recency",
     ) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 30))
         query = query[:1000]
         safe_query = sanitize_fts5_query(query)
+        sort = normalize_search_sort(sort)
         requested_types = {str(item) for item in (record_types or ())}
         if any(not item for item in requested_types):
             raise ValueError("record_types must contain non-empty strings")
         predicate, args = self._visibility(branch)
 
-        def collect(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
+        def collect(cursor: sqlite3.Cursor, *, fts: bool) -> list[dict[str, Any]]:
             # Filter before the result limit, including on SQLite without JSON1.
             results = []
             for raw in cursor:
                 row = self._decode(raw)
                 if requested_types and self.record_type(row) not in requested_types:
                     continue
+                if sort != "recency":
+                    prepare_rank(
+                        row, query, safe_query if fts else sanitize_like_query(query), fts=fts
+                    )
                 results.append(row)
-                if len(results) == limit:
+                if sort == "recency" and len(results) == limit:
                     break
-            return results
+            if sort != "recency":
+                rank_results(results, sort, now=time.time())
+            return results[:limit]
 
         if self.fts_enabled and not requires_like_fallback(query, safe_query):
             try:
                 return collect(
                     self.db.execute(
-                        "SELECT r.* FROM lcm_fts JOIN lcm_records r ON r.id=lcm_fts.record_id "
+                        "SELECT r.*, bm25(lcm_fts) AS search_rank FROM lcm_fts JOIN lcm_records r ON r.id=lcm_fts.record_id "
                         f"WHERE lcm_fts MATCH ? AND {predicate} ORDER BY r.seq DESC",
                         [safe_query, *args],
-                    )
+                    ),
+                    fts=True,
                 )
             except sqlite3.OperationalError:
                 # Upstream falls back on FTS errors, not on an empty hit list.
@@ -362,5 +390,6 @@ class LCMStore:
                 f"SELECT r.* FROM lcm_records r WHERE {predicate} "
                 f"AND ({clauses}) ORDER BY r.seq DESC",
                 [*args, *(f"%{escape_like(term)}%" for term in terms)],
-            )
+            ),
+            fts=False,
         )

@@ -1,9 +1,9 @@
-"""Deterministic delegation tests: actual worker processes, no network or keys."""
+"""Deterministic delegation tests: in-process workers, no network or keys."""
 
 import json
-import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 
@@ -34,32 +34,32 @@ class NativeScriptedLLMClient(ScriptedLLMClient):
 
 
 @pytest.fixture
-def manager(tmp_path):
+def manager(tmp_path, monkeypatch):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    script = tmp_path / "fake_worker.py"
-    script.write_text(
-        """import json, sys, time
-from pathlib import Path
-r = json.loads(sys.stdin.readline())
-p = Path(r["attempt"])
-(p / "started").write_text(str(time.monotonic()))
-(p / "previous.txt").write_text(r.get("previous", ""))
-if r["instruction"] == "slow": time.sleep(30)
-time.sleep(0.3)
-if r["instruction"] == "fail": sys.exit(1)
-(p / "answer.txt").write_text("x" * 9000)
-(p / "result.json").write_text(json.dumps({"status":"succeeded", "summary":r["instruction"]}))
-(p / "ended").write_text(str(time.monotonic()))
-""",
-        encoding="utf-8",
-    )
+
+    def fake_worker(request, *, control):
+        path = Path(request["attempt"])
+        (path / "started").write_text(str(time.monotonic()))
+        (path / "previous.txt").write_text(request.get("previous", ""))
+        delay = 30 if request["instruction"] == "slow" else 0.1
+        end = time.monotonic() + delay
+        while time.monotonic() < end:
+            control.check()
+            control.cancelled.wait(0.005)
+        control.check()
+        if request["instruction"] == "fail":
+            raise RuntimeError("scripted failure")
+        (path / "answer.txt").write_text("x" * 9000)
+        (path / "ended").write_text(str(time.monotonic()))
+        return {"status": "succeeded", "summary": request["instruction"]}
+
+    monkeypatch.setattr("dm_agent.subagents.manager.execute", fake_worker)
     mgr = TaskManager(
         tmp_path / "store",
         {"workspace": str(workspace)},
         workers=2,
         timeout=5,
-        command=[sys.executable, str(script)],
     )
     yield mgr
     mgr.close()
@@ -92,7 +92,7 @@ def test_partial_failure_and_pagination(manager):
     assert result["next_offset"] == 100
 
 
-def test_timeout_reaps_process(manager):
+def test_timeout_stops_worker_before_batch_returns(manager):
     manager.timeout = 0.3
     records = json.loads(manager.batch(batch("slow")).message)["results"]
     assert records[0]["status"] == "timed_out"
@@ -781,32 +781,222 @@ def test_worker_denies_write_even_if_model_requests_it(tmp_path):
     assert not (tmp_path / "bad.txt").exists()
 
 
-def test_owner_pipe_eof_stops_real_worker(tmp_path):
+def test_real_sessions_overlap_without_processes_or_context_leaks(tmp_path, monkeypatch):
     import os
     import subprocess
 
-    from dm_agent.subagents.manager import stop_process
+    barrier = threading.Barrier(2)
+    clients = []
+    pids = []
 
-    request = {
-        "settings": {"workspace": str(tmp_path)},
-        "attempt": str(tmp_path / "attempt"),
-        "context": "x",
-        "instruction": "x",
+    class IndependentClient:
+        def __init__(self):
+            self.messages = None
+            self.closed = False
+            clients.append(self)
+
+        def respond(self, messages, **kwargs):
+            self.messages = messages
+            pids.append(os.getpid())
+            barrier.wait(timeout=5)
+            marker = "alpha" if "alpha" in str(messages) else "beta"
+            report = {"summary": marker, "findings": [], "uncertainties": []}
+            return json.dumps(
+                {"action": "submit_exploration_result", "action_input": {"report": report}}
+            )
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("no worker processes"))
+    monkeypatch.setattr(
+        "dm_agent.subagents.worker.create_llm_client", lambda **k: IndependentClient()
+    )
+    settings = {
+        "workspace": str(tmp_path),
+        "provider": "fake",
+        "api_key": "private",
+        "model": "fake",
+        "base_url": "",
     }
-    code = (
-        "import time; import dm_agent.subagents.worker as w; "
-        "w.execute = lambda request: time.sleep(30); w.main()"
-    )
-    process = subprocess.Popen(
-        [sys.executable, "-c", code],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        start_new_session=os.name != "nt",
-    )
+    manager = TaskManager(tmp_path / "store", settings, workers=2)
     try:
-        process.communicate(json.dumps(request) + "\n", timeout=15)
-        assert process.returncode != 0
+        records = json.loads(manager.batch(batch("alpha", "beta")).message)["results"]
+        assert [r["summary"] for r in records] == ["alpha", "beta"]
+        assert all(r["execution_backend"] == "in_process" for r in records)
+        assert pids == [os.getpid(), os.getpid()]
+        assert len(clients) == 2 and all(c.closed for c in clients)
+        assert clients[0].messages is not clients[1].messages
+        assert all(not ("alpha" in str(c.messages) and "beta" in str(c.messages)) for c in clients)
+        assert "private" not in manager.journal.read_text()
+        assert all((manager.root / r["id"] / "checkpoint.jsonl").exists() for r in records)
     finally:
-        stop_process(process)
+        manager.close()
+
+
+def test_cancel_drains_inflight_request_and_discards_late_tool_call(tmp_path, monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    output = []
+
+    class BlockingClient:
+        def respond(self, messages, **kwargs):
+            entered.set()
+            assert release.wait(5)
+            return json.dumps({"action": "read_file", "action_input": {"path": "target.py"}})
+
+        def close(self):
+            closed.set()
+
+    monkeypatch.setattr("dm_agent.subagents.worker.create_llm_client", lambda **k: BlockingClient())
+    monkeypatch.setattr("dm_agent.subagents.worker.scoped_tools", lambda root: [])
+    manager = TaskManager(
+        tmp_path / "store",
+        {
+            "workspace": str(tmp_path),
+            "provider": "fake",
+            "api_key": "x",
+            "model": "fake",
+            "base_url": "",
+        },
+        workers=1,
+    )
+    thread = threading.Thread(target=lambda: output.append(manager.batch(batch("one", "two"))))
+    try:
+        thread.start()
+        assert entered.wait(5)
+        manager.cancel()
+        assert thread.is_alive()  # Parent cannot advance while synchronous work is still running.
+        release.set()
+        thread.join(5)
+        assert not thread.is_alive() and closed.is_set()
+        records = json.loads(output[0].message)["results"]
+        assert [r["status"] for r in records] == ["cancelled", "cancelled"]
+        assert not (manager.root / records[0]["id"] / "answer.txt").exists()
+    finally:
+        release.set()
+        thread.join(5)
+        manager.close()
+
+
+def test_deadline_expired_response_cannot_finish_or_continue(tmp_path):
+    from dm_agent.subagents.control import ExplorationStopped, RunControl
+
+    class LateClient:
+        def respond(self, messages, **kwargs):
+            control.deadline = time.monotonic() - 1
+            return json.dumps({"action": "finish", "action_input": "late"})
+
+    control = RunControl(threading.Event(), 5)
+    with pytest.raises(ExplorationStopped) as stopped:
+        execute(
+            {
+                "settings": {"workspace": str(tmp_path)},
+                "attempt": str(tmp_path / "attempt"),
+                "context": "x",
+                "instruction": "x",
+            },
+            LateClient(),
+            control=control,
+        )
+    assert stopped.value.status == "timed_out"
+    assert not (tmp_path / "attempt" / "answer.txt").exists()
+
+
+@pytest.mark.parametrize("provider", ["openai", "claude", "gemini", "deepseek"])
+def test_worker_request_limits_reach_provider_transport(tmp_path, provider):
+    from types import SimpleNamespace
+
+    from dm_agent.clients import ClaudeClient, DeepSeekClient, GeminiClient, OpenAIClient
+    from dm_agent.subagents.control import RunControl
+    from dm_agent.subagents.delivery import DeliveryPolicy
+    from dm_agent.subagents.schema import DEFAULT_REPORT
+    from dm_agent.subagents.worker import Meter
+
+    seen = {}
+
+    class SDK:
+        def with_options(self, **options):
+            seen.update(options)
+            return self
+
+        def generate_content(self, **options):
+            seen.update(options)
+            return SimpleNamespace(text="done")
+
+    cls = {
+        "openai": OpenAIClient,
+        "claude": ClaudeClient,
+        "gemini": GeminiClient,
+        "deepseek": DeepSeekClient,
+    }[provider]
+    client = object.__new__(cls)
+    sdk = SDK()
+    sdk.models = sdk
+    client.client = sdk
+    client.model = "fake"
+
+    def respond(messages, **options):
+        if provider == "gemini":
+            client.complete(messages, **options)
+        return "done"
+
+    client.respond = respond
+    meter = Meter(
+        client,
+        tmp_path / "usage.jsonl",
+        DeliveryPolicy(DEFAULT_REPORT, tmp_path / "rejected.jsonl"),
+        RunControl(threading.Event(), 2),
+    )
+    assert meter.respond([{"role": "user", "content": "test"}]) == "done"
+    assert 0 < client.timeout <= 2
+    if provider in {"openai", "claude"}:
+        assert seen["timeout"] == client.timeout
+        assert seen["max_retries"] == 0
+    if provider == "gemini":
+        http = seen["config"]["http_options"]
+        assert 0 < http["timeout"] <= 2000
+        assert http["retry_options"] == {"attempts": 1}
+
+
+def test_close_waits_for_child_cleanup_and_rejects_new_batches(tmp_path, monkeypatch):
+    from dm_agent.subagents.control import ExplorationStopped
+
+    entered = threading.Event()
+    cleanup = threading.Event()
+    release_cleanup = threading.Event()
+
+    def worker(request, *, control):
+        entered.set()
+        control.cancelled.wait(5)
+        try:
+            control.check()
+        except ExplorationStopped:
+            cleanup.set()
+            assert release_cleanup.wait(5)
+            raise
+
+    monkeypatch.setattr("dm_agent.subagents.manager.execute", worker)
+    manager = TaskManager(tmp_path / "store", {"workspace": str(tmp_path)})
+    batch_thread = threading.Thread(target=lambda: manager.batch(batch("one")))
+    close_thread = threading.Thread(target=manager.close)
+    try:
+        batch_thread.start()
+        assert entered.wait(5)
+        close_thread.start()
+        assert cleanup.wait(5)
+        assert close_thread.is_alive()
+        release_cleanup.set()
+        close_thread.join(5)
+        batch_thread.join(5)
+        assert not close_thread.is_alive() and not batch_thread.is_alive()
+        assert next(iter(manager.records.values()))["status"] == "cancelled"
+        with pytest.raises(RuntimeError, match="closed"):
+            manager.batch(batch("later"))
+    finally:
+        release_cleanup.set()
+        batch_thread.join(5)
+        if close_thread.ident:
+            close_thread.join(5)
+        manager.close()

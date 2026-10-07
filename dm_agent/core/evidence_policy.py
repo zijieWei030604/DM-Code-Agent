@@ -39,8 +39,7 @@ class EvidenceCompletionPolicy:
         contradictions = [
             node
             for node in checks
-            if not bool(node.metadata.get("passed"))
-            and bool(node.metadata.get("blocking", False))
+            if not bool(node.metadata.get("passed")) and bool(node.metadata.get("blocking", False))
         ]
         if contradictions:
             latest = contradictions[-1]
@@ -73,7 +72,7 @@ def _verification_issue(node: EvidenceNode, status: str) -> dict[str, str]:
 
 
 def _blocking_status(node: EvidenceNode) -> str:
-    if str(node.metadata.get("failure_kind", "")) == "syntax_error":
+    if str(node.metadata.get("failure_kind", "")) in {"syntax_error", "lsp_code_error"}:
         return "confirmed_code_error"
     return "confirmed_test_failure"
 

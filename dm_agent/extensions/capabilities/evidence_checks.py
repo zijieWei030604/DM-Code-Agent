@@ -103,6 +103,12 @@ def test_identity(
         matches = [
             p for p in files if relative == "." or p == relative or p.startswith(relative + "/")
         ]
+        # A broad pytest target (normally ``.``) includes production files.
+        # Those files are intentionally excluded from test identity, otherwise
+        # every source edit makes the same regression test look incomparable.
+        if relative == "." or candidate.is_dir():
+            test_matches = [p for p in matches if _is_test_source(p)]
+            matches = test_matches or matches
         if not matches:
             return ""
         selected.extend(matches)
@@ -111,8 +117,19 @@ def test_identity(
         p: h
         for p, h in files.items()
         if p in selected
-        or any("test" in part.lower() for part in Path(p).parts)
+        or _is_test_source(p)
         or Path(p).suffix in {".toml", ".ini", ".cfg", ".yaml", ".yml", ".json"}
         or Path(p).name == "setup.py"
     }
     return fingerprint([arguments, sources, environment])
+
+
+def _is_test_source(path: str) -> bool:
+    candidate = Path(path)
+    name = candidate.name.lower()
+    return (
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or "tests" in {part.lower() for part in candidate.parts}
+        or name == "conftest.py"
+    )

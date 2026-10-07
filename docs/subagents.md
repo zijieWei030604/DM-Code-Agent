@@ -11,7 +11,7 @@ uv run --frozen dm-agent --subagent-store E:\AgentRuns\explore-session-01 --suba
 
 `--subagent-store` 同时显式启用私有持久化：该目录保存子任务说明、结果、工具来源、
 完整会话 Checkpoint。不要把它作为可公开 trace 分享。模型原始请求/响应的 trace 捕获
-仍然关闭。密钥通过子进程 stdin 传递，不写入任务记录或命令行。目录必须位于工作区外，
+仍然关闭。密钥仅在进程内传递给子会话，不写入任务记录或命令行。目录必须位于工作区外，
 防止污染 changed-files 评分；同一目录绑定一个工作区，同一时刻仅允许一个管理器。
 新任务建议新目录；恢复原会话时传回同一个目录。不开启此参数不改变原有运行。
 
@@ -28,9 +28,13 @@ uv run --frozen dm-agent --subagent-store E:\AgentRuns\explore-session-01 --suba
 ```
 
 每批 1–16 项；同批任务必须独立。有依赖时主 Agent 先提交定位批次，返回后再提交调查批次。
-每项是独立 Python 进程、模型客户端、ReAct 实例、历史、工具集合、trace 和 checkpoint。
-线程池仅在父进程调度/等待这些进程。并发上限 1–8，同一个管理器的批次串行进入，所以
-不会因重复调用绕过上限。父工具等待所有进程实际退出，才返回逐项状态。
+每项在同一 Python 进程内创建独立模型客户端、ReAct 实例、事件总线、历史、工具集合、trace
+和 checkpoint。同步模型客户端通过 ThreadPoolExecutor 并发执行，无需启动 Python 子进程。
+这与 Oh My Pi 的进程内独立会话采用相同的隔离思路，但不是 Node.js 的异步事件循环实现。
+并发上限 1–8，同一个管理器的批次串行进入，不会因重复调用绕过上限。父工具等待所有
+工作线程完成并释放子会话资源，才返回逐项状态。不会在线程中切换 cwd、重定向全局
+stdout/stderr，或共享可变模型客户端状态。模型客户端及可选 LSP 仍按子会话独立创建。
+结果记录包含 execution_backend=in_process；独立上下文属于逻辑隔离，不是进程或沙箱隔离。
 
 返回的 `id` 是本次 attempt，`session_id` 是逻辑子会话。追问时在任务项传入
 `session_id`（也接受该会话的任意 attempt ID），使用最新 attempt 已保存的历史开启新一轮。
@@ -53,7 +57,7 @@ uv run --frozen dm-agent --subagent-store E:\AgentRuns\explore-session-01 --suba
 可按项提供 `output_schema`。实现明确的 JSON Schema 子集：
 `type`（object/array/string/boolean/integer/number/null）、`properties`、`required`、
 `additionalProperties`（仅布尔）、`items`、`enum`、`description`，嵌套最多十层。
-不支持 `$ref`、组合 Schema 等关键字；在启动任何子进程前拒绝不支持的契约，不静默忽略。
+不支持 `$ref`、组合 Schema 等关键字；在调度任何子会话前拒绝不支持的契约，不静默忽略。
 格式不符时将具体校验错误反馈模型；首次无效交付后最多允许两次纠正（合计三次无效
 交付即耗尽），完成工具和旧 `finish` 共用预算。纠正沿用当前 ReAct 循环，不重置步数、
 Token 或墙钟预算；耗尽后不再向模型发送请求。不增加 `partial` 状态，也不绕过 Schema。
@@ -67,7 +71,7 @@ Token 或墙钟预算；耗尽后不再向模型发送请求。不增加 `partia
 
 Explore 只注册经过选择的内置目录、搜索、读取工具；不继承项目扩展、MCP、可执行 Skills、
 Shell、Python 执行或委派工具。路径规范化限制在工作区内；扫描遇到指向工作区外的链接拒绝。
-开启父 LSP 功能时，子进程创建自己的 LSP 服务，只开放 symbols/references/definition/diagnostics。
+开启父 LSP 功能时，子会话创建自己的 LSP 服务（Pyright 本身仍是外部语言服务器进程），只开放 symbols/references/definition/diagnostics。
 这是一套工具权限边界，不是操作系统沙箱。会话记录写入私有目录，业务工作区只读。
 
 前台父循环在任务工具中等待，不会同时编辑。不防范外部编辑器，符合当前使用前提。
@@ -79,13 +83,18 @@ Shell、Python 执行或委派工具。路径规范化限制在工作区内；�
 状态：queued / running / succeeded / failed / cancelled / timed_out / interrupted。
 执行状态和 delivery 分开；returned 仅表示结果组装并交回工具调用，不等于模型采纳。
 一个失败不会取消同批其他独立任务。`TaskManager.cancel()` 是宿主取消入口；CLI 的
-Ctrl+C 会取消整批、终止并回收所属子进程树。前台运行期间模型无法再调用取消工具，
+Ctrl+C 会请求取消整批，停止未启动项，并等待运行中子会话协作退出。前台运行期间模型无法再调用取消工具，
 因此不提供一个实际上无法并发调用的 `task_cancel` 模型接口。
 
-每项最多 min(父 max_steps, 30) 步，默认 180 秒墙钟预算（不含排队），请求超时 30 秒；
+每项最多 min(父 max_steps, 30) 步，默认 180 秒墙钟预算（不含排队），每次模型请求的
+I/O 超时取剩余预算与 30 秒的较小值，并关闭子会话请求重试；
 累计模型文本估算预算 32000 Token，下一次请求前检查，正在生成的单次响应可能越过软额度。
-到墙钟预算即终止进程树，并等待退出后返回。父进程异常退出时 stdin 关闭，工作进程的
-owner watcher 终止自身进程树，不作为后台守护服务继续运行。
+在模型请求前后、工具执行前后和完成申请前检查取消/超时，迟到响应不能触发后续工具。
+取消是协作式的：已经发出的同步 HTTP 请求或文件读取不会被强杀，必须等它返回或触发
+底层超时，再关闭客户端和 LSP。同步 I/O 超时不等于严格的总墙钟截止，慢速持续响应或
+阻塞的文件系统可能延长收尾；不承诺点击取消后立即返回。前台不会留下仍在运行的线程
+却让父 Agent 开始写入。独立进程的硬终止及 owner-pipe watcher 已移除；进程崩溃隔离
+不再提供，正常退出仍由资源所有者清理可选 LSP。
 
 任务 journal 是 append-only，恢复不覆盖原状态；最后一条残缺记录用追加恢复标记保留。
 重新打开目录时未完成项标记 interrupted，不自动重跑；主 Agent 通过 task_list 查询、
@@ -96,18 +105,20 @@ task_result 复用完成结果，或明确委派新 attempt。追问恢复最后
 
 父结果 metadata.subagents 含子运行指标，subagent_estimated_tokens 是子运行文本估算总和；
 不等于供应商账单 Token，也不自动计入既有 Benchmark 的父客户端计数。A/B 分析必须另外加上
-子用量，并区分 schema/工具定义、重试等估算未覆盖部分。被强制终止的请求可能没有完整用量，
+子用量，并区分 schema/工具定义、重试等估算未覆盖部分。被取消或异常结束的请求可能没有完整用量，
 subagent_usage_complete 为 false，不把未知输出记作确定的零消耗。
 
 ```cmd
 uv run --frozen pytest tests/test_subagents.py -v
 ```
 
-测试使用脚本模型和本机假工作进程，不需要 API Key。真实模型收益需要后续运行同题对照；
+测试使用脚本模型与进程内工作线程，不需要 API Key。真实模型收益需要后续运行同题对照；
 本实现不声明通过率、Token 节省或提速指标。参考架构而非复制上游 TypeScript：
 [Oh My Pi task](https://github.com/can1357/oh-my-pi/tree/main/packages/coding-agent/src/task)。
 
-### 本次离线验证（2026-10-03）
+### 历史子进程版本的离线验证（2026-10-03）
+
+以下是迁移前的历史记录，不代表当前进程内实现的测试结果。
 
 - 新增 19 项委派测试全部通过：实际进程并行与并发上限、部分失败、超时、取消、
   父进程失联收尾、恢复查询、Checkpoint 追问、权限限制、原生/提示词 JSON 两种结构化
@@ -119,3 +130,14 @@ uv run --frozen pytest tests/test_subagents.py -v
 - direct_finish 的原始与当前版本均因 SQLite 文件无法打开而未成功；不能用退出码 0
   代替评测成功。全库 Ruff、Black、mypy 也仍有未修改文件中的存量问题。
 - 未运行真实模型或收费评测，不将本次功能测试解释为实际任务成功率提升。
+
+### 进程内会话迁移验证（2026-10-06）
+
+- 子 Agent 专项测试通过，覆盖同进程并发、独立上下文、并发上限、部分失败、
+  追问恢复、结构化交付、取消收尾、迟到响应拦截及四类模型客户端的请求超时传递。
+- compileall、本次修改文件的 Ruff / Black / mypy 通过；direct_finish 确定性评测
+  1/1 成功，maintenance Benchmark 清单可加载。
+- 全库 pytest 有 3 项失败，均为 LSP 工具清单断言：test_extension_registry、
+  test_observation_failure、test_server_readonly；未改动这些测试或 LSP 工具注册。
+- 全库 Ruff / Black / mypy 仍有其他文件的检查问题，本次未扩大修改范围。
+- 尚未测量真实模型任务的启动延迟或端到端加速，不声明量化性能收益。

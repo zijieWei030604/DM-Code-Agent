@@ -5,13 +5,16 @@ from typing import Any
 
 import pytest
 
+from dm_agent.core.capabilities import CapabilityContext
 from dm_agent.core.events import (
     AfterToolResultEvent,
     BeforeFinishEvent,
     BeforeToolCallEvent,
+    EventBus,
     RunStartEvent,
 )
 from dm_agent.core.evidence import EvidenceGraph
+from dm_agent.extensions.capabilities.evidence import EvidenceGraphCapability
 from dm_agent.extensions.capabilities.lsp_impact import LspImpactCapability
 from dm_agent.lsp_impact.analyzer import ImpactAnalyzer
 from dm_agent.lsp_impact.client import PyrightLspClient, _document_key, path_to_uri
@@ -158,6 +161,50 @@ def test_capability_appends_summary_and_blocks_new_error(tmp_path: Path) -> None
     assert decision["block"] is True
 
 
+def test_lsp_failure_is_recorded_by_evidence_before_completion_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
+    service = LspImpactService(tmp_path, client=FakeLspClient(error_after=True))
+    lsp = LspImpactCapability(service)
+    evidence = EvidenceGraphCapability()
+    bus = EventBus()
+    context = CapabilityContext(bus, lambda phase: None)
+    lsp.install(context)
+    evidence.install(context)
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("fix", 1, "run", metadata=metadata))
+    event = BeforeToolCallEvent("edit_file", {"path": "source.py"}, 1, "run", metadata)
+    bus.emit_before_tool_call(event)
+    source.write_text("def normalize(value):\n    return broken(value)\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file",
+            {"path": "source.py"},
+            "edited",
+            1,
+            "run",
+            True,
+            metadata,
+            result=ToolResult("success", "edited", changed_files=("source.py",)),
+        )
+    )
+
+    assert bus.emit_before_finish(
+        BeforeFinishEvent("fix", "finish", "done", [], 2, "run", metadata)
+    )
+    assert any(
+        node.kind == "verification" and node.metadata.get("tool") == "lsp_impact"
+        for node in evidence.graph.nodes.values()
+    )
+    assert bus.emit_before_finish(
+        BeforeFinishEvent("fix", "finish", "done", [], 3, "run", metadata)
+    )
+    assert metadata["evidence_terminal_completion_rejection"]
+
+
 def test_repaired_latest_report_replaces_old_error_for_completion(tmp_path: Path) -> None:
     source = tmp_path / "source.py"
     source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
@@ -205,6 +252,44 @@ def test_repaired_latest_report_replaces_old_error_for_completion(tmp_path: Path
     assert repaired.metadata["lsp_impact_reports"][0]["report_id"] in {
         report.report_id for report in service.completion_state().effective_reports
     }
+
+
+def test_lsp_uses_the_first_task_snapshot_as_its_error_baseline(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
+    service = LspImpactService(tmp_path, client=FakeLspClient(error_after=True))
+    assert service.start("run")
+    service.snapshot("source.py")
+    source.write_text("def normalize(value):\n    return broken(value)\n", encoding="utf-8")
+    first = service.analyze("source.py")
+    assert first.blocking_error_diagnostics
+
+    # A second edit must not turn the first task-introduced error into baseline.
+    service.snapshot("source.py")
+    source.write_text("def normalize(value):\n    return broken(value).strip()\n", encoding="utf-8")
+    second = service.analyze("source.py")
+    assert second.blocking_error_diagnostics
+
+
+def test_lsp_marks_dependency_resolution_errors_as_uncertain(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
+
+    class DependencyErrorClient(FakeLspClient):
+        def diagnostics(self, path: Path, text: str) -> list[dict[str, Any]]:
+            return (
+                [{"severity": 1, "code": "reportMissingImports", "message": "missing", "range": {}}]
+                if "broken" in text
+                else []
+            )
+
+    analyzer = ImpactAnalyzer(DependencyErrorClient(), tmp_path)
+    analyzer.snapshot(source)
+    source.write_text("def normalize(value):\n    return broken(value)\n", encoding="utf-8")
+    report = analyzer.analyze(source)
+    assert report.new_error_diagnostics
+    assert not report.blocking_error_diagnostics
+    assert report.uncertain_error_diagnostics
 
 
 def test_report_becomes_stale_after_unanalyzed_later_edit(tmp_path: Path) -> None:

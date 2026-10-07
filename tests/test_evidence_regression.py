@@ -153,6 +153,18 @@ def test_environment_changes_during_check_cannot_establish_baseline(rig, monkeyp
     assert not check(rig, 3, "failed").metadata["blocking"]
 
 
+def test_broad_pytest_identity_survives_a_production_code_edit(rig):
+    root, _, _, _ = rig
+    broad = {"targets": ["."]}
+    baseline = check(rig, 1, "passed", arguments=broad)
+    assert baseline.metadata["identity"]
+    edit(rig, 2)
+    failed = check(rig, 3, "failed", arguments=broad)
+    assert failed.metadata["identity"] == baseline.metadata["identity"]
+    assert failed.metadata["blocking"]
+    assert (root / "service.py").read_text() == "value = 2\n"
+
+
 @pytest.mark.parametrize("tool", ["run_shell", "run_python"])
 def test_failed_command_records_actual_modifications_and_deletions(rig, tool):
     root, bus, cap, metadata = rig

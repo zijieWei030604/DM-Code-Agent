@@ -37,6 +37,8 @@ class ImpactReport:
     references_seen: int = 0
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
     new_error_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    blocking_error_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    uncertain_error_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     truncated: bool = False
     reason: str = ""
     before_hash: str = ""
@@ -56,6 +58,15 @@ class ImpactAnalyzer:
         self.workspace_root = workspace_root.resolve()
         self.max_references = max_references
         self._snapshots: dict[Path, ImpactSnapshot] = {}
+        # A task has one diagnostic baseline per file.  Replacing this with the
+        # most recent snapshot would make an error introduced by an earlier edit
+        # look "old" after a second edit, which is unsafe at completion time.
+        self._initial_diagnostics: dict[Path, list[dict[str, Any]]] = {}
+
+    def reset(self) -> None:
+        """Discard run-scoped snapshots before a new Agent task starts."""
+        self._snapshots.clear()
+        self._initial_diagnostics.clear()
 
     def snapshot(self, path: Path) -> ImpactSnapshot | None:
         resolved = self._resolve(path)
@@ -72,6 +83,7 @@ class ImpactAnalyzer:
             diagnostics=diagnostics,
         )
         self._snapshots[resolved] = snapshot
+        self._initial_diagnostics.setdefault(resolved, diagnostics)
         return snapshot
 
     def analyze(self, path: Path) -> ImpactReport:
@@ -113,11 +125,14 @@ class ImpactAnalyzer:
                         candidates.add(candidate)
                 if truncated:
                     break
-            old_errors = {
-                _diagnostic_key(item)
-                for item in (before.diagnostics if before else [])
-                if _is_error(item)
-            }
+            baseline = self._initial_diagnostics.get(resolved)
+            # A newly-created Python file has no pre-write document. Its empty
+            # diagnostic baseline is still meaningful: every current Error is
+            # attributable to the task's new file.
+            if baseline is None:
+                baseline = []
+                self._initial_diagnostics[resolved] = baseline
+            old_errors = {_diagnostic_key(item) for item in baseline if _is_error(item)}
             new_errors = [
                 item
                 for item in diagnostics
@@ -133,6 +148,10 @@ class ImpactAnalyzer:
                 references_seen=seen,
                 diagnostics=diagnostics,
                 new_error_diagnostics=new_errors,
+                blocking_error_diagnostics=[item for item in new_errors if _is_code_error(item)],
+                uncertain_error_diagnostics=[
+                    item for item in new_errors if not _is_code_error(item)
+                ],
                 truncated=truncated or len(candidates) > 10,
             )
             self._snapshots[resolved] = ImpactSnapshot(
@@ -265,6 +284,12 @@ def _empty_or_declaration_only(references: list[dict[str, Any]], path: Path, lin
 
 def _is_error(diagnostic: dict[str, Any]) -> bool:
     return int(diagnostic.get("severity", 1)) == 1
+
+
+def _is_code_error(diagnostic: dict[str, Any]) -> bool:
+    """Keep dependency-resolution failures as warnings, not proven code defects."""
+    code = str(diagnostic.get("code", ""))
+    return code not in {"reportMissingImports", "reportMissingModuleSource"}
 
 
 def _diagnostic_key(diagnostic: dict[str, Any]) -> str:

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from dm_agent.tools import default_tools
 from dm_agent.tracing.analysis import analyze_events
 from dm_agent.tracing.session import load_session_entries
 
@@ -34,8 +35,10 @@ def test_health_and_meta_shape(client: TestClient) -> None:
         "claude",
         "gemini",
     }
-    # 21 个内置工具，与工具注册表保持一致。
-    assert len(meta["tools"]) == 21
+    # 服务端元信息必须与内置工具注册表保持一致，避免新增工具后 UI 静默遗漏。
+    assert [tool["name"] for tool in meta["tools"]] == [
+        tool.name for tool in default_tools(include_mcp=False)
+    ]
     # 开关目录必须同时覆盖两类，前端才能渲染出「护栏默认开 / 行为默认关」的分组。
     categories = {item["category"] for item in meta["capabilities"]}
     assert {"guardrail", "behavior"} <= categories
