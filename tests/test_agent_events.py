@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 
+from dm_agent.clients.streaming import StreamEvent
 from dm_agent.core import EventBus, ReactAgent
 from dm_agent.core.events import AfterToolResultEvent
 from dm_agent.tools.base import Tool, ToolResult
@@ -29,11 +30,66 @@ class FakeRespondClient:
         return self.responses.pop(0)
 
 
+class StreamingRespondClient(FakeRespondClient):
+    """Deterministic client that models a terminally assembled stream response."""
+
+    supports_tool_calling = True
+    supports_streaming = True
+
+    def respond(self, messages, **extra):
+        self.requests.append((messages, extra))
+        callback = extra["on_stream_event"]
+        callback(StreamEvent("stream_start", "request"))
+        callback(StreamEvent("toolcall_start", "request", tool_index=0, tool_name="echo"))
+        callback(
+            StreamEvent(
+                "toolcall_delta",
+                "request",
+                delta='{"value":"ready"}',
+                tool_index=0,
+                tool_name="echo",
+                arguments_preview={"value": "ready"},
+            )
+        )
+        callback(StreamEvent("toolcall_end", "request", tool_index=0, tool_name="echo"))
+        callback(StreamEvent("stream_done", "request"))
+        self.last_response_mode = "native_tool_call"
+        self.last_tool_call_count = 1
+        self.last_selected_tool = "echo"
+        return super().respond(messages, **extra)
+
+
 def _action(action: str, action_input) -> str:
     return json.dumps(
         {"thought": "step", "action": action, "action_input": action_input},
         ensure_ascii=False,
     )
+
+
+def test_terminal_stream_response_reuses_the_normal_tool_invoker_chain():
+    order = []
+    client = StreamingRespondClient(
+        [_action("echo", {"value": "ready"}), _action("finish", "done")]
+    )
+    agent = ReactAgent(
+        client,
+        [Tool("echo", "Echo", lambda arguments: order.append(("tool", arguments)) or "done")],
+        enable_planning=False,
+        enable_compression=False,
+        stream_callback=lambda event: order.append(("stream", event.type)),
+    )
+
+    result = agent.run("echo", max_steps=2)
+
+    assert result["metadata"]["status"] == "success"
+    assert order[:5] == [
+        ("stream", "stream_start"),
+        ("stream", "toolcall_start"),
+        ("stream", "toolcall_delta"),
+        ("stream", "toolcall_end"),
+        ("stream", "stream_done"),
+    ]
+    assert order[5] == ("tool", {"value": "ready"})
 
 
 def exploding_handler(event):

@@ -84,6 +84,7 @@ def initial_run_metadata(
         "protocol_downgrade_count": 0,
         "json_fallback_count": 0,
         "discarded_tool_call_count": 0,
+        "stream_security_block_count": 0,
         "tool_error_count": 0,
         "unknown_tool_count": 0,
         "argument_error_count": 0,

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Iterable
+import uuid
+from collections.abc import Callable, Iterable
 from typing import Any
 
 import requests
 
 from .base_client import BaseLLMClient, LLMError
+from .streaming import StreamEvent, StreamToolCall
 
 DEFAULT_RETRY_STATUS_CODES = frozenset({400, 408, 409, 429, 500, 502, 503, 504})
 
@@ -18,11 +20,16 @@ class DeepSeekError(LLMError):
     """当 DeepSeek API 请求失败时抛出。"""
 
 
+class DeepSeekStreamBlocked(DeepSeekError):
+    """A deterministic stream-time policy rejected a completed argument field."""
+
+
 class DeepSeekClient(BaseLLMClient):
     """DeepSeek 聊天补全 API 的轻量级封装。"""
 
     supports_tool_calling = True
     supports_json_schema = True
+    supports_streaming = True
 
     def __init__(
         self,
@@ -73,14 +80,14 @@ class DeepSeekClient(BaseLLMClient):
         tool_definitions: list[dict[str, Any]] | None = None,
         json_schema: dict[str, Any] | None = None,
         stream: bool = False,
+        on_stream_event: Callable[[StreamEvent], bool | None] | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """向 DeepSeek API 发送聊天式补全请求。"""
 
-        if stream:
-            raise NotImplementedError("此客户端未实现流式传输。")
-
         if json_schema is not None:
+            if stream:
+                raise ValueError("DeepSeek JSON Schema responses do not use this chat stream path.")
             return self._complete_structured_response(messages, json_schema, extra)
 
         payload: dict[str, Any] = {
@@ -97,7 +104,215 @@ class DeepSeekClient(BaseLLMClient):
         payload.update(extra)
 
         url = f"{self.base_url}/{self.endpoint.lstrip('/')}"
+        if stream:
+            return self._post_stream_with_retry(url, payload, on_stream_event=on_stream_event)
         return self._post_with_retry(url, payload)
+
+    def _post_stream_with_retry(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        on_stream_event: Callable[[StreamEvent], bool | None] | None,
+    ) -> dict[str, Any]:
+        """Consume one DeepSeek OpenAI-compatible SSE response into a final payload.
+
+        The callback sees immutable events.  Returning ``False`` rejects the
+        request immediately; it never authorizes or executes a tool call.
+        """
+
+        request_id = uuid.uuid4().hex
+        stream_payload = {**payload, "stream": True}
+        for retry_index in range(self.max_retries + 1):
+            has_retry_budget = retry_index < self.max_retries
+            response: Any | None = None
+            try:
+                response = self.session.post(
+                    url, json=stream_payload, timeout=self.timeout, stream=True
+                )
+                if not response.ok:
+                    message = self._format_error(response)
+                    if self._is_retryable_response(response) and has_retry_budget:
+                        self._sleep_before_retry(retry_index)
+                        continue
+                    raise DeepSeekError(message)
+                return self._consume_sse(response, request_id, on_stream_event)
+            except DeepSeekStreamBlocked as exc:
+                self._emit_stream_error(on_stream_event, request_id, str(exc))
+                raise
+            except DeepSeekError as exc:
+                self._emit_stream_error(on_stream_event, request_id, str(exc))
+                raise
+            except requests.RequestException as exc:
+                if self._is_retryable_exception(exc) and has_retry_budget:
+                    self._sleep_before_retry(retry_index)
+                    continue
+                error = DeepSeekError(f"DeepSeek stream request failed: {exc}")
+                self._emit_stream_error(on_stream_event, request_id, str(error))
+                raise error from exc
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+        raise DeepSeekError("DeepSeek stream request failed after exhausting retry budget.")
+
+    @staticmethod
+    def _emit_stream_event(
+        callback: Callable[[StreamEvent], bool | None] | None, event: StreamEvent
+    ) -> None:
+        if callback is not None and callback(event) is False:
+            raise DeepSeekStreamBlocked(event.reason or "Stream-time policy blocked this request.")
+
+    @staticmethod
+    def _emit_stream_error(
+        callback: Callable[[StreamEvent], bool | None] | None, request_id: str, reason: str
+    ) -> None:
+        """Best-effort terminal notification; a policy cannot reject an error event."""
+
+        if callback is None:
+            return
+        try:
+            callback(StreamEvent("stream_error", request_id, reason=reason))
+        except Exception:
+            # A UI observer must not mask the original transport or policy failure.
+            return
+
+    def _consume_sse(
+        self,
+        response: Any,
+        request_id: str,
+        callback: Callable[[StreamEvent], bool | None] | None,
+    ) -> dict[str, Any]:
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_calls: dict[int, StreamToolCall] = {}
+        saw_done = False
+        finish_reason = ""
+        self._emit_stream_event(callback, StreamEvent("stream_start", request_id))
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if body == "[DONE]":
+                saw_done = True
+                break
+            try:
+                chunk = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise DeepSeekError(f"DeepSeek stream yielded invalid JSON: {exc}") from exc
+            choices = chunk.get("choices")
+            if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                continue
+            choice = choices[0]
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                delta = {}
+            text = delta.get("content")
+            if isinstance(text, str) and text:
+                if not text_parts:
+                    self._emit_stream_event(callback, StreamEvent("text_start", request_id))
+                text_parts.append(text)
+                self._emit_stream_event(callback, StreamEvent("text_delta", request_id, delta=text))
+            thinking = delta.get("reasoning_content")
+            if isinstance(thinking, str) and thinking:
+                if not thinking_parts:
+                    self._emit_stream_event(callback, StreamEvent("thinking_start", request_id))
+                thinking_parts.append(thinking)
+                self._emit_stream_event(
+                    callback, StreamEvent("thinking_delta", request_id, delta=thinking)
+                )
+            raw_calls = delta.get("tool_calls")
+            if isinstance(raw_calls, list):
+                for offset, raw_call in enumerate(raw_calls):
+                    if not isinstance(raw_call, dict):
+                        continue
+                    index = raw_call.get("index", offset)
+                    if not isinstance(index, int):
+                        continue
+                    state = tool_calls.get(index)
+                    function = raw_call.get("function")
+                    function = function if isinstance(function, dict) else {}
+                    if state is None:
+                        state = StreamToolCall(index=index)
+                        tool_calls[index] = state
+                        self._emit_stream_event(
+                            callback,
+                            StreamEvent(
+                                "toolcall_start",
+                                request_id,
+                                tool_index=index,
+                                tool_call_id=str(raw_call.get("id") or ""),
+                                tool_name=str(function.get("name") or ""),
+                            ),
+                        )
+                    if raw_call.get("id"):
+                        state.call_id = str(raw_call["id"])
+                    if function.get("name"):
+                        state.name = str(function["name"])
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str) and arguments:
+                        state.append(arguments)
+                        self._emit_stream_event(
+                            callback,
+                            StreamEvent(
+                                "toolcall_delta",
+                                request_id,
+                                delta=arguments,
+                                tool_index=index,
+                                tool_call_id=state.call_id,
+                                tool_name=state.name,
+                                arguments_preview=state.preview(),
+                            ),
+                        )
+            reason = choice.get("finish_reason")
+            if isinstance(reason, str) and reason:
+                finish_reason = reason
+        if not saw_done and not finish_reason:
+            raise DeepSeekError("DeepSeek stream ended before a finish reason or [DONE].")
+        if text_parts:
+            self._emit_stream_event(callback, StreamEvent("text_end", request_id))
+        if thinking_parts:
+            self._emit_stream_event(callback, StreamEvent("thinking_end", request_id))
+        serialized_calls: list[dict[str, Any]] = []
+        for index in sorted(tool_calls):
+            state = tool_calls[index]
+            try:
+                state.finalize()
+            except ValueError as exc:
+                raise DeepSeekError(f"DeepSeek streamed invalid tool arguments: {exc}") from exc
+            self._emit_stream_event(
+                callback,
+                StreamEvent(
+                    "toolcall_end",
+                    request_id,
+                    tool_index=index,
+                    tool_call_id=state.call_id,
+                    tool_name=state.name,
+                    arguments_preview=state.arguments or {},
+                ),
+            )
+            serialized_calls.append(
+                {
+                    "id": state.call_id or f"stream_call_{index}",
+                    "type": "function",
+                    "function": {
+                        "name": state.name,
+                        "arguments": state.raw_arguments,
+                    },
+                }
+            )
+        message: dict[str, Any] = {"content": "".join(text_parts) or None}
+        if serialized_calls:
+            message["tool_calls"] = serialized_calls
+        if thinking_parts:
+            message["reasoning_content"] = "".join(thinking_parts)
+        self._emit_stream_event(
+            callback, StreamEvent("stream_done", request_id, reason=finish_reason)
+        )
+        return {"choices": [{"message": message, "finish_reason": finish_reason}]}
 
     def complete_summary(
         self, messages: list[dict[str, str]], *, max_tokens: int, timeout: float = 60.0
@@ -218,6 +433,14 @@ class DeepSeekClient(BaseLLMClient):
                 if isinstance(message, dict):
                     tool_calls = message.get("tool_calls")
                     if isinstance(tool_calls, list) and tool_calls:
+                        if len(tool_calls) != 1:
+                            self.last_response_mode = "native_tool_call_multiple"
+                            self.last_tool_call_count = len(tool_calls)
+                            self.last_selected_tool = ""
+                            return (
+                                "DeepSeek returned multiple native tool calls in one ReAct step. "
+                                "Return exactly one tool call."
+                            )
                         self.last_response_mode = "native_tool_call"
                         self.last_tool_call_count = len(tool_calls)
                         function = tool_calls[0].get("function")

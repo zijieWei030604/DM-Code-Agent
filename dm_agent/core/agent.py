@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from dm_agent.clients.base_client import BaseLLMClient
+from dm_agent.clients.streaming import StreamEvent
 from dm_agent.memory.lcm.compaction import ContextOverflow
 from dm_agent.memory.repo_map import RepoMapResult, RepositoryMap
 from dm_agent.prompts import build_code_agent_prompt
@@ -99,6 +100,7 @@ class ReactAgent:
         temperature: float = 0.0,
         system_prompt: str | None = None,
         step_callback: Callable[[int, Step], None] | None = None,  # 步骤回调函数
+        stream_callback: Callable[[StreamEvent], None] | None = None,
         enable_planning: bool = True,  # 是否启用规划
         enable_compression: bool = True,  # 是否启用上下文压缩
         skill_manager: Any | None = None,  # 技能管理器
@@ -158,6 +160,10 @@ class ReactAgent:
             tools, native_tool_calling=self.native_tool_calling
         )
         self.step_callback = step_callback
+        # Streaming is transport telemetry.  It cannot bypass the synchronous
+        # tool lifecycle below: only a terminal, fully parsed response reaches
+        # ``ToolInvoker``.
+        self.stream_callback = stream_callback
         # 多轮对话历史记录
         self.conversation_history: list[dict[str, str]] = []
 
@@ -318,6 +324,72 @@ class ReactAgent:
     def _record_hook_error(self, failure: HookFailure) -> None:
         if self.trace_writer:
             self.trace_writer.record("hook_error", failure.to_trace_payload())
+
+    def _handle_stream_event(self, event: StreamEvent) -> bool:
+        """Publish one provider event and reject only deterministic path escapes.
+
+        A partial JSON preview is intentionally never treated as an executable
+        tool input.  It can only stop an already-invalid request early; final
+        tool validation and lifecycle policies still run after ``toolcall_end``.
+        """
+
+        if event.type == "toolcall_delta":
+            reason = self._stream_safety_reason(event)
+            if reason:
+                self._run_context.metadata["stream_security_block_count"] = (
+                    int(self._run_context.metadata.get("stream_security_block_count", 0)) + 1
+                )
+                if self.trace_writer:
+                    self.trace_writer.record(
+                        "stream_security_blocked",
+                        {
+                            "step_number": self._run_context.step_number,
+                            "tool_name": event.tool_name,
+                            "tool_index": event.tool_index,
+                            "reason": reason,
+                        },
+                    )
+                return False
+        if self.trace_writer and event.type in {
+            "stream_start",
+            "toolcall_start",
+            "toolcall_end",
+            "stream_done",
+            "stream_error",
+        }:
+            self.trace_writer.record(
+                "llm_stream",
+                {
+                    "step_number": self._run_context.step_number,
+                    "type": event.type,
+                    "tool_name": event.tool_name,
+                    "tool_index": event.tool_index,
+                    "delta_chars": len(event.delta),
+                    "reason": event.reason,
+                },
+            )
+        if self.stream_callback:
+            self.stream_callback(event)
+        return True
+
+    @staticmethod
+    def _stream_safety_reason(event: StreamEvent) -> str:
+        """Identify only a complete preview path that escapes this workspace."""
+
+        path = event.arguments_preview.get("path")
+        if not isinstance(path, str) or not path:
+            return ""
+        if "\x00" in path or path.startswith("~"):
+            return "invalid_path_prefix"
+        try:
+            root = Path.cwd().resolve()
+            candidate = Path(path).resolve()
+            candidate.relative_to(root)
+        except ValueError:
+            return "path_outside_workspace"
+        except OSError:
+            return "unresolvable_path"
+        return ""
 
     def _append_history(
         self,
@@ -607,6 +679,9 @@ class ReactAgent:
                 if getattr(self._request_client, "supports_tool_calling", False):
                     request_options["tool_definitions"] = tool_definitions
                     request_options["tool_choice"] = "auto"
+                if getattr(self._request_client, "supports_streaming", False):
+                    request_options["stream"] = True
+                    request_options["on_stream_event"] = self._handle_stream_event
                 raw = self._request_client.respond(request_messages, **request_options)
 
                 response_mode = str(

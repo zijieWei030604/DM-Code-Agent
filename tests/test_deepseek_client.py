@@ -3,8 +3,9 @@ import json
 import pytest
 import requests
 
-from dm_agent.clients.deepseek_client import DeepSeekClient, DeepSeekError
+from dm_agent.clients.deepseek_client import DeepSeekClient, DeepSeekError, DeepSeekStreamBlocked
 from dm_agent.clients.llm_factory import create_llm_client
+from dm_agent.clients.streaming import parse_partial_json_object
 
 
 class FakeResponse:
@@ -37,6 +38,28 @@ class FakeSession:
 
     def close(self):
         self.closed = True
+
+
+class StreamingResponse(FakeResponse):
+    def __init__(self, lines):
+        super().__init__(200, {})
+        self.lines = lines
+        self.closed = False
+
+    def iter_lines(self, *, decode_unicode=True):
+        yield from self.lines
+
+    def close(self):
+        self.closed = True
+
+
+class StreamingSession(FakeSession):
+    def post(self, url, *, json, timeout, stream=False):
+        self.calls.append({"url": url, "json": json, "timeout": timeout, "stream": stream})
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 def _client_with_session(session, **kwargs):
@@ -120,7 +143,7 @@ def test_deepseek_retry_settings_flow_through_factory():
     assert client.retry_status_codes == frozenset({429})
 
 
-def test_deepseek_uses_schema_and_only_first_tool_call():
+def test_deepseek_reports_multiple_tool_calls_instead_of_discarding_them():
     session = FakeSession(
         [
             FakeResponse(
@@ -167,11 +190,9 @@ def test_deepseek_uses_schema_and_only_first_tool_call():
     function = session.calls[0]["json"]["tools"][0]["function"]
     assert function["name"] == "read_file"
     assert function["strict"] is False
-    assert json.loads(text) == {
-        "thought": "",
-        "action": "read_file",
-        "action_input": {"path": "users.py"},
-    }
+    assert "multiple native tool calls" in text
+    assert client.last_response_mode == "native_tool_call_multiple"
+    assert client.last_tool_call_count == 2
 
 
 def test_deepseek_malformed_native_tool_arguments_return_recoverable_text():
@@ -265,3 +286,91 @@ def test_deepseek_closes_its_http_session():
     client.close()
 
     assert session.closed is True
+
+
+def test_partial_json_preview_exposes_only_completed_values():
+    assert parse_partial_json_object('{"path":"src/a.py","content":"unterminated') == {
+        "path": "src/a.py"
+    }
+    assert parse_partial_json_object('{"line":12,"nested":{') == {"line": 12}
+
+
+def test_deepseek_stream_assembles_tool_arguments_and_events():
+    lines = [
+        'data: {"choices":[{"delta":{"content":"Read ","tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\\"path\\":\\"src/"}}]}}]}',
+        'data: {"choices":[{"delta":{"content":"it","tool_calls":[{"index":0,"function":{"arguments":"a.py\\"}"}}]}}]}',
+        'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+        "data: [DONE]",
+    ]
+    response = StreamingResponse(lines)
+    client = _client_with_session(StreamingSession([response]))
+    events = []
+
+    raw = client.respond(
+        [{"role": "user", "content": "read"}],
+        stream=True,
+        on_stream_event=lambda event: events.append(event) or True,
+    )
+
+    assert json.loads(raw) == {
+        "thought": "",
+        "action": "read_file",
+        "action_input": {"path": "src/a.py"},
+    }
+    assert [event.type for event in events] == [
+        "stream_start",
+        "text_start",
+        "text_delta",
+        "toolcall_start",
+        "toolcall_delta",
+        "text_delta",
+        "toolcall_delta",
+        "text_end",
+        "toolcall_end",
+        "stream_done",
+    ]
+    preview = next(event.arguments_preview for event in events if event.type == "toolcall_delta")
+    assert preview == {}
+    assert response.closed is True
+
+
+def test_deepseek_stream_stops_when_policy_rejects_completed_path():
+    response = StreamingResponse(
+        [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\\"path\\":\\"../secret.txt\\"}"}}]}}]}',
+            "data: [DONE]",
+        ]
+    )
+    client = _client_with_session(StreamingSession([response]))
+    events = []
+
+    def reject_completed_path(event):
+        events.append(event)
+        return not event.arguments_preview.get("path")
+
+    with pytest.raises(DeepSeekStreamBlocked):
+        client.respond(
+            [{"role": "user", "content": "read"}],
+            stream=True,
+            on_stream_event=reject_completed_path,
+        )
+
+    assert events[-1].type == "stream_error"
+    assert response.closed is True
+
+
+def test_deepseek_stream_does_not_silently_discard_multiple_calls():
+    response = StreamingResponse(
+        [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{}"}},{"index":1,"id":"call_b","function":{"name":"run_tests","arguments":"{}"}}]}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+    )
+    client = _client_with_session(StreamingSession([response]))
+
+    raw = client.respond([{"role": "user", "content": "do both"}], stream=True)
+
+    assert "multiple native tool calls" in raw
+    assert client.last_response_mode == "native_tool_call_multiple"
+    assert client.last_tool_call_count == 2
