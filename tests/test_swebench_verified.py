@@ -20,7 +20,11 @@ from dm_agent.core.events import (
     EventBus,
     RunStartEvent,
 )
-from dm_agent.extensions.capabilities import SemanticWorkspaceCapability, VerifiedEditCapability
+from dm_agent.extensions.capabilities import (
+    LspImpactCapability,
+    SemanticWorkspaceCapability,
+    VerifiedEditCapability,
+)
 from dm_agent.tools.base import Tool, ToolResult
 from dm_agent.tools.file_tools import create_file, edit_file, read_file
 from dm_agent.tracing import TraceWriter, load_trace_events
@@ -70,9 +74,7 @@ def _prepare_predict(monkeypatch, tmp_path: Path, result: dict[str, Any] | Excep
     monkeypatch.setattr(predict, "build_client", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(predict, "ReactAgent", _FakeAgent)
     monkeypatch.setattr(predict, "default_tools", lambda **_kwargs: [])
-    monkeypatch.setattr(
-        predict, "_discard_windows_reserved_untracked_files", lambda _container: ()
-    )
+    monkeypatch.setattr(predict, "_discard_windows_reserved_untracked_files", lambda _container: ())
     monkeypatch.setattr(predict, "extract_patch", lambda _workspace: "diff --git a/a b/a\n")
     return workspace_root
 
@@ -163,9 +165,7 @@ def test_host_workspace_paths_translate_testbed_alias_without_mutating_input():
         return ToolResult("success", "ok", changed_files=(arguments["path"],))
 
     original_arguments = {"path": "/testbed/pkg/module.py", "line_start": 3}
-    tool = bind_host_workspace_paths(
-        [Tool("read_file", "read", capture, result_runner=capture)]
-    )[0]
+    tool = bind_host_workspace_paths([Tool("read_file", "read", capture, result_runner=capture)])[0]
 
     result = tool.result_runner(original_arguments)
 
@@ -187,21 +187,24 @@ def test_host_workspace_paths_translate_root_and_path_lists():
         [Tool("inspect_change_impact", "impact", capture, result_runner=capture)]
     )[0]
 
-    assert tool.result_runner(
-        {
-            "root": "/testbed",
-            "paths": ["/testbed/a.py", "relative/b.py"],
-        }
-    ).message == "ok"
+    assert (
+        tool.result_runner(
+            {
+                "root": "/testbed",
+                "paths": ["/testbed/a.py", "relative/b.py"],
+            }
+        ).message
+        == "ok"
+    )
     assert received == [{"root": ".", "paths": ["a.py", "relative/b.py"]}]
 
 
 def test_host_workspace_paths_reject_testbed_escape():
     from swebench_verified.container_tools import bind_host_workspace_paths
 
-    tool = bind_host_workspace_paths(
-        [Tool("read_file", "read", lambda _arguments: "unexpected")]
-    )[0]
+    tool = bind_host_workspace_paths([Tool("read_file", "read", lambda _arguments: "unexpected")])[
+        0
+    ]
 
     with pytest.raises(ValueError, match="不能越出任务工作区"):
         tool.execute({"path": "/testbed/../outside.py"})
@@ -279,9 +282,9 @@ def test_container_execution_backend_preserves_tool_contract_and_classifies_test
         "failed": 1,
         "errors": 0,
         "skipped": 0,
-            "failure_kind": "assertion_failure",
-            "scope_level": "related",
-        }
+        "failure_kind": "assertion_failure",
+        "scope_level": "related",
+    }
     assert tool.input_schema is schema
     assert tool.read_only is True
 
@@ -297,7 +300,7 @@ def test_container_execution_backend_marks_unavailable_pytest_result(monkeypatch
     monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
     result = backend.run_tests_result({"test_path": "tests"})
 
-    assert result.status == "failed"
+    assert result.status == "unavailable"
     assert result.metadata["verification"]["execution_status"] == "unavailable"
     assert result.metadata["verification"]["failure_kind"] == "pytest_internal_error"
 
@@ -687,19 +690,27 @@ def test_predict_one_installs_workspace_and_verified_edit_capabilities(monkeypat
         enable_repo_map=True,
         enable_verified_edits=True,
         enable_evidence_graph=True,
+        enable_lsp_impact=True,
+        lsp_impact_command="pyright-langserver",
+        lsp_impact_timeout_seconds=8.0,
         enable_adaptive_replanning=True,
         max_replans=2,
     )
 
     capabilities = _FakeAgent.last_kwargs["capabilities"]
     assert any(isinstance(capability, SemanticWorkspaceCapability) for capability in capabilities)
+    lsp_impact = next(
+        capability for capability in capabilities if isinstance(capability, LspImpactCapability)
+    )
+    assert lsp_impact.service.workspace_root == workspace_root / _instance()["instance_id"]
     verified = next(
         capability for capability in capabilities if isinstance(capability, VerifiedEditCapability)
     )
     assert verified.command_runner is not None
     assert verified.command_runner.__self__.container_name == "test-container"
     evidence = next(
-        capability for capability in capabilities
+        capability
+        for capability in capabilities
         if getattr(capability, "checkpoint_key", "") == "evidence_graph"
     )
     assert evidence._checks.runner.__self__.container_name == "test-container"
@@ -1448,3 +1459,24 @@ def test_progress_loop_guard_allows_one_undo_then_blocks_edit_cycle(tmp_path, mo
     assert result["metadata"]["edit_cycle_block_count"] == 1
     assert "Edit-state revisit #1" in result["steps"][2]["observation"]
     assert result["steps"][3]["observation"].startswith("Skipped edit-state cycle #1")
+
+
+def test_container_execution_backend_marks_missing_pytest_as_dependency_unavailable(monkeypatch):
+    from swebench_verified.container_tools import ContainerExecutionBackend
+
+    backend = ContainerExecutionBackend("task-container")
+
+    def fake_run(command, **_kwargs):
+        return subprocess.CompletedProcess(
+            command,
+            1,
+            stdout="",
+            stderr="/opt/miniconda/bin/python: No module named pytest",
+        )
+
+    monkeypatch.setattr("swebench_verified.container_tools.subprocess.run", fake_run)
+    result = backend.run_tests_result({"test_path": "tests"})
+
+    assert result.status == "unavailable"
+    assert result.metadata["verification"]["execution_status"] == "unavailable"
+    assert result.metadata["verification"]["failure_kind"] == "dependency_unavailable"

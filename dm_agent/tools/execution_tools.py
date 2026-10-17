@@ -9,7 +9,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from .base import ToolResult, _require_str
 
@@ -82,10 +82,14 @@ def run_python_result(arguments: dict[str, Any]) -> ToolResult:
     segments.append(f"returncode: {result.returncode}")
     output = "\n".join(segment for segment in segments if segment).strip()
     passed = result.returncode == 0
-    failure_kind = "" if passed else (
-        "syntax_error"
-        if "SyntaxError" in output or "IndentationError" in output
-        else "python_error"
+    failure_kind = (
+        ""
+        if passed
+        else (
+            "syntax_error"
+            if "SyntaxError" in output or "IndentationError" in output
+            else "python_error"
+        )
     )
     verification = _verification_metadata(
         execution_status="completed",
@@ -145,8 +149,13 @@ def run_shell_result(arguments: dict[str, Any]) -> ToolResult:
         metadata["verification"] = verification
         check_scope = (command,)
         error_code = str(verification["failure_kind"])
+    status: Literal["success", "failed", "unavailable"] = (
+        "success" if result.returncode == 0 else "failed"
+    )
+    if purpose == "verification" and metadata["verification"]["execution_status"] == "unavailable":
+        status = "unavailable"
     return ToolResult(
-        "success" if result.returncode == 0 else "failed",
+        status,
         output,
         error_code=error_code,
         exit_code=result.returncode,
@@ -163,7 +172,12 @@ def _classify_declared_shell_verification(
     scope_level: str = "related",
     expected_exit_code: int = 0,
 ) -> dict[str, Any]:
-    if exit_code == expected_exit_code:
+    # A fallback such as ``pytest ... || echo unavailable`` makes the shell's
+    # final exit code describe the fallback, not the check.  It is useful for
+    # exploration, but cannot be evidence that the validation passed.
+    if "||" in command:
+        execution_status, outcome, failure_kind = "unavailable", "unknown", "masked_exit_status"
+    elif exit_code == expected_exit_code:
         execution_status, outcome, failure_kind = "completed", "passed", ""
     elif "SyntaxError" in output or "IndentationError" in output:
         execution_status, outcome, failure_kind = "completed", "error", "syntax_error"
@@ -439,7 +453,9 @@ def _verification_metadata(
         "errors": int(values.get("errors", 0)),
         "skipped": int(values.get("skipped", 0)),
         "failure_kind": failure_kind,
-        "scope_level": _test_scope_level(scope) if framework in {"pytest", "unittest"} else "related",
+        "scope_level": (
+            _test_scope_level(scope) if framework in {"pytest", "unittest"} else "related"
+        ),
     }
 
 

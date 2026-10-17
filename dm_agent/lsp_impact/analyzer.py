@@ -16,6 +16,12 @@ from .client import LspClient
 REFERENCE_RETRY_COUNT = 4
 REFERENCE_RETRY_DELAY_SECONDS = 0.5
 
+# These diagnostics identify a definite defect in the edited expression itself.
+# Broad type-analysis warnings vary across legacy repositories and remain observations.
+BLOCKING_DIAGNOSTIC_CODES = frozenset(
+    {"reportUndefinedVariable", "reportUnboundVariable", "reportInvalidSyntax"}
+)
+
 
 @dataclass(frozen=True)
 class ImpactSnapshot:
@@ -104,9 +110,9 @@ class ImpactAnalyzer:
             text = resolved.read_text(encoding="utf-8")
             symbols = self.client.document_symbols(resolved, text)
             diagnostics = self.client.diagnostics(resolved, text)
-            changed = _changed_symbols(
-                before.symbols if before else [], symbols, before.content if before else "", text
-            )
+            before_text = before.content if before else ""
+            changed_lines = _changed_line_numbers(before_text, text)
+            changed = _changed_symbols(before.symbols if before else [], symbols, before_text, text)
             candidates: set[str] = set()
             seen = 0
             truncated = False
@@ -138,6 +144,11 @@ class ImpactAnalyzer:
                 for item in diagnostics
                 if _is_error(item) and _diagnostic_key(item) not in old_errors
             ]
+            blocking_errors = [
+                item
+                for item in new_errors
+                if _is_code_error(item) and _diagnostic_touches_changed_lines(item, changed_lines)
+            ]
             report = self._report(
                 resolved,
                 "ok",
@@ -148,9 +159,9 @@ class ImpactAnalyzer:
                 references_seen=seen,
                 diagnostics=diagnostics,
                 new_error_diagnostics=new_errors,
-                blocking_error_diagnostics=[item for item in new_errors if _is_code_error(item)],
+                blocking_error_diagnostics=blocking_errors,
                 uncertain_error_diagnostics=[
-                    item for item in new_errors if not _is_code_error(item)
+                    item for item in new_errors if item not in blocking_errors
                 ],
                 truncated=truncated or len(candidates) > 10,
             )
@@ -287,10 +298,33 @@ def _is_error(diagnostic: dict[str, Any]) -> bool:
 
 
 def _is_code_error(diagnostic: dict[str, Any]) -> bool:
-    """Keep dependency-resolution failures as warnings, not proven code defects."""
+    """Return whether Pyright identifies a definite local code defect."""
     code = str(diagnostic.get("code", ""))
-    return code not in {"reportMissingImports", "reportMissingModuleSource"}
+    # Test doubles and parser diagnostics may omit a code. They remain blocking
+    # only when their range overlaps the edited code.
+    return not code or code in BLOCKING_DIAGNOSTIC_CODES
+
+
+def _diagnostic_touches_changed_lines(diagnostic: dict[str, Any], changed_lines: set[int]) -> bool:
+    value = diagnostic.get("range")
+    if not isinstance(value, dict):
+        return True
+    start, end = value.get("start"), value.get("end")
+    if not isinstance(start, dict) or not isinstance(end, dict):
+        return True
+    first, last = int(start.get("line", 0)), int(end.get("line", 0))
+    return any(first <= line <= last for line in changed_lines)
 
 
 def _diagnostic_key(diagnostic: dict[str, Any]) -> str:
-    return json.dumps(diagnostic, sort_keys=True, ensure_ascii=False)
+    """Identify a diagnostic without volatile source coordinates.
+
+    Inserting lines above an unchanged legacy issue shifts its LSP range. The
+    range must not turn that old issue into a newly introduced one.
+    """
+    stable = {
+        key: diagnostic.get(key)
+        for key in ("severity", "code", "message", "source")
+        if key in diagnostic
+    }
+    return json.dumps(stable, sort_keys=True, ensure_ascii=False)

@@ -80,7 +80,14 @@ class FakeLspClient:
 
     def diagnostics(self, path: Path, text: str) -> list[dict[str, Any]]:
         if self.error_after and "broken" in text:
-            return [{"severity": 1, "message": "incompatible type", "range": {}}]
+            return [
+                {
+                    "severity": 1,
+                    "code": "reportUndefinedVariable",
+                    "message": "broken is not defined",
+                    "range": {"start": {"line": 1}, "end": {"line": 1}},
+                }
+            ]
         return []
 
 
@@ -98,6 +105,62 @@ def test_analyzer_reports_cross_file_reference_and_new_error(tmp_path: Path) -> 
     assert report.changed_symbols == ["normalize"]
     assert report.candidate_files == ["consumer.py"]
     assert len(report.new_error_diagnostics) == 1
+
+
+def test_analyzer_ignores_unchanged_diagnostic_after_line_shift(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
+
+    class MovingDiagnosticClient(FakeLspClient):
+        def diagnostics(self, path: Path, text: str) -> list[dict[str, Any]]:
+            line = 11 if text.startswith("# comment") else 10
+            return [
+                {
+                    "severity": 1,
+                    "code": "reportOptionalMemberAccess",
+                    "message": "legacy optional access",
+                    "source": "Pyright",
+                    "range": {"start": {"line": line}, "end": {"line": line}},
+                }
+            ]
+
+    analyzer = ImpactAnalyzer(MovingDiagnosticClient(), tmp_path)
+    analyzer.snapshot(source)
+    source.write_text("# comment\ndef normalize(value):\n    return value\n", encoding="utf-8")
+    report = analyzer.analyze(source)
+
+    assert report.new_error_diagnostics == []
+    assert report.blocking_error_diagnostics == []
+
+
+def test_analyzer_keeps_dynamic_type_warning_out_of_completion_block(tmp_path: Path) -> None:
+    source = tmp_path / "source.py"
+    source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
+
+    class DynamicTypeClient(FakeLspClient):
+        def diagnostics(self, path: Path, text: str) -> list[dict[str, Any]]:
+            return (
+                [
+                    {
+                        "severity": 1,
+                        "code": "reportCallIssue",
+                        "message": "dynamic helper is not callable",
+                        "source": "Pyright",
+                        "range": {"start": {"line": 1}, "end": {"line": 1}},
+                    }
+                ]
+                if "dynamic_helper" in text
+                else []
+            )
+
+    analyzer = ImpactAnalyzer(DynamicTypeClient(), tmp_path)
+    analyzer.snapshot(source)
+    source.write_text("def normalize(value):\n    return dynamic_helper(value)\n", encoding="utf-8")
+    report = analyzer.analyze(source)
+
+    assert len(report.new_error_diagnostics) == 1
+    assert report.blocking_error_diagnostics == []
+    assert report.uncertain_error_diagnostics == report.new_error_diagnostics
 
 
 def test_analyzer_retries_when_a_cold_index_returns_only_the_declaration(tmp_path: Path) -> None:
@@ -203,6 +266,78 @@ def test_lsp_failure_is_recorded_by_evidence_before_completion_blocks(
         BeforeFinishEvent("fix", "finish", "done", [], 3, "run", metadata)
     )
     assert metadata["evidence_terminal_completion_rejection"]
+
+
+def test_evidence_stops_blocking_after_lsp_error_is_repaired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prior LSP failure must not be projected onto a later clean version."""
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "source.py"
+    source.write_text("def normalize(value):\n    return value\n", encoding="utf-8")
+    service = LspImpactService(tmp_path, client=FakeLspClient(error_after=True))
+    lsp = LspImpactCapability(service)
+    evidence = EvidenceGraphCapability()
+    bus = EventBus()
+    context = CapabilityContext(bus, lambda phase: None)
+    lsp.install(context)
+    evidence.install(context)
+    metadata: dict[str, Any] = {}
+    bus.emit_run_start(RunStartEvent("fix", 1, "run", metadata=metadata))
+
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("edit_file", {"path": "source.py"}, 1, "run", metadata)
+    )
+    source.write_text("def normalize(value):\n    return broken(value)\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file",
+            {"path": "source.py"},
+            "edited",
+            1,
+            "run",
+            True,
+            metadata,
+            result=ToolResult("success", "edited", changed_files=("source.py",)),
+        )
+    )
+    assert bus.emit_before_finish(
+        BeforeFinishEvent("fix", "finish", "broken", [], 2, "run", metadata)
+    )
+    assert metadata["lsp_impact_confirmed_failure"]
+
+    bus.emit_before_tool_call(
+        BeforeToolCallEvent("edit_file", {"path": "source.py"}, 3, "run", metadata)
+    )
+    source.write_text("def normalize(value):\n    return value.strip()\n", encoding="utf-8")
+    bus.emit_after_tool_result(
+        AfterToolResultEvent(
+            "edit_file",
+            {"path": "source.py"},
+            "edited",
+            3,
+            "run",
+            True,
+            metadata,
+            result=ToolResult("success", "edited", changed_files=("source.py",)),
+        )
+    )
+
+    # Strict evidence pauses once for missing verification, but the repaired
+    # LSP error is no longer an explicit contradiction.
+    assert bus.emit_before_finish(
+        BeforeFinishEvent("fix", "finish", "repaired", [], 4, "run", metadata)
+    )
+    assert "lsp_impact_confirmed_failure" not in metadata
+    assert all(
+        item["status"] != "confirmed_code_error" for item in metadata["evidence_policy_issues"]
+    )
+    assert (
+        bus.emit_before_finish(
+            BeforeFinishEvent("fix", "finish", "repaired", [], 5, "run", metadata)
+        )
+        is None
+    )
 
 
 def test_repaired_latest_report_replaces_old_error_for_completion(tmp_path: Path) -> None:

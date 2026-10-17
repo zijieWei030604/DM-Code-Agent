@@ -66,8 +66,7 @@ def _translate_host_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         value = translated.get(key)
         if isinstance(value, list):
             translated[key] = [
-                _host_workspace_path(item) if isinstance(item, str) else item
-                for item in value
+                _host_workspace_path(item) if isinstance(item, str) else item for item in value
             ]
     return translated
 
@@ -202,14 +201,18 @@ class ContainerExecutionBackend:
         check_scope: tuple[str, ...] = ()
         error_code = ""
         if purpose == "verification":
-            verification = _classify_declared_shell_verification(
-                result.returncode, output, command
-            )
+            verification = _classify_declared_shell_verification(result.returncode, output, command)
             metadata["verification"] = verification
             check_scope = (command,)
             error_code = str(verification["failure_kind"])
+        status = "success" if result.returncode == 0 else "failed"
+        if (
+            purpose == "verification"
+            and metadata["verification"]["execution_status"] == "unavailable"
+        ):
+            status = "unavailable"
         return ToolResult(
-            "success" if result.returncode == 0 else "failed",
+            status,
             output,
             error_code=error_code,
             exit_code=result.returncode,
@@ -241,10 +244,14 @@ class ContainerExecutionBackend:
             raise ValueError("run_python 工具需要 'code' 或 'path' 参数。")
         result, output = self._run_completed(command)
         passed = result.returncode == 0
-        failure_kind = "" if passed else (
-            "syntax_error"
-            if "SyntaxError" in output or "IndentationError" in output
-            else "python_error"
+        failure_kind = (
+            ""
+            if passed
+            else (
+                "syntax_error"
+                if "SyntaxError" in output or "IndentationError" in output
+                else "python_error"
+            )
         )
         verification = _verification_metadata(
             execution_status="completed",
@@ -271,8 +278,10 @@ class ContainerExecutionBackend:
         framework = arguments.get("framework", "pytest")
         verbose = arguments.get("verbose", False)
         if targets is not None:
-            if not isinstance(targets, list) or not targets or not all(
-                isinstance(item, str) and item.strip() for item in targets
+            if (
+                not isinstance(targets, list)
+                or not targets
+                or not all(isinstance(item, str) and item.strip() for item in targets)
             ):
                 raise ValueError("targets 必须是非空字符串列表。")
             scopes = list(dict.fromkeys(item.strip() for item in targets))
@@ -299,21 +308,26 @@ class ContainerExecutionBackend:
                     str(PurePosixPath(scope)).removesuffix(".py").replace("/", ".")
                     for scope in scopes
                 )
-        result, output = self._run_completed(
-            " ".join(shlex.quote(part) for part in command_parts)
-        )
-        if framework == "pytest":
+        result, output = self._run_completed(" ".join(shlex.quote(part) for part in command_parts))
+        if framework == "pytest" and "No module named pytest" in output:
+            verification = _verification_metadata(
+                execution_status="unavailable",
+                outcome="unknown",
+                framework="pytest",
+                scope=scopes,
+                failure_kind="dependency_unavailable",
+            )
+        elif framework == "pytest":
             counts = _pytest_counts_from_output(output)
-            verification = _classify_pytest_result(
-                result.returncode, counts=counts, scope=scopes
-            )
+            verification = _classify_pytest_result(result.returncode, counts=counts, scope=scopes)
         else:
-            verification = _classify_unittest_result(
-                result.returncode, output=output, scope=scopes
-            )
+            verification = _classify_unittest_result(result.returncode, output=output, scope=scopes)
         passed = verification["outcome"] == "passed"
+        status = "success" if passed else "failed"
+        if verification["execution_status"] == "unavailable":
+            status = "unavailable"
         return ToolResult(
-            "success" if passed else "failed",
+            status,
             output,
             error_code=str(verification["failure_kind"]),
             exit_code=result.returncode,
@@ -328,18 +342,42 @@ class ContainerExecutionBackend:
             "run_tests": (self.run_tests, self.run_tests_result),
         }
         return [
-            Tool(
-                name=tool.name,
-                description=tool.description,
-                runner=runners[tool.name][0],
-                result_runner=runners[tool.name][1],
-                read_only=tool.read_only,
-                input_schema=tool.input_schema,
+            (
+                Tool(
+                    name=tool.name,
+                    description=_container_tool_description(tool.name, tool.description),
+                    runner=runners[tool.name][0],
+                    result_runner=runners[tool.name][1],
+                    read_only=tool.read_only,
+                    input_schema=tool.input_schema,
+                )
+                if tool.name in runners
+                else tool
             )
-            if tool.name in runners
-            else tool
             for tool in tools
         ]
+
+
+def _container_tool_description(name: str, fallback: str) -> str:
+    """Describe the task-container boundary to the model at tool-selection time."""
+    descriptions = {
+        "run_shell": (
+            "Run a shell command inside the current SWE-bench task's Linux container. "
+            "The repository root is already /testbed. Use repository-relative paths; do not use "
+            "Windows paths or assume host-only tools such as Pyright are installed. For validation, "
+            "prefer the repository's documented test command and never mask a check failure with `||`."
+        ),
+        "run_python": (
+            "Run Python code inside the current SWE-bench task's Linux container, using the task "
+            "image's Python and dependencies. This is separate from the host LSP environment."
+        ),
+        "run_tests": (
+            "Run pytest or unittest inside the current SWE-bench task's Linux container. Confirm the "
+            "repository's test framework and target paths before calling it; older repositories may "
+            "not provide pytest."
+        ),
+    }
+    return descriptions.get(name, fallback)
 
 
 def _pytest_counts_from_output(output: str) -> dict[str, int]:

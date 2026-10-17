@@ -122,6 +122,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Record and summarize decision evidence for each prediction.",
     )
     parser.add_argument(
+        "--enable-lsp-impact",
+        action="store_true",
+        help="Enable Pyright-based Python impact analysis for each task workspace.",
+    )
+    parser.add_argument(
+        "--lsp-impact-command",
+        default="pyright-langserver",
+        help="LSP server command (default: pyright-langserver).",
+    )
+    parser.add_argument(
+        "--lsp-impact-timeout-seconds",
+        type=float,
+        default=5.0,
+        help="Timeout for one LSP request in seconds (default: 5).",
+    )
+    parser.add_argument(
         "--enable-adaptive-replanning",
         action="store_true",
         help="Enable deterministic error-signal-aware replanning for each prediction.",
@@ -268,6 +284,9 @@ def main(argv: list[str] | None = None) -> int:
                     enable_repo_map=args.enable_repo_map,
                     enable_verified_edits=args.enable_verified_edits,
                     enable_evidence_graph=args.enable_evidence_graph,
+                    enable_lsp_impact=args.enable_lsp_impact,
+                    lsp_impact_command=args.lsp_impact_command,
+                    lsp_impact_timeout_seconds=args.lsp_impact_timeout_seconds,
                     enable_adaptive_replanning=args.enable_adaptive_replanning,
                     max_replans=args.max_replans,
                 )

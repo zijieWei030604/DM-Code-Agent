@@ -31,12 +31,14 @@ from dm_agent.core import ReactAgent
 from dm_agent.evals.real_runner import PROVIDER_API_KEY_ENV, UsageTrackingClient
 from dm_agent.extensions.capabilities import (
     EvidenceGraphCapability,
+    LspImpactCapability,
     SemanticWorkspaceCapability,
     VerifiedEditCapability,
 )
+from dm_agent.lsp_impact.service import LspImpactService
 from dm_agent.memory.repo_map import RepositoryMap
 from dm_agent.paths import load_env_files
-from dm_agent.tools import bind_semantic_workspace_tools, default_tools
+from dm_agent.tools import bind_lsp_impact_tools, bind_semantic_workspace_tools, default_tools
 from dm_agent.tracing import TraceWriter
 from dm_agent.verification import VerificationPolicy
 from dm_agent.workspace import SemanticWorkspaceEngine
@@ -494,6 +496,9 @@ def predict_one(
     enable_repo_map: bool = False,
     enable_verified_edits: bool = False,
     enable_evidence_graph: bool = False,
+    enable_lsp_impact: bool = False,
+    lsp_impact_command: str = "pyright-langserver",
+    lsp_impact_timeout_seconds: float = 5.0,
     enable_adaptive_replanning: bool = False,
     max_replans: int = -1,
 ) -> dict[str, Any]:
@@ -508,6 +513,7 @@ def predict_one(
     container_name, container_image = start_runtime_container(instance_id, workspace)
     execution_backend = ContainerExecutionBackend(container_name)
     workspace_engine: SemanticWorkspaceEngine | None = None
+    lsp_service: LspImpactService | None = None
 
     try:
         trace_writer = None
@@ -530,6 +536,8 @@ def predict_one(
                     "semantic_impact_enabled": enable_semantic_workspace,
                     "verified_edits_enabled": enable_verified_edits,
                     "evidence_graph_enabled": enable_evidence_graph,
+                    "lsp_impact_enabled": enable_lsp_impact,
+                    "lsp_impact_command": lsp_impact_command if enable_lsp_impact else "",
                     "adaptive_replanning_enabled": enable_adaptive_replanning,
                     "max_replans": max_replans,
                 },
@@ -553,6 +561,14 @@ def predict_one(
                     command_runner=execution_backend.run_validation,
                 )
             )
+        if enable_lsp_impact:
+            lsp_service = LspImpactService(
+                workspace,
+                command=lsp_impact_command,
+                timeout_seconds=lsp_impact_timeout_seconds,
+            )
+            bind_lsp_impact_tools(tools, lsp_service)
+            capabilities.append(LspImpactCapability(lsp_service))
         if enable_evidence_graph:
             capabilities.append(
                 EvidenceGraphCapability(
@@ -630,6 +646,7 @@ def predict_one(
             "dm_container_exec_count": execution_backend.stats.calls,
             "dm_container_exec_failures": execution_backend.stats.failures,
             "dm_planning_enabled": enable_planning,
+            "dm_lsp_impact_enabled": enable_lsp_impact,
             "dm_adaptive_replanning_enabled": enable_adaptive_replanning,
             "dm_max_replans": max_replans,
             "dm_windows_reserved_untracked_removed": len(windows_reserved_files_removed),
@@ -673,5 +690,7 @@ def predict_one(
     finally:
         if workspace_engine is not None:
             workspace_engine.close()
+        if lsp_service is not None:
+            lsp_service.close()
         shutil.rmtree(semantic_index_dir, ignore_errors=True)
         stop_runtime_container(container_name)

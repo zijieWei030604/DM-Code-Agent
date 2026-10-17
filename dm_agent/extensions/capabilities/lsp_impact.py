@@ -109,6 +109,13 @@ class LspImpactCapability:
         return event.observation + "\n\n" + "\n".join(summaries)
 
     def _before_finish(self, event: BeforeFinishEvent) -> dict[str, Any] | None:
+        # ``metadata`` belongs to the whole run, while an LSP finding belongs
+        # only to the workspace version that produced it. Clear an earlier
+        # finding before evaluating the latest effective reports; otherwise a
+        # repaired file leaves a stale failure that EvidenceGraphCapability
+        # projects again at every later finish attempt.
+        event.metadata.pop("lsp_impact_confirmed_failure", None)
+        event.metadata.pop("lsp_impact_completion_blocked", None)
         state = self.service.completion_state()
         failures = [
             report for report in state.effective_reports if report.blocking_error_diagnostics
@@ -153,18 +160,18 @@ class LspImpactCapability:
         # Fall back to Python parsing only; a clean parse remains a verification
         # gap for the evidence policy rather than an artificial pass.
         if state.unavailable_reports and self._changed_python_paths:
-            paths = sorted(self._changed_python_paths)
-            syntax = self._checks.syntax(self.service.workspace_root, paths)
+            changed_paths = sorted(self._changed_python_paths)
+            syntax = self._checks.syntax(self.service.workspace_root, changed_paths)
             event.metadata["lsp_impact_syntax_fallback"] = syntax
             self._record(
                 "lsp_impact_syntax_fallback",
-                {"paths": paths, "result": syntax, "step_number": event.step_number},
+                {"paths": changed_paths, "result": syntax, "step_number": event.step_number},
             )
             if syntax and syntax.get("errors"):
                 return self._report_or_block(
                     event,
                     kind="python_syntax_error",
-                    paths=", ".join(paths),
+                    paths=", ".join(changed_paths),
                     reason=(
                         "Completion blocked: Pyright was unavailable and the Python syntax "
                         "fallback found an error in the current changed files."

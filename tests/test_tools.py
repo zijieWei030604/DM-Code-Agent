@@ -99,12 +99,7 @@ def test_run_shell_records_verification_only_when_declared():
 
 
 def test_shell_direct_scope_requires_a_narrow_non_xfail_command():
-    assert (
-        _validated_shell_scope(
-            "pytest tests/test_service.py::test_update", "direct"
-        )
-        == "direct"
-    )
+    assert _validated_shell_scope("pytest tests/test_service.py::test_update", "direct") == "direct"
     assert _validated_shell_scope("pytest tests/test_service.py", "direct") == "related"
     assert _validated_shell_scope("pytest --runxfail test_xf.py", "direct") == "related"
 
@@ -125,6 +120,20 @@ def test_declared_shell_verification_requires_real_process_result():
     assert failed["failure_kind"] == "assertion_failure"
     assert unavailable["execution_status"] == "unavailable"
     assert unavailable["outcome"] == "unknown"
+
+
+def test_declared_shell_verification_rejects_masked_exit_status():
+    result = run_shell_result(
+        {
+            "command": f'"{sys.executable}" -c "raise SystemExit(1)" || echo unavailable',
+            "purpose": "verification",
+        }
+    )
+
+    assert result.status == "unavailable"
+    assert result.exit_code == 0
+    assert result.metadata["verification"]["execution_status"] == "unavailable"
+    assert result.metadata["verification"]["failure_kind"] == "masked_exit_status"
 
 
 def test_file_tools_create_read_edit_and_search(tmp_path):
@@ -523,9 +532,7 @@ def test_inspect_change_impact_returns_confidence_tiers_and_provenance(tmp_path)
     tests.mkdir()
     (tests / "test_service.py").write_text("def test_value():\n    assert True\n", encoding="utf-8")
 
-    result = json.loads(
-        inspect_change_impact({"root": str(tmp_path), "paths": ["service.py"]})
-    )
+    result = json.loads(inspect_change_impact({"root": str(tmp_path), "paths": ["service.py"]}))
 
     assert any(
         item["path"] == "consumer.py" and item["confidence_level"] == "confirmed"

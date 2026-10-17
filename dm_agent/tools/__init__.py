@@ -50,17 +50,17 @@ from .file_tools import (
     search_in_file,
     search_in_file_result,
 )
-from .structured_edit_tools import (
-    edit_python_symbol,
-    edit_python_symbol_result,
-    inspect_python_symbol,
-    inspect_python_symbol_result,
-)
 from .lsp_impact_tools import (
     analyze_lsp_impact,
     analyze_lsp_impact_result,
     lsp_query,
     lsp_query_result,
+)
+from .structured_edit_tools import (
+    edit_python_symbol,
+    edit_python_symbol_result,
+    inspect_python_symbol,
+    inspect_python_symbol_result,
 )
 
 if TYPE_CHECKING:
@@ -207,7 +207,10 @@ BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "lsp_query": _object_schema(
         {
             "path": _STR,
-            "action": {"type": "string", "enum": ["symbols", "references", "definition", "diagnostics"]},
+            "action": {
+                "type": "string",
+                "enum": ["symbols", "references", "definition", "diagnostics"],
+            },
             "line": _INT,
             "character": _INT,
         },
@@ -344,7 +347,9 @@ def _builtin_tools() -> list[Tool]:
             description=(
                 'Execute a shell command. Arguments: {"command": string, "purpose": optional '
                 '"execution"|"verification" (default "execution")}. Set purpose to '
-                '"verification" only when the command is intended to validate the current code.'
+                '"verification" only when the command is intended to validate the current code. '
+                "A verification command must expose its checker exit code; do not mask failures "
+                "with shell fallbacks such as `|| echo ...`."
             ),
             runner=run_shell,
             result_runner=run_shell_result,
@@ -352,7 +357,7 @@ def _builtin_tools() -> list[Tool]:
         Tool(
             name="run_tests",
             description=(
-                "Run Python tests. Arguments: {\"targets\": optional list of paths or pytest "
+                'Run Python tests. Arguments: {"targets": optional list of paths or pytest '
                 "node ids, \"test_path\": legacy optional single path (default '.'), "
                 '"framework": optional "pytest"|"unittest" (default \'pytest\'), "verbose": optional bool (default false)}.'
             ),
@@ -560,8 +565,8 @@ def default_tools(
 
 __all__ = [
     "Tool",
-    "bind_semantic_workspace_tools",
     "bind_lsp_impact_tools",
+    "bind_semantic_workspace_tools",
     "default_tools",
     "register_builtin_tools",
     "task_complete",
