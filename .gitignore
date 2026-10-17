@@ -110,4 +110,5 @@ logs/run_evaluation/
 .codex-pycache/
 .tools/
 .pytest-*/
+.tmp-pytest*/
 .verified-edits-subprocess-temp/
