@@ -12,6 +12,7 @@ except ImportError:
     GENAI_AVAILABLE = False
 
 from .base_client import BaseLLMClient, LLMError, classify_retryable_exception
+from .messages import text_messages
 
 
 class GeminiClient(BaseLLMClient):
@@ -61,6 +62,7 @@ class GeminiClient(BaseLLMClient):
     ) -> dict[str, Any]:
         """向 Gemini API 发送生成请求。"""
 
+        messages = text_messages(messages)
         try:
             # 将消息格式转换为 Gemini 内容格式
             contents = self._convert_messages_to_contents(messages)

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import copy
+import json
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from dm_agent.clients.base_client import BaseLLMClient
+from dm_agent.clients.messages import protocol_fields
 from dm_agent.memory.lcm.compaction import CompactionPolicy, Compactor, SummaryResponse
 from dm_agent.memory.lcm.store import LCMStore
 from dm_agent.memory.lcm.tools import build_lcm_tools
@@ -77,7 +79,12 @@ class LCMMemory:
         if len(history) < len(self.history_ids):
             raise ValueError("LCM history changed without restoring its checkpoint")
         for message in history[len(self.history_ids) :]:
-            self.append(message["role"], message["content"], kind="imported")
+            self.append(
+                message["role"],
+                message["content"],
+                kind="imported",
+                message_fields=protocol_fields(message),
+            )
 
     def append(
         self,
@@ -86,12 +93,18 @@ class LCMMemory:
         *,
         kind: str,
         context_content: str | None = None,
+        message_fields: dict[str, Any] | None = None,
     ) -> None:
         store = self.store
-        metadata: dict[str, Any] = {"role": role, "kind": kind}
+        fields = json.loads(
+            redact_text(json.dumps(message_fields or {}, ensure_ascii=False, default=str))
+        )
+        metadata: dict[str, Any] = {"role": role, "kind": kind, **fields}
         # One Runtime decision and its observation form a complete unit, including
         # rejected/unknown calls. Native providers currently normalize to this unit.
-        if kind == "model_response":
+        if metadata.get("tool_calls") or metadata.get("tool_call_id"):
+            pass
+        elif kind == "model_response":
             if self.pending_call:
                 raise ValueError("Previous Runtime decision has no observation")
             self.pending_call = uuid.uuid4().hex
@@ -144,7 +157,9 @@ class LCMMemory:
 
     def restore_state(self, state: dict[str, Any]) -> None:
         if state.get("schema") != "lcm-2":
-            raise ValueError("Legacy atomic-memory or LCM checkpoints are not compatible with schema lcm-2")
+            raise ValueError(
+                "Legacy atomic-memory or LCM checkpoints are not compatible with schema lcm-2"
+            )
         path = Path(state["database"])
         if not path.is_file():
             raise ValueError("LCM checkpoint database is missing")

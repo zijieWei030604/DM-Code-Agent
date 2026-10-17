@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from threading import Event
 from typing import Any, Literal
 
 
@@ -34,6 +35,8 @@ class Tool:
     read_only: bool = False
     input_schema: dict[str, Any] | None = None
     completes_task: bool = False
+    concurrency: Literal["shared", "exclusive"] | Callable[[dict[str, Any]], str] = "exclusive"
+    cancel_runner: Callable[[dict[str, Any], Event], str | ToolResult] | None = None
 
     def execute(self, arguments: dict[str, Any]) -> str | ToolResult:
         """

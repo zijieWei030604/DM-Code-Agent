@@ -143,7 +143,7 @@ def test_deepseek_retry_settings_flow_through_factory():
     assert client.retry_status_codes == frozenset({429})
 
 
-def test_deepseek_reports_multiple_tool_calls_instead_of_discarding_them():
+def test_deepseek_preserves_multiple_tool_calls():
     session = FakeSession(
         [
             FakeResponse(
@@ -190,8 +190,8 @@ def test_deepseek_reports_multiple_tool_calls_instead_of_discarding_them():
     function = session.calls[0]["json"]["tools"][0]["function"]
     assert function["name"] == "read_file"
     assert function["strict"] is False
-    assert "multiple native tool calls" in text
-    assert client.last_response_mode == "native_tool_call_multiple"
+    assert [c["action"] for c in json.loads(text)["tool_calls"]] == ["read_file", "run_tests"]
+    assert client.last_response_mode == "native_tool_call"
     assert client.last_tool_call_count == 2
 
 
@@ -223,7 +223,7 @@ def test_deepseek_malformed_native_tool_arguments_return_recoverable_text():
 
     text = client.respond([{"role": "user", "content": "read users.py"}])
 
-    assert text.startswith("DeepSeek tool arguments are not valid JSON:")
+    assert json.loads(text)["argument_error"]
 
 
 def test_deepseek_uses_responses_api_for_strict_json_schema():
@@ -316,6 +316,7 @@ def test_deepseek_stream_assembles_tool_arguments_and_events():
         "thought": "",
         "action": "read_file",
         "action_input": {"path": "src/a.py"},
+        "call_id": "call_a",
     }
     assert [event.type for event in events] == [
         "stream_start",
@@ -371,6 +372,35 @@ def test_deepseek_stream_does_not_silently_discard_multiple_calls():
 
     raw = client.respond([{"role": "user", "content": "do both"}], stream=True)
 
-    assert "multiple native tool calls" in raw
-    assert client.last_response_mode == "native_tool_call_multiple"
+    assert [c["action"] for c in json.loads(raw)["tool_calls"]] == ["read_file", "run_tests"]
+    assert client.last_response_mode == "native_tool_call"
     assert client.last_tool_call_count == 2
+
+
+def test_stream_invalid_argument_call_preserves_valid_sibling():
+    response = StreamingResponse(
+        [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"bad","function":{"name":"read_file","arguments":"{"}},{"index":1,"id":"good","function":{"name":"find_files","arguments":"{}"}}]}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+            "data: [DONE]",
+        ]
+    )
+    client = _client_with_session(StreamingSession([response]))
+    calls = json.loads(client.respond([{"role": "user", "content": "both"}], stream=True))[
+        "tool_calls"
+    ]
+    assert calls[0]["call_id"] == "bad" and calls[0]["argument_error"]
+    assert calls[1]["call_id"] == "good" and "argument_error" not in calls[1]
+
+
+def test_truncated_stream_never_marks_a_call_executable():
+    response = StreamingResponse(
+        [
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"edit_file","arguments":"{}"}}]}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"length"}]}',
+            "data: [DONE]",
+        ]
+    )
+    client = _client_with_session(StreamingSession([response]))
+    call = json.loads(client.respond([{"role": "user", "content": "edit"}], stream=True))
+    assert call["argument_error"]

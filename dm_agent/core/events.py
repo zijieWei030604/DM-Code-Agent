@@ -353,7 +353,7 @@ class EventBus:
     ) -> list[dict[str, str]]:
         """串联改写 messages，返回实际发送给客户端的消息。"""
         for position, handler in enumerate(self._handlers["before_llm_request"], start=1):
-            previous = [dict(message) for message in event.messages]
+            previous = deepcopy(event.messages)
             succeeded, result = self._call("before_llm_request", handler, position, event, on_error)
             if not succeeded:
                 event.messages = previous
@@ -456,7 +456,7 @@ class LLMRequestClient:
     def respond(self, messages: list[dict[str, str]], **extra: Any) -> str:
         run_id, step_number, metadata = self._context_provider()
         event = BeforeLLMRequestEvent(
-            messages=[dict(message) for message in messages],
+            messages=deepcopy(messages),
             step_number=step_number,
             run_id=run_id,
             phase=self._phase,

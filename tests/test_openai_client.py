@@ -80,7 +80,7 @@ def test_openai_compatible_endpoint_does_not_overclaim_json_schema(monkeypatch) 
     assert client.supports_json_schema is False
 
 
-def test_openai_uses_responses_tools_and_only_first_function_call(monkeypatch) -> None:
+def test_openai_uses_responses_tools_and_preserves_all_function_calls(monkeypatch) -> None:
     monkeypatch.setattr(openai_client, "OpenAI", FakeCallingOpenAI)
     monkeypatch.setattr(openai_client, "OPENAI_AVAILABLE", True)
     client = openai_client.OpenAIClient("test-key", model="gpt-5")
@@ -108,11 +108,8 @@ def test_openai_uses_responses_tools_and_only_first_function_call(monkeypatch) -
         }
     ]
     assert "temperature" not in FakeResponses.request
-    assert json.loads(text) == {
-        "thought": "",
-        "action": "read_file",
-        "action_input": {"path": "users.py"},
-    }
+    assert [call["action"] for call in json.loads(text)["tool_calls"]] == ["read_file", "run_tests"]
+    assert client.last_tool_call_count == 2
 
 
 def test_openai_passes_json_schema_to_responses_format(monkeypatch) -> None:

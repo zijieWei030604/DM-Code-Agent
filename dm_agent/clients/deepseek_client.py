@@ -1,4 +1,4 @@
-﻿"""DeepSeek Responses/Chat API 的 HTTP 客户端。"""
+"""DeepSeek Responses/Chat API 的 HTTP 客户端。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,9 @@ from typing import Any
 import requests
 
 from .base_client import BaseLLMClient, LLMError
+from .messages import chat_messages
 from .streaming import StreamEvent, StreamToolCall
+from .tool_calls import serialize_tool_calls
 
 DEFAULT_RETRY_STATUS_CODES = frozenset({400, 408, 409, 429, 500, 502, 503, 504})
 
@@ -92,7 +94,7 @@ class DeepSeekClient(BaseLLMClient):
 
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": chat_messages(messages),
         }
         if response_format is not None:
             payload["response_format"] = response_format
@@ -281,8 +283,9 @@ class DeepSeekClient(BaseLLMClient):
             state = tool_calls[index]
             try:
                 state.finalize()
-            except ValueError as exc:
-                raise DeepSeekError(f"DeepSeek streamed invalid tool arguments: {exc}") from exc
+            except ValueError:
+                # Preserve this call as an error result; valid siblings still dispatch.
+                state.arguments = {}
             self._emit_stream_event(
                 callback,
                 StreamEvent(
@@ -321,7 +324,7 @@ class DeepSeekClient(BaseLLMClient):
             f"{self.base_url}/{self.endpoint.lstrip('/')}",
             json={
                 "model": self.model,
-                "messages": messages,
+                "messages": chat_messages(messages),
                 "max_tokens": max_tokens,
                 "temperature": 0,
             },
@@ -433,21 +436,23 @@ class DeepSeekClient(BaseLLMClient):
                 if isinstance(message, dict):
                     tool_calls = message.get("tool_calls")
                     if isinstance(tool_calls, list) and tool_calls:
-                        if len(tool_calls) != 1:
-                            self.last_response_mode = "native_tool_call_multiple"
-                            self.last_tool_call_count = len(tool_calls)
-                            self.last_selected_tool = ""
-                            return (
-                                "DeepSeek returned multiple native tool calls in one ReAct step. "
-                                "Return exactly one tool call."
-                            )
                         self.last_response_mode = "native_tool_call"
                         self.last_tool_call_count = len(tool_calls)
-                        function = tool_calls[0].get("function")
+                        first = tool_calls[0]
+                        function = first.get("function") if isinstance(first, dict) else None
                         self.last_selected_tool = (
                             str(function.get("name", "")) if isinstance(function, dict) else ""
                         )
-                        return self._tool_call_as_agent_json(tool_calls[0])
+                        if choice.get("finish_reason") in {"length", "content_filter", "error"}:
+                            tool_calls = [
+                                {
+                                    **call,
+                                    "argument_error": "Tool was not executed: the model turn was truncated or rejected.",
+                                }
+                                for call in tool_calls
+                                if isinstance(call, dict)
+                            ]
+                        return serialize_tool_calls(tool_calls)
                     content = message.get("content")
                     if isinstance(content, str) and content.strip():
                         self.last_response_mode = "json_fallback"
@@ -470,30 +475,6 @@ class DeepSeekClient(BaseLLMClient):
 
     def close(self) -> None:
         self.session.close()
-
-    @staticmethod
-    def _tool_call_as_agent_json(tool_call: Any) -> str:
-        if not isinstance(tool_call, dict):
-            raise DeepSeekError("DeepSeek 返回了无效的工具调用。")
-        function = tool_call.get("function")
-        if not isinstance(function, dict) or not isinstance(function.get("name"), str):
-            raise DeepSeekError("DeepSeek 工具调用缺少函数名称。")
-        raw_arguments = function.get("arguments", "{}")
-        try:
-            arguments = (
-                json.loads(raw_arguments) if isinstance(raw_arguments, str) else raw_arguments
-            )
-        except json.JSONDecodeError as exc:
-            # Treat malformed provider output like any other response parse failure.
-            # Returning plain text routes it through ReactAgent's existing recovery
-            # loop instead of aborting the entire task as an agent exception.
-            return f"DeepSeek tool arguments are not valid JSON: {exc}"
-        if not isinstance(arguments, dict):
-            raise DeepSeekError("DeepSeek 工具参数必须是 JSON object。")
-        return json.dumps(
-            {"thought": "", "action": function["name"], "action_input": arguments},
-            ensure_ascii=False,
-        )
 
     @staticmethod
     def _format_error(response: requests.Response) -> str:

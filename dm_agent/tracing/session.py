@@ -117,6 +117,7 @@ def conversation_from_entries(entries: Iterable[dict[str, Any]]) -> list[dict[st
             {
                 "role": str(payload.get("role", "")),
                 "content": _message_content(payload),
+                **(payload.get("message_fields") or {}),
             }
         )
     return history
@@ -159,7 +160,11 @@ def rebuild_context(
             first_kept_entry_id = ""
         elif event == MESSAGE_EVENT:
             history.append(
-                {"role": str(payload.get("role", "")), "content": _message_content(payload)}
+                {
+                    "role": str(payload.get("role", "")),
+                    "content": _message_content(payload),
+                    **(payload.get("message_fields") or {}),
+                }
             )
             history_ids.append(str(entry.get("id", "")))
         elif event == PARSE_ERROR_EVENT:

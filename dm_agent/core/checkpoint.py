@@ -65,6 +65,7 @@ class RunCheckpoint:
     compressor_state: dict[str, Any] | None = None
     capability_state: dict[str, Any] = field(default_factory=dict)
     agent_config: dict[str, Any] = field(default_factory=dict)
+    pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     cwd: str = ""
     schema_version: int = CHECKPOINT_SCHEMA_VERSION
 
@@ -93,6 +94,7 @@ class RunCheckpoint:
             compressor_state=data.get("compressor_state"),
             capability_state=dict(data.get("capability_state") or {}),
             agent_config=dict(data.get("agent_config") or {}),
+            pending_tool_calls=list(data.get("pending_tool_calls") or []),
             cwd=str(data.get("cwd", "")),
             schema_version=version,
         )

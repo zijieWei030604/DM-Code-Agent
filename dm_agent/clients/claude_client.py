@@ -12,6 +12,7 @@ except ImportError:
     ANTHROPIC_AVAILABLE = False
 
 from .base_client import BaseLLMClient, LLMError, classify_retryable_exception
+from .messages import text_messages
 
 
 class ClaudeClient(BaseLLMClient):
@@ -65,6 +66,7 @@ class ClaudeClient(BaseLLMClient):
     ) -> dict[str, Any]:
         """向 Claude API 发送消息请求。"""
 
+        messages = text_messages(messages)
         try:
             # Claude API 要求分离系统消息
             system_message = None

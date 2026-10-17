@@ -256,7 +256,15 @@ class TraceWriter:
             payload["signal"] = signal
         self.record("replan", payload)
 
-    def record_message(self, *, role: str, content: str, step_number: int, kind: str) -> str:
+    def record_message(
+        self,
+        *,
+        role: str,
+        content: str,
+        step_number: int,
+        kind: str,
+        message_fields: dict[str, Any] | None = None,
+    ) -> str:
         """记录一条进入对话历史的消息，返回它的 entry id。
 
         保真档沿用既有口径：模型原始输出（``assistant``）默认只留长度与摘要指纹，
@@ -273,6 +281,12 @@ class TraceWriter:
             payload["content_sha256"] = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
         else:
             payload["content"] = content
+        if message_fields:
+            fields = json.loads(json.dumps(message_fields))
+            if role == "assistant" and self.redact and not self.capture_llm_io:
+                for call in fields.get("tool_calls", []):
+                    call["function"]["arguments"] = "{}"
+            payload["message_fields"] = fields
         return self.record("message", payload)
 
     def record_compaction(
@@ -398,7 +412,15 @@ class SessionWriter:
     def record(self, event: str, payload: dict[str, Any], *, sanitize: bool | None = None) -> str:
         return self._fanout("record", event, payload, sanitize=sanitize)
 
-    def record_message(self, *, role: str, content: str, step_number: int, kind: str) -> str:
+    def record_message(
+        self,
+        *,
+        role: str,
+        content: str,
+        step_number: int,
+        kind: str,
+        message_fields: dict[str, Any] | None = None,
+    ) -> str:
         """同时写入各 sink，并返回主 sink 的本地 entry id。"""
         results: dict[str, str] = {}
         for name, writer in list(self._sinks.items()):
@@ -408,6 +430,7 @@ class SessionWriter:
                     content=content,
                     step_number=step_number,
                     kind=kind,
+                    message_fields=message_fields,
                 )
             except OSError as exc:
                 self._disable_checkpoint_sink(name, exc)

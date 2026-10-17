@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 try:
@@ -13,6 +12,8 @@ except ImportError:
     OPENAI_AVAILABLE = False
 
 from .base_client import BaseLLMClient, LLMError, classify_retryable_exception
+from .messages import responses_input
+from .tool_calls import serialize_tool_calls
 
 
 class OpenAIClient(BaseLLMClient):
@@ -59,7 +60,7 @@ class OpenAIClient(BaseLLMClient):
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self.model,
-            "input": messages,
+            "input": responses_input(messages),
             "max_output_tokens": max_tokens,
         }
         response = self.client.with_options(timeout=timeout, max_retries=0).responses.create(
@@ -79,7 +80,7 @@ class OpenAIClient(BaseLLMClient):
 
         try:
             # 调用 OpenAI responses API
-            request: dict[str, Any] = {"model": self.model, "input": messages}
+            request: dict[str, Any] = {"model": self.model, "input": responses_input(messages)}
             if tool_definitions:
                 request["tools"] = [
                     {"type": "function", **definition, "strict": False}
@@ -115,27 +116,22 @@ class OpenAIClient(BaseLLMClient):
         response = data.get("response")
         if response:
             try:
-                for item in getattr(response, "output", ()):
-                    if getattr(item, "type", "") == "function_call":
-                        calls = [
-                            candidate
-                            for candidate in getattr(response, "output", ())
-                            if getattr(candidate, "type", "") == "function_call"
-                        ]
-                        arguments = json.loads(getattr(item, "arguments", "{}"))
-                        if not isinstance(arguments, dict):
-                            raise ValueError("tool arguments must be a JSON object")
-                        self.last_response_mode = "native_tool_call"
-                        self.last_tool_call_count = len(calls)
-                        self.last_selected_tool = str(item.name)
-                        return json.dumps(
-                            {
-                                "thought": "",
-                                "action": item.name,
-                                "action_input": arguments,
-                            },
-                            ensure_ascii=False,
-                        )
+                calls: list[dict[str, Any]] = [
+                    {
+                        "id": getattr(item, "call_id", ""),
+                        "function": {
+                            "name": item.name,
+                            "arguments": item.arguments,
+                        },
+                    }
+                    for item in getattr(response, "output", ())
+                    if getattr(item, "type", "") == "function_call"
+                ]
+                if calls:
+                    self.last_response_mode = "native_tool_call"
+                    self.last_tool_call_count = len(calls)
+                    self.last_selected_tool = str(calls[0]["function"]["name"])
+                    return serialize_tool_calls(calls)
                 self.last_response_mode = "json_fallback"
                 self.last_tool_call_count = 0
                 self.last_selected_tool = ""

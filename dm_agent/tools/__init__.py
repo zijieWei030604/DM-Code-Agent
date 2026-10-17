@@ -489,6 +489,16 @@ def _builtin_tools() -> list[Tool]:
     ]
     for tool in tools:
         tool.input_schema = BUILTIN_TOOL_SCHEMAS[tool.name]
+    for tool in tools:
+        if tool.name in {
+            "read_file",
+            "list_directory",
+            "find_files",
+            "search_code",
+            "search_in_file",
+        }:
+            tool.read_only = True
+            tool.concurrency = "shared"
     return tools
 
 

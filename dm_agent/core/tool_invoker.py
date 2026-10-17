@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import Any, cast
 
 from dm_agent.tools.base import Tool, ToolResult
@@ -106,6 +107,27 @@ def render_tool_observation(result: ToolResult) -> str:
     return f"{message}\n\n{suffix}" if message else suffix
 
 
+@dataclass
+class PreparedInvocation:
+    tool: Tool
+    action: str
+    arguments: Any
+    context: RunContext
+    call_id: str = ""
+    identity_edit_noop: bool = False
+    immediate: ToolInvocation | None = None
+
+
+@dataclass
+class ExecutedInvocation:
+    prepared: PreparedInvocation
+    result: ToolResult | None
+    observation: str
+    error_kind: str = ""
+    succeeded: bool = False
+    exception: BaseException | None = None
+
+
 class ToolInvoker:
     """按固定次序把一次工具调用跑完，并把过程记进 metadata。"""
 
@@ -133,8 +155,15 @@ class ToolInvoker:
         action: str,
         action_input: Any,
         context: RunContext,
+        cancelled: Event | None = None,
     ) -> ToolInvocation:
         """执行一次工具调用；入参非法或被钩子拦下时不会真正调用 runner。"""
+        prepared = self.prepare(tool, action=action, action_input=action_input, context=context)
+        return self.commit(self.execute(prepared, cancelled=cancelled))
+
+    def prepare(
+        self, tool: Tool, *, action: str, action_input: Any, context: RunContext
+    ) -> PreparedInvocation:
         metadata = context.metadata
         result: ToolResult | None
         if action == "task_complete":
@@ -150,11 +179,17 @@ class ToolInvoker:
                     observation,
                     error_code="invalid_arguments",
                 )
-                return ToolInvocation(
-                    arguments=action_input,
-                    observation=observation,
-                    error_kind="invalid_arguments",
-                    result=result,
+                return PreparedInvocation(
+                    tool,
+                    action,
+                    action_input,
+                    context,
+                    immediate=ToolInvocation(
+                        arguments=action_input,
+                        observation=observation,
+                        error_kind="invalid_arguments",
+                        result=result,
+                    ),
                 )
 
         before_event = BeforeToolCallEvent(
@@ -174,18 +209,30 @@ class ToolInvoker:
                 observation,
                 error_code="invalid_arguments",
             )
-            return ToolInvocation(
-                arguments=action_input,
-                observation=observation,
-                error_kind="invalid_arguments",
-                result=result,
+            return PreparedInvocation(
+                tool,
+                action,
+                action_input,
+                context,
+                immediate=ToolInvocation(
+                    arguments=action_input,
+                    observation=observation,
+                    error_kind="invalid_arguments",
+                    result=result,
+                ),
             )
         if block is not None:
             # 被拦下的调用不计入计划完成，也不备份。
-            return ToolInvocation(
-                arguments=action_input,
-                observation=str(block["reason"]),
-                blocked=True,
+            return PreparedInvocation(
+                tool,
+                action,
+                action_input,
+                context,
+                immediate=ToolInvocation(
+                    arguments=action_input,
+                    observation=str(block["reason"]),
+                    blocked=True,
+                ),
             )
 
         identity_edit_noop = (
@@ -196,26 +243,37 @@ class ToolInvoker:
         if action in WRITE_ACTIONS and not identity_edit_noop:
             self.persistence.backup_before_write(action_input, context)
 
-        error_kind = ""
-        tool_succeeded = False
-        result = None
         journal = self.persistence.call_journal
         call_id = (
             journal.begin(action, context.step_number, context.run_id, read_only=tool.read_only)
             if journal
             else ""
         )
+        return PreparedInvocation(tool, action, action_input, context, call_id, identity_edit_noop)
+
+    def execute(
+        self, prepared: PreparedInvocation, *, cancelled: Event | None = None
+    ) -> ExecutedInvocation:
+        """Only this phase may run on a worker; no shared hook/state mutations."""
+        if prepared.immediate is not None:
+            return ExecutedInvocation(prepared, None, "")
+        tool, action, action_input = prepared.tool, prepared.action, prepared.arguments
+        error_kind = ""
+        tool_succeeded = False
+        result = None
         try:
             output = (
-                tool.result_runner(action_input)
-                if tool.result_runner
-                else tool.execute(action_input)
+                tool.cancel_runner(action_input, cancelled)
+                if tool.cancel_runner and cancelled is not None
+                else (
+                    tool.result_runner(action_input)
+                    if tool.result_runner
+                    else tool.execute(action_input)
+                )
             )
             result = output if isinstance(output, ToolResult) else None
             raw_observation = render_tool_observation(result) if result is not None else str(output)
         except Exception as exc:
-            metadata["tool_error_count"] += 1
-            metadata["failure_reason"] = str(exc)
             raw_observation = f"Tool execution failed: {exc}"
             error_kind = "tool_error"
             result = ToolResult(
@@ -232,6 +290,22 @@ class ToolInvoker:
             if result is not None and not tool_succeeded:
                 error_kind = result.error_code
 
+        return ExecutedInvocation(prepared, result, raw_observation, error_kind, tool_succeeded)
+
+    def commit(self, execution: ExecutedInvocation) -> ToolInvocation:
+        """Commit facts and lifecycle effects serially, in model call order."""
+        prepared = execution.prepared
+        if prepared.immediate is not None:
+            return prepared.immediate
+        action, action_input, context = prepared.action, prepared.arguments, prepared.context
+        metadata = context.metadata
+        result, raw_observation = execution.result, execution.observation
+        error_kind, tool_succeeded = execution.error_kind, execution.succeeded
+        identity_edit_noop = prepared.identity_edit_noop
+        journal = self.persistence.call_journal
+        if error_kind == "tool_error":
+            metadata["tool_error_count"] += 1
+            metadata["failure_reason"] = raw_observation
         bounded_observation = self.bounder.bound(
             raw_observation,
             action=action,
@@ -268,8 +342,8 @@ class ToolInvoker:
             execution_fact=fact,
         )
         observation = self.event_bus.emit_after_tool_result(after_event, on_error=self.on_error)
-        if journal:
-            journal.finish(call_id)
+        if journal and execution.exception is None:
+            journal.finish(prepared.call_id)
         return ToolInvocation(
             arguments=action_input,
             observation=observation,

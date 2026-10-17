@@ -6,10 +6,13 @@ import json
 import time
 import uuid
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from pathlib import Path
+from threading import Event
 from typing import Any, cast
 
 from dm_agent.clients.base_client import BaseLLMClient
+from dm_agent.clients.messages import protocol_fields
 from dm_agent.clients.streaming import StreamEvent
 from dm_agent.memory.lcm.compaction import ContextOverflow
 from dm_agent.memory.repo_map import RepoMapResult, RepositoryMap
@@ -18,6 +21,7 @@ from dm_agent.tools.base import Tool
 from dm_agent.tracing.session import parse_failed_response_placeholder
 from dm_agent.tracing.writer import SessionWriter
 
+from .batch_runtime import execute_tool_batch
 from .capabilities import AgentCapability, CapabilityContext
 from .checkpoint import RunCheckpoint
 from .completion import CompletionGate, build_run_result, format_final_answer
@@ -45,6 +49,7 @@ from .prompting import build_user_prompt
 from .response_parser import normalize_action, parse_agent_response
 from .run_state import RunContext, Step, initial_run_metadata
 from .task_plan import TaskPlan
+from .tool_batches import prepare_batch, validate_pending
 from .tool_invoker import ToolInvoker
 
 __all__ = ["ReactAgent", "Step"]
@@ -133,6 +138,7 @@ class ReactAgent:
         self.client = client
         self._owned_resources = list(owned_resources)
         self._closed = False
+        self._cancel_event = Event()
         self.trace_writer = (
             trace_writer if isinstance(trace_writer, SessionWriter) else SessionWriter(trace_writer)
         )
@@ -165,7 +171,7 @@ class ReactAgent:
         # ``ToolInvoker``.
         self.stream_callback = stream_callback
         # 多轮对话历史记录
-        self.conversation_history: list[dict[str, str]] = []
+        self.conversation_history: list[dict[str, Any]] = []
 
         # Task-scoped checklist, updated by the same ReAct loop.
         self.enable_planning = enable_planning
@@ -292,14 +298,15 @@ class ReactAgent:
         ) and self.event_bus.has_retry_handlers():
             raise ValueError("checkpoint/resume 暂不支持与 on_run_end 重试同时使用。")
 
-        initial_history = [dict(message) for message in self.conversation_history]
+        self._cancel_event.clear()
+        initial_history = deepcopy(self.conversation_history)
         initial_compressor_state = (
             self.compressor.snapshot_runtime_state() if self.compressor else None
         )
         attempt = 1
         while True:
             if attempt > 1:
-                self.conversation_history = [dict(message) for message in initial_history]
+                self.conversation_history = deepcopy(initial_history)
                 if self.compressor and initial_compressor_state is not None:
                     self.compressor.restore_runtime_state(initial_compressor_state)
             result = self._run_once(
@@ -333,6 +340,8 @@ class ReactAgent:
         tool validation and lifecycle policies still run after ``toolcall_end``.
         """
 
+        if self._cancel_event.is_set() and event.type != "stream_error":
+            return False
         if event.type == "toolcall_delta":
             reason = self._stream_safety_reason(event)
             if reason:
@@ -398,6 +407,7 @@ class ReactAgent:
         *,
         kind: str,
         context_content: str | None = None,
+        message_fields: dict[str, Any] | None = None,
     ) -> None:
         """把一条消息追加进对话历史，同时在会话日志里落一条 ``message`` 条目。
 
@@ -409,11 +419,21 @@ class ReactAgent:
         原文。解析失败响应用这条路径保留审计证据，同时不再污染上下文。
         """
         self.conversation_history.append(
-            {"role": role, "content": content if context_content is None else context_content}
+            {
+                "role": role,
+                "content": content if context_content is None else context_content,
+                **(message_fields or {}),
+            }
         )
         if self.compressor:
             self.compressor.adopt(self.conversation_history[:-1])
-            self.compressor.append(role, content, kind=kind, context_content=context_content)
+            self.compressor.append(
+                role,
+                content,
+                kind=kind,
+                context_content=context_content,
+                message_fields=message_fields,
+            )
         entry_id = ""
         if self.trace_writer:
             entry_id = self.trace_writer.record_message(
@@ -421,6 +441,7 @@ class ReactAgent:
                 content=content,
                 step_number=self._run_context.step_number,
                 kind=kind,
+                message_fields=message_fields,
             )
         self._run_context.history_entry_ids.append(entry_id)
 
@@ -441,6 +462,7 @@ class ReactAgent:
                     content=str(message.get("content", "")),
                     step_number=self._run_context.step_number,
                     kind=kind,
+                    message_fields=protocol_fields(message),
                 )
             self._run_context.history_entry_ids.append(entry_id)
 
@@ -556,6 +578,7 @@ class ReactAgent:
             )
 
         def finish_result(final_answer: str) -> dict[str, Any]:
+            metadata.setdefault("duration_seconds", time.perf_counter() - started_at)
             metadata["plan_revision"] = self.task_plan.revision
             metadata["plan_scope"] = self.task_plan.scope
             metadata["plan"] = self.task_plan.items
@@ -626,7 +649,14 @@ class ReactAgent:
             self._append_history("user", task_prompt, kind="task")
 
         native_tool_retry_budget = 3
+        consumed_until = resume_from
         for step_num in range(resume_from + 1, limit + 1):
+            if step_num <= consumed_until:
+                continue
+            if self._cancel_event.is_set() and not self._run_context.pending_tool_calls:
+                metadata["status"] = "cancelled"
+                metadata["failure_reason"] = "Run cancelled."
+                return finish_result("")
             self._run_context.step_number = step_num
             # 每步开始前落盘上一步完成后的快照（若启用 checkpoint）。
             if checkpoint_path is not None:
@@ -638,6 +668,18 @@ class ReactAgent:
                     metadata=metadata,
                     limit=limit,
                 )
+            metadata.pop("current_tool_call", None)
+            if self._run_context.pending_tool_calls:
+                terminal, answer = self._execute_tool_batch(
+                    task,
+                    steps,
+                    checkpoint_path,
+                    limit,
+                )
+                consumed_until = self._run_context.step_number
+                if terminal:
+                    return finish_result(answer)
+                continue
             # 第二步：整理旧上下文为本地记忆（如果需要）
             tool_definitions = (
                 [tool.function_definition() for tool in self.tools.values()]
@@ -718,7 +760,7 @@ class ReactAgent:
                                 "role": "system",
                                 "content": (
                                     "The previous response did not contain a native tool call. "
-                                    "Continue by calling exactly one available tool; call "
+                                    "Continue by calling available tools; submit completion alone using "
                                     f"{completion_tool_hint} when the task is finished."
                                 ),
                             },
@@ -751,6 +793,10 @@ class ReactAgent:
                                 )
                             raw = self._request_client.respond(request_messages, **request_options)
             except Exception as exc:
+                if self._cancel_event.is_set():
+                    metadata["status"] = "cancelled"
+                    metadata["failure_reason"] = "Model stream cancelled before tool dispatch."
+                    return finish_result("")
                 if self.trace_writer:
                     self.trace_writer.record(
                         "llm_error",
@@ -784,15 +830,56 @@ class ReactAgent:
             )
             if response_mode == "native_tool_call":
                 metadata["native_tool_call_count"] += 1
-                metadata["discarded_tool_call_count"] += max(
-                    int(getattr(self._request_client, "last_tool_call_count", 0) or 0) - 1,
-                    0,
-                )
             elif response_mode == "json_fallback":
                 metadata["json_fallback_count"] += 1
 
+            batch_pending = False
             try:
                 parsed_response = parse_agent_response(raw)
+                if "tool_calls" in parsed_response.data or "call_id" in parsed_response.data:
+                    envelope = parsed_response.data
+                    if "tool_calls" not in envelope:
+                        envelope = {"tool_calls": [envelope]}
+                    pending = prepare_batch(
+                        envelope,
+                        {name for name, tool in self.tools.items() if tool.completes_task},
+                    )
+                    used_ids = {
+                        call["id"]
+                        for message in self.conversation_history
+                        for call in message.get("tool_calls", [])
+                    }
+                    for call in pending:
+                        if call["call_id"] in used_ids:
+                            call["provider_call_id"] = call["call_id"]
+                            call["call_id"] = f"call_{call['batch_id']}_{call['index']}"
+                        used_ids.add(call["call_id"])
+                    native_calls = [
+                        {
+                            "id": call["call_id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["action"],
+                                "arguments": call.get("raw_arguments")
+                                or json.dumps(call["action_input"], ensure_ascii=False),
+                            },
+                        }
+                        for call in pending
+                    ]
+                    self._append_history(
+                        "assistant",
+                        raw,
+                        kind="model_response",
+                        message_fields={"tool_calls": native_calls},
+                    )
+                    self._run_context.pending_tool_calls = pending
+                    metadata["tool_batch_count"] += 1
+                    if self.trace_writer:
+                        self.trace_writer.record(
+                            "tool_batch_received",
+                            {"batch_id": pending[0]["batch_id"], "call_count": len(pending)},
+                        )
+                    batch_pending = True
             except ValueError as exc:
                 context_replacement = parse_failed_response_placeholder(len(raw))
                 self._append_history(
@@ -830,7 +917,25 @@ class ReactAgent:
                 self._note_observation(observation)
                 self._publish_step(step, step_num)
                 continue
-            self._append_history("assistant", raw, kind="model_response")
+            if batch_pending:
+                terminal, answer = self._execute_tool_batch(task, steps, checkpoint_path, limit)
+                consumed_until = self._run_context.step_number
+                if terminal:
+                    return finish_result(answer)
+                continue
+            self._append_history(
+                "assistant",
+                raw,
+                kind="tool_call" if metadata.get("current_tool_call") else "model_response",
+            )
+            if self.trace_writer and metadata.get("current_tool_call"):
+                self.trace_writer.record(
+                    "tool_batch_call",
+                    {
+                        **metadata["current_tool_call"],
+                        "step_number": step_num,
+                    },
+                )
             parsed = parsed_response.data
             if parsed_response.repaired:
                 metadata["parse_repair_count"] += 1
@@ -925,6 +1030,7 @@ class ReactAgent:
                 action=action,
                 action_input=action_input,
                 context=self._run_context,
+                cancelled=self._cancel_event,
             )
             action_input = invocation.arguments
             observation = invocation.observation
@@ -1006,6 +1112,19 @@ class ReactAgent:
                 limit=limit,
             )
         return finish_result("Reached step limit without completion.")
+
+    def cancel(self) -> None:
+        """Request cooperative cancellation and stop owned child sessions."""
+        self._cancel_event.set()
+        for resource in self._owned_resources:
+            cancel = getattr(resource, "cancel", None)
+            if callable(cancel):
+                cancel()
+
+    def _execute_tool_batch(
+        self, task: str, steps: list[Step], checkpoint_path: Path | None, limit: int
+    ) -> tuple[bool, str]:
+        return execute_tool_batch(self, task, steps, checkpoint_path, limit)
 
     def refresh_mcp_tools(self, mcp_tools: list[Tool]) -> None:
         """Atomically replace MCP wrappers before the next model request.
@@ -1094,8 +1213,12 @@ class ReactAgent:
     ) -> int:
         """Restore checkpoint state and return the consumed step count."""
         resume_from = max(0, int(resume_state.step_count))
-        self.conversation_history = [dict(message) for message in resume_state.conversation_history]
+        validate_pending(resume_state.pending_tool_calls)
+        self.conversation_history = deepcopy(resume_state.conversation_history)
         steps.extend(steps_from_checkpoint(resume_state.steps))
+        self._run_context.pending_tool_calls = [
+            dict(call) for call in resume_state.pending_tool_calls
+        ]
         metadata.update(metadata_from_checkpoint(resume_state.metadata, resume_from=resume_from))
 
         if resume_state.plan_state is not None:
@@ -1127,7 +1250,7 @@ class ReactAgent:
         checkpoint = RunCheckpoint(
             task=task,
             step_count=step_count,
-            conversation_history=[dict(message) for message in self.conversation_history],
+            conversation_history=deepcopy(self.conversation_history),
             steps=[dict(step.__dict__) for step in steps],
             metadata=json_safe_metadata({**metadata, "run_id": self._run_context.run_id}),
             plan=self.task_plan.items,
@@ -1135,6 +1258,7 @@ class ReactAgent:
             compressor_state=self.compressor.export_state() if self.compressor else None,
             capability_state=self._export_capability_state(),
             agent_config=self._config_snapshot(max_steps=limit),
+            pending_tool_calls=[dict(call) for call in self._run_context.pending_tool_calls],
             cwd=str(Path.cwd()),
         )
         self._persistence.save(path, checkpoint)

@@ -39,6 +39,7 @@ class RunContext:
     step_number: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
     history_entry_ids: list[str] = field(default_factory=list)
+    pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
     def begin(self, *, run_id: str, metadata: dict[str, Any]) -> None:
         """进入新一轮 run，原地重置共享环境。"""
@@ -46,6 +47,7 @@ class RunContext:
         self.step_number = 0
         self.metadata = metadata
         self.history_entry_ids.clear()
+        self.pending_tool_calls.clear()
 
     def as_event_context(self) -> tuple[str, int, dict[str, Any]]:
         """``LLMRequestClient`` 需要的上下文取值回调。"""
@@ -84,6 +86,8 @@ def initial_run_metadata(
         "protocol_downgrade_count": 0,
         "json_fallback_count": 0,
         "discarded_tool_call_count": 0,
+        "tool_batch_count": 0,
+        "skipped_tool_call_count": 0,
         "stream_security_block_count": 0,
         "tool_error_count": 0,
         "unknown_tool_count": 0,

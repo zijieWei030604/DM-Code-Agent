@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from dm_agent.clients.messages import protocol_fields
 from dm_agent.memory.context_budget import estimate_tokens
 
 from .fresh_tail import fresh_tail_start, safe_boundaries
@@ -138,7 +139,11 @@ class Compactor:
         for record_id in frontier:
             message = self._message(record_id)
             result.append(
-                {"role": str(message.get("role", "user")), "content": str(message["content"])}
+                {
+                    "role": str(message.get("role", "user")),
+                    "content": str(message["content"]),
+                    **protocol_fields(message),
+                }
             )
         return result
 
@@ -185,7 +190,12 @@ class Compactor:
 
     @staticmethod
     def _strip_reasoning(text: str) -> str:
-        text = re.sub(r"<(?:think|thinking|reasoning|thought)\\b[^>]*>.*?</(?:think|thinking|reasoning|thought)>", "", text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(
+            r"<(?:think|thinking|reasoning|thought)\\b[^>]*>.*?</(?:think|thinking|reasoning|thought)>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
         if re.match(r"^\\s*<(?:think|thinking|reasoning|thought)\\b", text, flags=re.IGNORECASE):
             return ""
         return text.strip()
@@ -236,13 +246,19 @@ class Compactor:
             ),
         )
         for instruction, max_tokens, level in prompts:
-            request = [{"role": "system", "content": instruction}, {"role": "user", "content": payload}]
+            request = [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": payload},
+            ]
             request_tokens = sum(estimate_tokens(message["content"]) for message in request)
             spent = sum(
                 int(call["estimated_input_tokens"])
                 for call in self.calls[self._call_budget_start :]
             )
-            if request_tokens > self.policy.max_request_tokens or spent + request_tokens > self.policy.max_total_request_tokens:
+            if (
+                request_tokens > self.policy.max_request_tokens
+                or spent + request_tokens > self.policy.max_total_request_tokens
+            ):
                 break
             audit: dict[str, Any] = {
                 "mode": level,
@@ -335,9 +351,7 @@ class Compactor:
             selected = self._raw_leaf_selection(frontier)
             node = None
             if selected:
-                node, _ = self._commit(
-                    frontier, selected, depth=0, source_type="messages"
-                )
+                node, _ = self._commit(frontier, selected, depth=0, source_type="messages")
             condensed = self._condense_once(frontier, leaf_compacted=bool(selected))
             if on_commit is not None:
                 for committed in (node, condensed):
