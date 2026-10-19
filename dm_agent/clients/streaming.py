@@ -7,10 +7,10 @@ for early *rejection*, but are never an execution input.
 
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+from .argument_json import PathFieldScanner, parse_final_arguments, preview_arguments
 
 StreamEventType = Literal[
     "stream_start",
@@ -40,6 +40,8 @@ class StreamEvent:
     tool_name: str = ""
     arguments_preview: dict[str, Any] = field(default_factory=dict)
     reason: str = ""
+    safety_arguments: dict[str, Any] = field(default_factory=dict)
+    arguments_error: str = ""
 
 
 @dataclass
@@ -52,42 +54,33 @@ class StreamToolCall:
     raw_arguments: str = ""
     arguments: dict[str, Any] | None = None
     completed: bool = False
+    _parsed_length: int = 0
+    _preview: dict[str, Any] = field(default_factory=dict)
+    _path_scanner: PathFieldScanner = field(default_factory=PathFieldScanner)
 
     def append(self, delta: str) -> None:
         self.raw_arguments += delta
+        self._path_scanner.feed(delta)
 
     def preview(self) -> dict[str, Any]:
-        return parse_partial_json_object(self.raw_arguments)
+        length = len(self.raw_arguments)
+        growth = max(256, length // 32)
+        if not self._parsed_length or length - self._parsed_length >= growth:
+            self._preview = preview_arguments(self.raw_arguments)
+            self._parsed_length = length
+        return self._preview
+
+    def safety_arguments(self) -> dict[str, Any]:
+        path = self._path_scanner.path
+        return {"path": path} if path is not None else {}
 
     def finalize(self) -> dict[str, Any]:
-        value = json.loads(self.raw_arguments or "{}")
-        if not isinstance(value, dict):
-            raise ValueError("Tool arguments must be a JSON object.")
+        value = parse_final_arguments(self.raw_arguments)
         self.arguments = value
         self.completed = True
         return value
 
 
 def parse_partial_json_object(text: str) -> dict[str, Any]:
-    """Return only completed top-level scalar values from an object prefix.
-
-    It intentionally does not guess unfinished strings or nested structures.
-    The result can therefore be used to reject a completed dangerous path while
-    remaining unsuitable as a substitute for final JSON schema validation.
-    """
-
-    preview: dict[str, Any] = {}
-    decoder = json.JSONDecoder()
-    for match in re.finditer(r'"((?:\\.|[^"\\])*)"\s*:\s*', text):
-        try:
-            key = json.loads(f'"{match.group(1)}"')
-        except json.JSONDecodeError:
-            continue
-        start = match.end()
-        try:
-            value, _ = decoder.raw_decode(text[start:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(key, str) and isinstance(value, (str, int, float, bool)):
-            preview[key] = value
-    return preview
+    """Display-only nested preview; never use it to authorize or reject a call."""
+    return preview_arguments(text)

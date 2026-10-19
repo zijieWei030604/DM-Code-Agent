@@ -195,6 +195,11 @@ setx GITHUB_MCP_OAUTH_CLIENT_SECRET "你的 OAuth App Client Secret"
 
 重新打开终端后再运行 Agent。Client Secret 不会进入配置文件或 Trace。
 
+若调用工具返回带 `insufficient_scope` 挑战的 HTTP 403，客户端会将挑战中的 `scope`
+传入浏览器授权流程，并在成功后重试一次，不会无限重试。GitHub 可能要求 `repo`；
+该 OAuth scope 包含仓库读写权限，`/readonly` 仅限制 MCP 工具操作，不会缩小 Token
+本身的权限。用户可以在授权页拒绝追加权限；普通 HTTP 403 不会触发重新授权。
+
 ---
 
 ## 如何接入新的 MCP 服务器

@@ -385,7 +385,7 @@ class ReactAgent:
     def _stream_safety_reason(event: StreamEvent) -> str:
         """Identify only a complete preview path that escapes this workspace."""
 
-        path = event.arguments_preview.get("path")
+        path = event.safety_arguments.get("path")
         if not isinstance(path, str) or not path:
             return ""
         if "\x00" in path or path.startswith("~"):

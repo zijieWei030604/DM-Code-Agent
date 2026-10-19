@@ -210,8 +210,11 @@ class OAuthAuthorizer:
             registration = self._register(registration_endpoint, callback.redirect_uri)
             verifier = _code_verifier()
             state = secrets.token_urlsafe(24)
+            scope_match = re.search(r'\bscope="([^"]+)"', challenge)
+            scope_parameters = {"scope": scope_match.group(1)} if scope_match else {}
             query = urllib.parse.urlencode(
                 {
+                    **scope_parameters,
                     "response_type": "code",
                     "client_id": registration["client_id"],
                     "redirect_uri": callback.redirect_uri,

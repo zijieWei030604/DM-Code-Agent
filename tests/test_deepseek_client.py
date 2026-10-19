@@ -288,11 +288,12 @@ def test_deepseek_closes_its_http_session():
     assert session.closed is True
 
 
-def test_partial_json_preview_exposes_only_completed_values():
+def test_partial_json_preview_preserves_nested_display_prefixes():
     assert parse_partial_json_object('{"path":"src/a.py","content":"unterminated') == {
-        "path": "src/a.py"
+        "path": "src/a.py",
+        "content": "unterminated",
     }
-    assert parse_partial_json_object('{"line":12,"nested":{') == {"line": 12}
+    assert parse_partial_json_object('{"line":12,"nested":{') == {"line": 12, "nested": {}}
 
 
 def test_deepseek_stream_assembles_tool_arguments_and_events():
@@ -331,7 +332,10 @@ def test_deepseek_stream_assembles_tool_arguments_and_events():
         "stream_done",
     ]
     preview = next(event.arguments_preview for event in events if event.type == "toolcall_delta")
-    assert preview == {}
+    assert preview == {"path": "src/"}
+    deltas = [event for event in events if event.type == "toolcall_delta"]
+    assert deltas[0].safety_arguments == {}
+    assert deltas[-1].safety_arguments == {"path": "src/a.py"}
     assert response.closed is True
 
 
@@ -347,7 +351,7 @@ def test_deepseek_stream_stops_when_policy_rejects_completed_path():
 
     def reject_completed_path(event):
         events.append(event)
-        return not event.arguments_preview.get("path")
+        return not event.safety_arguments.get("path")
 
     with pytest.raises(DeepSeekStreamBlocked):
         client.respond(

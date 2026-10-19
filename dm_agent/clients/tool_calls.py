@@ -6,6 +6,8 @@ import json
 import uuid
 from typing import Any
 
+from .argument_json import parse_final_arguments
+
 
 def serialize_tool_calls(calls: list[dict[str, Any]]) -> str:
     actions = []
@@ -19,7 +21,7 @@ def serialize_tool_calls(calls: list[dict[str, Any]]) -> str:
         try:
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("Tool call requires a function name")
-            arguments = json.loads(raw) if isinstance(raw, str) else raw
+            arguments = parse_final_arguments(raw) if isinstance(raw, str) else raw
             if not isinstance(arguments, dict):
                 raise ValueError("Tool arguments must be a JSON object")
         except (TypeError, ValueError) as exc:

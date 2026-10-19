@@ -267,6 +267,7 @@ class DeepSeekClient(BaseLLMClient):
                                 tool_call_id=state.call_id,
                                 tool_name=state.name,
                                 arguments_preview=state.preview(),
+                                safety_arguments=state.safety_arguments(),
                             ),
                         )
             reason = choice.get("finish_reason")
@@ -281,11 +282,13 @@ class DeepSeekClient(BaseLLMClient):
         serialized_calls: list[dict[str, Any]] = []
         for index in sorted(tool_calls):
             state = tool_calls[index]
+            argument_error = ""
             try:
                 state.finalize()
-            except ValueError:
+            except ValueError as exc:
                 # Preserve this call as an error result; valid siblings still dispatch.
                 state.arguments = {}
+                argument_error = str(exc)
             self._emit_stream_event(
                 callback,
                 StreamEvent(
@@ -295,6 +298,7 @@ class DeepSeekClient(BaseLLMClient):
                     tool_call_id=state.call_id,
                     tool_name=state.name,
                     arguments_preview=state.arguments or {},
+                    arguments_error=argument_error,
                 ),
             )
             serialized_calls.append(

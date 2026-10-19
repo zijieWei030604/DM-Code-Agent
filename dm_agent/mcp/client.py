@@ -609,7 +609,11 @@ class MCPHTTPClient:
                 ):
                     body = response.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as error:
-                if error.code == 401 and attempt == 0 and self._begin_oauth(error):
+                challenge = error.headers.get("WWW-Authenticate", "")
+                needs_authorization = error.code == 401 or (
+                    error.code == 403 and 'error="insufficient_scope"' in challenge
+                )
+                if needs_authorization and attempt == 0 and self._begin_oauth(error):
                     continue
                 return None
             except (OSError, urllib.error.URLError):
@@ -645,7 +649,7 @@ class MCPHTTPClient:
         return headers
 
     def _begin_oauth(self, error: urllib.error.HTTPError) -> bool:
-        """Start interactive OAuth only after a protected resource challenges us."""
+        """Authorize after a missing-token or insufficient-scope challenge."""
         if self._authorizer is None:
             return False
         challenge = error.headers.get("WWW-Authenticate", "")
