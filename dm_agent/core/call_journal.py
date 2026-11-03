@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import uuid
@@ -56,13 +57,21 @@ class CallJournal:
     def check_resume(self, step: int, run_id: str) -> None:
         if not self.path.exists():
             return
-        calls: dict[str, dict[str, Any]] = {}
-        try:
-            for line in self.path.read_text(encoding="utf-8").splitlines():
-                record = json.loads(line)
-                calls.setdefault(record["call_id"], {}).update(record)
-        except (ValueError, KeyError, TypeError) as exc:
-            raise ValueError(f"Inspect incomplete call journal before resume: {self.path}") from exc
+        calls = self.records()
+        resolutions: set[str] = set()
+        resolution_path = self.path.with_name(self.path.name + ".reconciliations.jsonl")
+        if resolution_path.exists():
+            try:
+                for line in resolution_path.read_text(encoding="utf-8").splitlines():
+                    item = json.loads(line)
+                    if (
+                        item.get("actor") == "user"
+                        and item.get("note")
+                        and item.get("outcome") in {"verified", "compensated", "not_executed"}
+                    ):
+                        resolutions.add(str(item["fingerprint"]))
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ValueError("Malformed reconciliation log") from exc
         for record in calls.values():
             if (
                 record.get("run_id") != run_id
@@ -71,8 +80,24 @@ class CallJournal:
             ):
                 continue
             if record.get("state") == "started" or int(record.get("step", 0)) > step:
+                if self.fingerprint(record) in resolutions:
+                    continue
                 raise ValueError(
                     f"Resume requires side-effect reconciliation: {record['action']} "
                     f"call {record['call_id']} is not covered by this checkpoint. "
                     f"Inspect {self.path}; do not blindly replay the operation."
                 )
+
+    @staticmethod
+    def fingerprint(record: dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(record, sort_keys=True).encode()).hexdigest()
+
+    def records(self) -> dict[str, dict[str, Any]]:
+        calls: dict[str, dict[str, Any]] = {}
+        try:
+            for line in self.path.read_text(encoding="utf-8").splitlines():
+                record = json.loads(line)
+                calls.setdefault(record["call_id"], {}).update(record)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"Inspect incomplete call journal before resume: {self.path}") from exc
+        return calls

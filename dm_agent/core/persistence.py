@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -55,7 +55,8 @@ def is_session_checkpoint(path: str | Path) -> bool:
 class RunPersistence:
     """写前备份与 checkpoint 落盘的执行者。
 
-    两件事都是**尽力而为**：备份或落盘失败绝不能中断任务，只记录并继续。
+    默认备份与 checkpoint 写入是尽力而为；可选的持久化边界观察器在写入前运行，
+    其失败会中止任务，避免在未建立工作区恢复点时继续修改。
     """
 
     def __init__(self, *, trace_writer: Any | None = None) -> None:
@@ -64,6 +65,8 @@ class RunPersistence:
         # 使用共享 SessionWriter，因此 checkpoint 与普通会话条目共用同一条写入链。
         self._session_writer: TraceWriter | None = None
         self.call_journal: CallJournal | None = None
+        # Optional durable boundary observer, assembled outside the kernel.
+        self.checkpoint_observer: Callable[[Path, RunCheckpoint], None] | None = None
 
     def prepare_session_checkpoint(self, path: str | Path) -> None:
         """在 run_start 前准备 JSONL checkpoint sink，让首条消息也能被扇出。"""
@@ -97,11 +100,14 @@ class RunPersistence:
             )
 
     def save(self, path: Path, checkpoint: RunCheckpoint) -> None:
-        """落盘一份可恢复状态；磁盘出问题时告警并继续执行。
+        """落盘状态；普通写入失败告警，可选边界观察器失败则中止。
 
         ``*.jsonl`` 追加一条 ``checkpoint`` 会话条目（append-only，历史快照全部留着，
         于是 ``--resume-at`` 能挑更早的条目）；其余后缀走原子覆盖写的单文件快照。
         """
+        if self.checkpoint_observer is not None:
+            # Fail closed before writes when the durable workspace boundary cannot commit.
+            self.checkpoint_observer(path, checkpoint)
         try:
             if is_session_checkpoint(path):
                 self._append_session_checkpoint(path, checkpoint)
@@ -159,6 +165,8 @@ def load_resume_state(path: str | Path, *, at: str | None = None) -> RunCheckpoi
         if at:
             raise ValueError("--resume-at 只适用于 JSONL 会话日志，单文件快照没有条目 id。")
         checkpoint = RunCheckpoint.from_dict(snapshot)
+        if checkpoint.recovery:
+            return _load_workspace_resume(checkpoint)
         CallJournal(source).check_resume(
             checkpoint.step_count, str(checkpoint.metadata.get("run_id", ""))
         )
@@ -181,10 +189,24 @@ def load_resume_state(path: str | Path, *, at: str | None = None) -> RunCheckpoi
     if not isinstance(state, dict):
         raise ValueError(f"Checkpoint entry {entry.get('id')} carries no resumable state.")
     checkpoint = RunCheckpoint.from_dict(state)
+    if checkpoint.recovery:
+        return _load_workspace_resume(checkpoint)
     CallJournal(source).check_resume(
         checkpoint.step_count, str(checkpoint.metadata.get("run_id", ""))
     )
     return checkpoint
+
+
+def _load_workspace_resume(checkpoint: RunCheckpoint) -> RunCheckpoint:
+    from dm_agent.recovery.points import prepare_state, validate_resume
+
+    validate_resume(checkpoint)
+    # Both same-directory resume and a restored checkout need fresh verification.
+    return (
+        checkpoint
+        if checkpoint.recovery.get("receipt")
+        else prepare_state(checkpoint, Path(checkpoint.cwd))
+    )
 
 
 def _as_json_object(text: str) -> dict[str, Any] | None:

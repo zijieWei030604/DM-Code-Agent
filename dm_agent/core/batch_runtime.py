@@ -112,6 +112,7 @@ def execute_tool_batch(
                 },
             )
 
+    metadata["tool_batch_active"] = True
     save()
     allowed = list(pending[: max(0, limit - start + 1)])
 
@@ -245,4 +246,7 @@ def execute_tool_batch(
         if interruption is not None and not isinstance(interruption, BatchCancelled):
             raise interruption
         terminal = True
+    if interruption is None and not host._cancel_event.is_set() and not pending:
+        metadata.pop("tool_batch_active", None)
+        save()
     return terminal, answer

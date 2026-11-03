@@ -30,6 +30,14 @@ def validate_feature_args(args: argparse.Namespace) -> str:
         return conversation_error
     checkpoint_path = getattr(args, "checkpoint", None)
     trace_path = getattr(args, "trace", None)
+    if getattr(args, "workspace_recovery_store", "") and (
+        not checkpoint_path or getattr(args, "conversation_stdin", False)
+    ):
+        return "Workspace recovery requires --checkpoint and single-task mode."
+    if getattr(args, "workspace_recovery_policy", "") and not (
+        getattr(args, "workspace_recovery_store", "") or getattr(args, "resume", None)
+    ):
+        return "--workspace-recovery-policy requires recovery or resume."
     if checkpoint_path and trace_path and Path(checkpoint_path) == Path(trace_path):
         # checkpoint 里有完整对话（含模型原始输出），trace 默认是可分享的脱敏档。
         # 指向同一个文件会让脱敏档被完整历史悄悄污染，直接拒绝。
@@ -62,6 +70,16 @@ def parse_args(argv: Any) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="运行基于 LLM 的 ReAct 智能体来完成任务描述。")
     parser.add_argument("task", nargs="?", help="智能体要完成的自然语言任务。")
+    parser.add_argument(
+        "--workspace-recovery-store",
+        default="",
+        help="工作区外的私有快照目录；需配合 --checkpoint，仅单任务模式。",
+    )
+    parser.add_argument(
+        "--workspace-recovery-policy",
+        default="",
+        help="可选 JSON 策略：include/exclude/max_file_bytes/max_snapshot_bytes。",
+    )
 
     parser.add_argument(
         "--api-key",

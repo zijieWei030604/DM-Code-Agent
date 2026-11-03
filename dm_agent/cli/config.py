@@ -55,6 +55,8 @@ class Config:
     subagent_store: str = ""
     subagent_workers: int = 3
     subagent_timeout: float = 180.0
+    workspace_recovery_store: str = ""
+    workspace_recovery_policy: str = ""
 
 
 def load_config_from_file() -> dict[str, Any]:

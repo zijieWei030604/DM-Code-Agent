@@ -15,6 +15,9 @@ from .client import LspClient
 
 REFERENCE_RETRY_COUNT = 4
 REFERENCE_RETRY_DELAY_SECONDS = 0.5
+CALLABLE_SYMBOL_KINDS = frozenset({6, 9, 12})  # Method, Constructor, Function
+DATA_SYMBOL_KINDS = frozenset({7, 8, 13, 14})  # Property, Field, Variable, Constant
+CLASS_SYMBOL_KIND = 5
 
 # These diagnostics identify a definite defect in the edited expression itself.
 # Broad type-analysis warnings vary across legacy repositories and remain observations.
@@ -28,7 +31,6 @@ class ImpactSnapshot:
     path: str
     content: str
     content_hash: str
-    symbols: list[dict[str, Any]]
     diagnostics: list[dict[str, Any]]
 
 
@@ -49,6 +51,8 @@ class ImpactReport:
     reason: str = ""
     before_hash: str = ""
     after_hash: str = ""
+    unmapped_changed_lines: list[int] = field(default_factory=list)
+    unqueryable_symbols: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -79,13 +83,11 @@ class ImpactAnalyzer:
         if resolved.suffix != ".py" or not resolved.is_file():
             return None
         text = resolved.read_text(encoding="utf-8")
-        symbols = self.client.document_symbols(resolved, text) if self.client.available else []
         diagnostics = self.client.diagnostics(resolved, text) if self.client.available else []
         snapshot = ImpactSnapshot(
             path=self._relative(resolved),
             content=text,
             content_hash=_hash(text),
-            symbols=symbols,
             diagnostics=diagnostics,
         )
         self._snapshots[resolved] = snapshot
@@ -112,13 +114,15 @@ class ImpactAnalyzer:
             diagnostics = self.client.diagnostics(resolved, text)
             before_text = before.content if before else ""
             changed_lines = _changed_line_numbers(before_text, text)
-            changed = _changed_symbols(before.symbols if before else [], symbols, before_text, text)
+            changed, unmapped_lines = _changed_symbols(symbols, changed_lines)
+            unqueryable: list[str] = []
             candidates: set[str] = set()
             seen = 0
             truncated = False
             for symbol in changed:
                 position = _symbol_position(symbol)
                 if position is None:
+                    unqueryable.append(_symbol_name(symbol))
                     continue
                 references = self._references_with_retry(resolved, position, text)
                 for reference in references:
@@ -164,9 +168,11 @@ class ImpactAnalyzer:
                     item for item in new_errors if item not in blocking_errors
                 ],
                 truncated=truncated or len(candidates) > 10,
+                unmapped_changed_lines=unmapped_lines,
+                unqueryable_symbols=unqueryable,
             )
             self._snapshots[resolved] = ImpactSnapshot(
-                self._relative(resolved), text, _hash(text), symbols, diagnostics
+                self._relative(resolved), text, _hash(text), diagnostics
             )
             return report
         except (OSError, RuntimeError, TimeoutError, UnicodeError) as error:
@@ -232,19 +238,71 @@ def _symbol_position(symbol: dict[str, Any]) -> tuple[int, int] | None:
 
 
 def _changed_symbols(
-    before_symbols: list[dict[str, Any]],
     after_symbols: list[dict[str, Any]],
-    before: str,
-    after: str,
-) -> list[dict[str, Any]]:
-    old_names = {_symbol_name(item) for item in before_symbols}
-    changed_lines = _changed_line_numbers(before, after)
-    chosen = [
-        item
-        for item in after_symbols
-        if _symbol_name(item) not in old_names or _symbol_touches(item, changed_lines)
-    ]
-    return chosen or after_symbols[:1]
+    changed_lines: set[int],
+) -> tuple[list[dict[str, Any]], list[int]]:
+    """Select reference targets and expose unmapped lines (one-based).
+
+    Local data changes belong to the nearest callable. Module data and class
+    members remain independently queryable. No arbitrary symbol is used when
+    LSP cannot map a changed line, including a deletion boundary, to a target.
+    """
+    flattened = _nested_symbols(after_symbols)
+    chosen: list[dict[str, Any]] = []
+    chosen_ids: set[int] = set()
+    unmapped: list[int] = []
+    for line in sorted(changed_lines):
+        matching = [lineage for symbol, lineage in flattened if _symbol_touches(symbol, {line})]
+        if not matching:
+            unmapped.append(line + 1)
+            continue
+        deepest = max(len(lineage) for lineage in matching)
+        mapped = False
+        for lineage in matching:
+            if len(lineage) != deepest:
+                continue
+            target = _reference_target(lineage)
+            if target is None:
+                continue
+            mapped = True
+            identity = id(target)
+            if identity not in chosen_ids:
+                chosen.append(target)
+                chosen_ids.add(identity)
+        if not mapped:
+            unmapped.append(line + 1)
+    return chosen, unmapped
+
+
+def _nested_symbols(
+    symbols: list[dict[str, Any]], ancestors: tuple[dict[str, Any], ...] = ()
+) -> list[tuple[dict[str, Any], tuple[dict[str, Any], ...]]]:
+    """Flatten DocumentSymbol trees with their enclosing scopes."""
+    result: list[tuple[dict[str, Any], tuple[dict[str, Any], ...]]] = []
+    for symbol in symbols:
+        lineage = (*ancestors, symbol)
+        result.append((symbol, lineage))
+        children = symbol.get("children")
+        if isinstance(children, list):
+            nested = [item for item in children if isinstance(item, dict)]
+            result.extend(_nested_symbols(nested, lineage))
+    return result
+
+
+def _reference_target(lineage: tuple[dict[str, Any], ...]) -> dict[str, Any] | None:
+    for index in range(len(lineage) - 1, -1, -1):
+        symbol = lineage[index]
+        kind = symbol.get("kind")
+        if kind == CLASS_SYMBOL_KIND or kind in CALLABLE_SYMBOL_KINDS:
+            return symbol
+        if kind in DATA_SYMBOL_KINDS:
+            for ancestor in reversed(lineage[:index]):
+                if ancestor.get("kind") in CALLABLE_SYMBOL_KINDS:
+                    return ancestor
+                if ancestor.get("kind") == CLASS_SYMBOL_KIND:
+                    break
+            return symbol
+    return None
 
 
 def _changed_line_numbers(before: str, after: str) -> set[int]:
@@ -265,7 +323,11 @@ def _symbol_touches(symbol: dict[str, Any], lines: set[int]) -> bool:
     start, end = value.get("start"), value.get("end")
     if not isinstance(start, dict) or not isinstance(end, dict):
         return False
-    return any(int(start.get("line", 0)) <= line <= int(end.get("line", 0)) for line in lines)
+    first, last = int(start.get("line", 0)), int(end.get("line", 0))
+    # LSP ends are exclusive: an end at column zero does not cover that line.
+    if end.get("character") == 0:
+        last -= 1
+    return any(first <= line <= last for line in lines)
 
 
 def _location_path(location: dict[str, Any], root: Path) -> str:

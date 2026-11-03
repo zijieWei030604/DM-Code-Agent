@@ -217,6 +217,8 @@ def main(argv: Any = None) -> int:
         subagent_store=args.subagent_store,
         subagent_workers=args.subagent_workers,
         subagent_timeout=args.subagent_timeout,
+        workspace_recovery_store=args.workspace_recovery_store,
+        workspace_recovery_policy=args.workspace_recovery_policy,
     )
 
     # --resume：从 checkpoint 恢复任务（任务参数可省略）

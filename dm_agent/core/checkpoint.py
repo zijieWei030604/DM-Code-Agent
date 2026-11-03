@@ -66,6 +66,7 @@ class RunCheckpoint:
     capability_state: dict[str, Any] = field(default_factory=dict)
     agent_config: dict[str, Any] = field(default_factory=dict)
     pending_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    recovery: dict[str, Any] = field(default_factory=dict)
     cwd: str = ""
     schema_version: int = CHECKPOINT_SCHEMA_VERSION
 
@@ -95,6 +96,7 @@ class RunCheckpoint:
             capability_state=dict(data.get("capability_state") or {}),
             agent_config=dict(data.get("agent_config") or {}),
             pending_tool_calls=list(data.get("pending_tool_calls") or []),
+            recovery=dict(data.get("recovery") or {}),
             cwd=str(data.get("cwd", "")),
             schema_version=version,
         )

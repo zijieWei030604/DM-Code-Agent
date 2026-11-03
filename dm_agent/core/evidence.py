@@ -266,6 +266,8 @@ class EvidenceGraph:
                 "status": str(report.get("status", "unknown")),
                 "report_id": str(report.get("report_id", "")),
                 "changed_symbols": list(report.get("changed_symbols") or ()),
+                "unmapped_changed_lines": list(report.get("unmapped_changed_lines") or ()),
+                "unqueryable_symbols": list(report.get("unqueryable_symbols") or ()),
                 "candidate_files": list(report.get("candidate_files") or ()),
                 "new_error_count": len(list(report.get("new_error_diagnostics") or ())),
                 "truncated": bool(report.get("truncated", False)),

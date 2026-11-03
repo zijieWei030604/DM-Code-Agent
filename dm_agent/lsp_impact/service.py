@@ -78,8 +78,19 @@ class LspImpactService:
             details = ", ".join(report.candidate_files) or "no cross-file candidates"
             errors = len(report.new_error_diagnostics)
             suffix = " (reference limit reached)" if report.truncated else ""
+            gaps = []
+            if report.unmapped_changed_lines:
+                gaps.append(
+                    f"unmapped changed lines/boundaries={report.unmapped_changed_lines[:10]}"
+                )
+            if report.unqueryable_symbols:
+                gaps.append(f"symbols without query positions={report.unqueryable_symbols[:10]}")
+            if gaps:
+                suffix += " Impact scope incomplete: " + "; ".join(gaps) + "."
+                if not report.candidate_files:
+                    details = "unresolved (no candidates obtained)"
             return (
-                f"LSP impact for {report.path}: changed symbols={report.changed_symbols or ['unknown']}; "
+                f"LSP impact for {report.path}: changed symbols={report.changed_symbols}; "
                 f"candidates={details}; new Error diagnostics={errors}.{suffix}"
             )
         return f"LSP impact {report.status} for {report.path}: {report.reason or 'no report'}"

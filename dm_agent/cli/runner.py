@@ -306,6 +306,18 @@ def run_single_task(
     trace_writer: SessionWriter | None = None
 
     try:
+        if config.workspace_recovery_store or (resume_state and resume_state.recovery):
+            if checkpoint_path is None:
+                raise ValueError("Workspace recovery requires a new --checkpoint output path")
+            for output in (checkpoint_path, trace_path, report_path):
+                if output and output.resolve().is_relative_to(Path.cwd().resolve()):
+                    raise ValueError(
+                        "Recovery checkpoint, trace and report outputs must be outside the workspace"
+                    )
+            if checkpoint_path.exists():
+                raise ValueError(
+                    "Use a new checkpoint output; preserve the original recovery history"
+                )
         agent, trace_writer = _assemble_agent(
             config,
             mcp_manager=mcp_manager,
@@ -314,6 +326,34 @@ def run_single_task(
             checkpoint_path=checkpoint_path,
             extension_registry=extension_registry,
         )
+
+        if config.workspace_recovery_store or (resume_state and resume_state.recovery):
+            from dm_agent.core.capabilities import CapabilityContext
+            from dm_agent.extensions.capabilities.workspace_recovery import WorkspaceRecovery
+            from dm_agent.recovery.storage import SnapshotPolicy
+
+            if checkpoint_path is None:
+                raise ValueError("Workspace recovery requires a new --checkpoint output path")
+            ancestry = resume_state.recovery if resume_state else {}
+            store_path = config.workspace_recovery_store or ancestry["store"]
+            policy_data = (
+                json.loads(Path(config.workspace_recovery_policy).read_text(encoding="utf-8"))
+                if config.workspace_recovery_policy
+                else {}
+            )
+            if resume_state and ancestry and not policy_data:
+                from dm_agent.recovery.storage import WorkspaceStore
+
+                policy_data = WorkspaceStore(Path(ancestry["store"])).manifest(
+                    ancestry["manifest"]
+                )["policy"]
+            recovery = WorkspaceRecovery(
+                Path(store_path), SnapshotPolicy(**policy_data), ancestry=ancestry
+            )
+            recovery.install(
+                CapabilityContext(agent.event_bus, lambda phase: agent.client, trace_writer)
+            )
+            agent._persistence.checkpoint_observer = recovery.save
 
         UI.panel(
             "Run",

@@ -67,6 +67,7 @@ class FakeLspClient:
         return [
             {
                 "name": "normalize",
+                "kind": 12,
                 "range": {"start": {"line": 0}, "end": {"line": 2}},
                 "selectionRange": {"start": {"line": 0, "character": 4}},
             }
@@ -522,3 +523,158 @@ def test_reference_query_retries_cold_index_and_limits_context_to_first_fifty(
     assert result["location_only_items"] == 1
     assert "context" in result["items"][0]
     assert "context" not in result["items"][50]
+
+
+def _impact_symbol(name, kind, first, last, children=()):
+    return {
+        "name": name,
+        "kind": kind,
+        "range": {
+            "start": {"line": first, "character": 0},
+            "end": {"line": last + 1, "character": 0},
+        },
+        "selectionRange": {"start": {"line": first, "character": 4}},
+        "children": list(children),
+    }
+
+
+@pytest.mark.parametrize(
+    ("replacements", "expected_names", "expected_positions", "unmapped"),
+    [
+        ([("discount = 0.9", "discount = 0.8")], ["total"], [2], []),
+        ([("value = 1", "value = 2")], ["helper"], [4], []),
+        ([("class Calculator:", "class Calculator(Base):")], ["Calculator"], [0], []),
+        ([("limit = 3", "limit = 4")], ["limit"], [1], []),
+        ([("MAX_RETRIES = 3", "MAX_RETRIES = 5")], ["MAX_RETRIES"], [10], []),
+        ([("local = 1", "local = 2")], ["standalone"], [11], []),
+        (
+            [("discount = 0.9", "discount = 0.8"), ("return 0", "return 1")],
+            ["total", "reset"],
+            [2, 8],
+            [],
+        ),
+        (
+            [("class Calculator:", "class Calculator(Base):"), ("return 0", "return 1")],
+            ["Calculator", "reset"],
+            [0, 8],
+            [],
+        ),
+        ([("# trailing comment", "# changed comment")], [], [], [15]),
+        ([], [], [], []),
+    ],
+)
+def test_impact_queries_scope_owners_instead_of_local_variables(
+    tmp_path, replacements, expected_names, expected_positions, unmapped
+):
+    source = tmp_path / "source.py"
+    before = (
+        "class Calculator:\n"
+        "    limit = 3\n"
+        "    def total(self, price):\n"
+        "        discount = 0.9\n"
+        "        def helper():\n"
+        "            value = 1\n"
+        "            return value\n"
+        "        return price * discount * helper()\n"
+        "    def reset(self):\n"
+        "        return 0\n"
+        "MAX_RETRIES = 3\n"
+        "def standalone():\n"
+        "    local = 1\n"
+        "    return local\n"
+        "# trailing comment\n"
+    )
+
+    class HierarchicalClient(FakeLspClient):
+        def __init__(self):
+            super().__init__()
+            self.positions = []
+
+        def document_symbols(self, path, text):
+            return [
+                _impact_symbol(
+                    "Calculator",
+                    5,
+                    0,
+                    9,
+                    [
+                        _impact_symbol("limit", 8, 1, 1),
+                        _impact_symbol(
+                            "total",
+                            6,
+                            2,
+                            7,
+                            [
+                                _impact_symbol("discount", 13, 3, 3),
+                                _impact_symbol(
+                                    "helper",
+                                    12,
+                                    4,
+                                    6,
+                                    [_impact_symbol("value", 13, 5, 5)],
+                                ),
+                            ],
+                        ),
+                        _impact_symbol("reset", 6, 8, 9),
+                    ],
+                ),
+                _impact_symbol("MAX_RETRIES", 14, 10, 10),
+                _impact_symbol(
+                    "standalone",
+                    12,
+                    11,
+                    13,
+                    [_impact_symbol("local", 13, 12, 12)],
+                ),
+            ]
+
+        def references(self, path, line, character, text):
+            self.positions.append(line)
+            return [{"uri": path_to_uri(tmp_path / f"consumer_{line}.py")}]
+
+    source.write_text(before, encoding="utf-8")
+    client = HierarchicalClient()
+    analyzer = ImpactAnalyzer(client, tmp_path)
+    analyzer.snapshot(source)
+    after = before
+    for old, new in replacements:
+        after = after.replace(old, new)
+    source.write_text(after, encoding="utf-8")
+    report = analyzer.analyze(source)
+    assert report.status == "ok"
+    assert report.changed_symbols == expected_names
+    assert client.positions == expected_positions
+    assert report.unmapped_changed_lines == unmapped
+    assert report.candidate_files == sorted(f"consumer_{line}.py" for line in expected_positions)
+    if unmapped:
+        summary = LspImpactService(tmp_path, client=client).summary(report)
+        assert "Impact scope incomplete" in summary
+        assert "no cross-file candidates" not in summary
+
+
+@pytest.mark.parametrize("member_kind", [7, 8, 13, 14])
+def test_class_data_inside_a_local_class_is_not_promoted_to_outer_function(member_kind):
+    from dm_agent.lsp_impact.analyzer import _changed_symbols
+
+    member = _impact_symbol("member", member_kind, 2, 2)
+    symbols = [_impact_symbol("outer", 12, 0, 5, [_impact_symbol("Local", 5, 1, 3, [member])])]
+    selected, unmapped = _changed_symbols(symbols, {2})
+    assert selected == [member]
+    assert unmapped == []
+
+
+def test_impact_falls_back_to_class_only_when_the_changed_line_is_in_its_range():
+    from dm_agent.lsp_impact.analyzer import _changed_symbols
+
+    symbol = _impact_symbol("Calculator", 5, 0, 2)
+    selected, unmapped = _changed_symbols([symbol], {1, 3})
+    assert selected == [symbol]
+    assert unmapped == [4]
+
+
+def test_unknown_symbol_kind_is_reported_as_unmapped():
+    from dm_agent.lsp_impact.analyzer import _changed_symbols
+
+    selected, unmapped = _changed_symbols([_impact_symbol("unknown", 999, 0, 1)], {1})
+    assert selected == []
+    assert unmapped == [2]
